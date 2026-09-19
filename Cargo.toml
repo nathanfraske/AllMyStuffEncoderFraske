@@ -32,9 +32,9 @@ members = [
 # each live in their own Cargo workspace so a `cargo build --workspace` at
 # the root stays fast and webview-free — the same split MyOwnMesh uses. The
 # GUI and the node are *clients* of the `myownmesh` daemon and of these
-# library crates; neither has to compile to test the core. (`node` carries
-# the heavy media deps — xcap/cpal/openh264/nokhwa/… — so it is deliberately
-# kept out of the lightweight library workspace.)
+# library crates; neither has to compile to test the core. Video native
+# dependencies are optional; the root workspace default remains device-free.
+# The node and GUI keep their own application feature and profile selections.
 # Keep the checksum-preserved experimental dependency outside workspace checks.
 exclude = ["gui", "node", "vendor/openh264-sys2-0.9.6"]
 
@@ -108,3 +108,61 @@ codegen-units = 1
 lto = true
 opt-level = "s"
 strip = true
+
+[patch.crates-io]
+# Same experimental source-only patch used by the node and GUI workspaces.
+openh264-sys2 = { path = "vendor/openh264-sys2-0.9.6" }
+
+[profile.release.package.jpeg-encoder]
+opt-level = 3
+
+[profile.release.package.openh264]
+opt-level = 3
+
+[profile.release.package.openh264-sys2]
+opt-level = 3
+
+[profile.release.package.xcap]
+opt-level = 3
+
+[profile.release.package.image]
+opt-level = 3
+
+[profile.release.package.allmystuff-pixels]
+opt-level = 3
+
+[profile.release.package.nokhwa]
+opt-level = 3
+
+[profile.release.package.nokhwa-core]
+opt-level = 3
+
+[profile.release.package.mozjpeg]
+opt-level = 3
+
+[profile.dev.package.jpeg-encoder]
+opt-level = 3
+
+[profile.dev.package.openh264]
+opt-level = 3
+
+[profile.dev.package.openh264-sys2]
+opt-level = 3
+
+[profile.dev.package.xcap]
+opt-level = 3
+
+[profile.dev.package.image]
+opt-level = 3
+
+[profile.dev.package.allmystuff-pixels]
+opt-level = 3
+
+[profile.dev.package.nokhwa]
+opt-level = 3
+
+[profile.dev.package.nokhwa-core]
+opt-level = 3
+
+[profile.dev.package.mozjpeg]
+opt-level = 3

@@ -55,7 +55,7 @@ path = "src/bin/serve.rs"
 # itself is version-agnostic). At runtime the ladder still falls back to
 # openh264 when no hardware encoder produces frames.
 default = ["host"]
-hwenc = ["host", "dep:ffmpeg-next"]
+hwenc = ["host", "allmystuff-video/hwenc"]
 
 # Field-test instrumentation the fork added: the periodic telemetry line
 # (telemetry.rs — CPU/GPU-engine/VRAM every second). Diagnostic/prototype
@@ -77,21 +77,12 @@ field-telemetry = []
 # — they stay in every build; watching other machines is the whole point of
 # a capture-less node.
 host = [
+    "allmystuff-video/host",
     "audio-io",
     "dep:portable-pty",
     "dep:xcap",
-    "dep:jpeg-encoder",
     "dep:enigo",
-    "dep:nokhwa",
     "dep:clipboard-rs",
-    "dep:allmystuff-pixels",
-    # …and the per-OS capture underpinnings (see the target tables below):
-    # the ScreenCast portal + DPMS on Linux, the IOKit display-sleep
-    # assertion on macOS.
-    "dep:zbus",
-    "dep:pipewire",
-    "dep:xcb",
-    "dep:core-foundation",
     # Windows capture, injection, and hardware codec backends. The Windows
     # dependency itself stays available for non-capture node services.
     "windows/Win32_Graphics_Direct3D",
@@ -113,12 +104,7 @@ host = [
 audio-io = ["dep:cpal", "dep:libloading"]
 
 [dependencies]
-allmystuff-video = { path = "../crates/allmystuff-video" }
-# Hardware H.264 (and later HEVC/AV1) encode across every vendor behind one
-# API — `h264_nvenc` is real NVENC, plus AMF/QSV/VideoToolbox/VA-API. Optional
-# so a software-only build needs no FFmpeg toolchain; see the `hwenc` feature.
-ffmpeg-next = { version = "6.1", optional = true }
-
+allmystuff-video = { path = "../crates/allmystuff-video", features = ["decode"] }
 # Async runtime — control-socket client + the media-plane tasks. "process"
 # backs the daemon self-update the spawner runs when the installed myownmesh
 # is older than the pin; "signal" handles SIGINT/SIGTERM for a clean serve
@@ -183,16 +169,8 @@ portable-pty = { package = "xpty", version = "0.3.6", optional = true }
 # Screen capture (PipeWire / AVFoundation; the in-house DXGI path on
 # Windows lives in win_capture.rs).
 xcap = { version = "0.9", optional = true }
-# `simd` = runtime-detected AVX2 fDCT/color-convert — a multiple of encode
-# speed on typical x86-64 desktops, plain safe Rust elsewhere.
-jpeg-encoder = { version = "0.7", features = ["simd"], optional = true }
 # Keyboard/mouse injection for inbound input/terminal control routes.
 enigo = { version = "0.6", optional = true }
-# Camera capture for video routes — V4L2 / AVFoundation / Media Foundation.
-nokhwa = { version = "0.10", features = ["input-native"], optional = true }
-# H.264 encode/decode for the mesh's video track lane (Cisco's encoder,
-# built from source). MJPEG stays the fallback.
-openh264 = "0.9"
 # Opus encode/decode for the mesh's audio track lane (libopus, built from
 # source). PCM-over-channel stays the fallback.
 opus = "0.3"
@@ -206,10 +184,6 @@ sysinfo = "0.38"
 # clipboard plane. The clipboard-manager bits the GUI used are a webview
 # concern and stay in the GUI; this is the OS-clipboard side the node owns.
 clipboard-rs = { version = "0.3.5", optional = true }
-# The per-pixel hot loops (frame downscale/strip), split out so dev builds
-# optimize them — see the crate's manifest. Only the host capture/encode
-# paths use these; the receive-only software decoder does not.
-allmystuff-pixels = { path = "pixels", optional = true }
 
 # `libc::kill` for graceful daemon/node teardown (SIGTERM-then-SIGKILL) and
 # for SIGTERM-ing an orphaned daemon we're replacing — needed on every unix,
@@ -218,19 +192,12 @@ allmystuff-pixels = { path = "pixels", optional = true }
 libc = "0.2"
 
 # PR_SET_PDEATHSIG for the daemon lifetime tie (daemon_spawn). libloading
-# dlopens libpulse-simple at runtime for system-audio capture; zbus drives
-# the ScreenCast portal (wayland_capture) and the keep-awake inhibitor
-# (wake); pipewire consumes the portal's stream; xcb makes the DPMS
-# "light the panel" call.
+# dlopens libpulse-simple at runtime for system-audio capture. Video capture
+# and keep-awake dependencies are supplied by allmystuff-video/host.
 [target.'cfg(target_os = "linux")'.dependencies]
 libloading = { version = "0.8", optional = true }
-zbus = { version = "5", optional = true }
-pipewire = { version = "0.9", optional = true }
-xcb = { version = "1", features = ["dpms"], optional = true }
 
-# IOKit power assertions (NoDisplaySleep) while hosting a screen stream.
 [target.'cfg(target_os = "macos")'.dependencies]
-core-foundation = { version = "0.10", optional = true }
 # `diskutil info -plist` is the stable machine-readable bridge from a mounted
 # USB volume (`/Volumes/Windows`) to its whole raw disk (`/dev/rdiskN`).
 plist = "1"

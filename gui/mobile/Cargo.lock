@@ -176,7 +176,6 @@ dependencies = [
  "allmystuff-graph",
  "allmystuff-inventory",
  "allmystuff-node-client",
- "allmystuff-pixels",
  "allmystuff-protocol",
  "allmystuff-session",
  "allmystuff-updater",
@@ -197,7 +196,6 @@ dependencies = [
  "libc",
  "libloading 0.8.9",
  "notify",
- "openh264",
  "opus",
  "parking_lot",
  "plist",
@@ -287,10 +285,20 @@ dependencies = [
 name = "allmystuff-video"
 version = "0.2.121"
 dependencies = [
+ "allmystuff-bridge",
  "allmystuff-frame-timing",
+ "allmystuff-pixels",
+ "allmystuff-protocol",
+ "allmystuff-session",
  "allmystuff-video-metadata",
  "allmystuff-video-pacing",
+ "openh264",
+ "parking_lot",
+ "serde",
+ "serde_json",
  "tracing",
+ "windows 0.61.3",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]

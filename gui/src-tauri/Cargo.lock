@@ -149,7 +149,6 @@ dependencies = [
  "allmystuff-graph",
  "allmystuff-inventory",
  "allmystuff-node-client",
- "allmystuff-pixels",
  "allmystuff-protocol",
  "allmystuff-session",
  "allmystuff-updater",
@@ -158,7 +157,6 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "clipboard-rs",
- "core-foundation 0.10.1",
  "cpal",
  "dav-server",
  "dirs 5.0.1",
@@ -170,15 +168,11 @@ dependencies = [
  "hyper",
  "hyper-util",
  "interprocess",
- "jpeg-encoder",
  "libc",
  "libloading 0.8.9",
- "nokhwa",
  "notify",
- "openh264",
  "opus",
  "parking_lot",
- "pipewire",
  "plist",
  "reqwest 0.12.28",
  "rusqlite",
@@ -195,9 +189,7 @@ dependencies = [
  "windows-service",
  "windows-sys 0.60.2",
  "xcap",
- "xcb",
  "xpty",
- "zbus",
 ]
 
 [[package]]
@@ -280,10 +272,28 @@ dependencies = [
 name = "allmystuff-video"
 version = "0.2.121"
 dependencies = [
+ "allmystuff-bridge",
  "allmystuff-frame-timing",
+ "allmystuff-pixels",
+ "allmystuff-protocol",
+ "allmystuff-session",
  "allmystuff-video-metadata",
  "allmystuff-video-pacing",
+ "core-foundation 0.10.1",
+ "enigo",
+ "jpeg-encoder",
+ "nokhwa",
+ "openh264",
+ "parking_lot",
+ "pipewire",
+ "serde",
+ "serde_json",
  "tracing",
+ "windows 0.61.3",
+ "windows-sys 0.60.2",
+ "xcap",
+ "xcb",
+ "zbus",
 ]
 
 [[package]]
