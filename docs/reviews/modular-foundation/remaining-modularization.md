@@ -3,8 +3,11 @@
 **Status update (2026-09-19).** The [local IPC client extraction](ipc-client-extraction.md)
 is complete. The encoded-video, receive-policy and decoder/backend boundaries
 now live in one `allmystuff-video` package; the [video extraction report](video-library-extraction.md)
-tracks its current validation and qualifications. The ranking, proposals and
-source anchors below are preserved as a historical audit at the stated revision.
+tracks its current validation and qualifications. Fleet storage-plan records,
+validation and transitions now live in `allmystuff-storage::plan`, with the
+durable adapter retained in node; the [storage extraction report](storage-library-extraction.md)
+records compatibility and validation evidence. The ranking, proposals and source
+anchors below are preserved as a historical audit at the stated revision.
 
 Source review by C2 at `6602922dfa7c4eba937e1c8fa4d8eda200da010b`.
 This is a ranked proposal after the timing, byte-queue, pacing, update-policy,

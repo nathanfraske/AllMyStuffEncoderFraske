@@ -19,6 +19,7 @@ artifact identities.
 
 | Library | Current contents | Direct dependencies |
 | --- | --- | --- |
+| [allmystuff-storage](../crates/allmystuff-storage/README.md) | Fleet storage-plan records, validation, ordered transitions and digest, with caller-supplied persistence. | `serde` and `serde_json`; `parking_lot` is test-only. |
 | [allmystuff-video](../crates/allmystuff-video/README.md) | Encoded-video rules, receive/handoff policy, optional decode workers and capture/encode backends. | Default: existing timing/metadata/pacing libraries and `tracing`; native dependencies are feature-gated. |
 | [allmystuff-byte-queues](../crates/allmystuff-byte-queues/src/lib.rs) | Viewer byte queues, watcher tokens and local IPC chunk packing. | `parking_lot` 0.12, `tracing` 0.1. |
 | [allmystuff-frame-timing](../crates/allmystuff-frame-timing/src/lib.rs) | `FrameCadence`, `AssemblyClock`, `SendBreakdown`, `send_breakdown` and `periodic_sample`. | Standard library only. |
@@ -44,6 +45,7 @@ a consumer beside this repository, choose the dependency lines it needs:
 
 ```toml
 [dependencies]
+allmystuff-storage = { path = "../AllMyStuff/crates/allmystuff-storage" }
 allmystuff-video = { path = "../AllMyStuff/crates/allmystuff-video" }
 allmystuff-byte-queues = { path = "../AllMyStuff/crates/allmystuff-byte-queues" }
 allmystuff-frame-timing = { path = "../AllMyStuff/crates/allmystuff-frame-timing" }
@@ -86,6 +88,23 @@ malformed-input differences, logging targets and backend selection retain their
 existing behavior. The [video extraction review](reviews/modular-foundation/video-library-extraction.md)
 records exact compatibility evidence and remaining platform/hardware limits;
 the [package README](../crates/allmystuff-video/README.md) describes its interfaces.
+
+**Storage plan library.** `allmystuff-storage::plan` provides the existing
+records, validation, ordered merge decisions and serialized digest without a
+node runtime, state-directory lookup, mutex or filesystem dependency.
+`PlanState::sanitize()` retains the original load filtering and ordered caps.
+Prepared local updates and peer patches apply through a synchronous persistence
+callback, preserving validation order and the distinct setter/merge rollback
+rules, including consumed counters after a failed setter.
+
+The caller supplies synchronization, durable loading/writing and authenticated
+sender/management decisions. Node retains `storage_plan::StoragePlanStore` and
+the existing public record paths, plus volume/capacity checks, storage-root
+materialization, reconciliation and broadcasts. The library does not implement
+file transfer, mounts or fleet authentication. The
+[storage extraction review](reviews/modular-foundation/storage-library-extraction.md)
+records the frozen comparisons, isolated persistence tests, actual central
+results and platform limits.
 
 **Byte-queue policy.** These are the existing policies, retained unchanged:
 
