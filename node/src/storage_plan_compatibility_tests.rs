@@ -30,7 +30,9 @@ struct TestDirectory {
 impl TestDirectory {
     fn new() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        let parent = std::env::temp_dir().canonicalize().expect("temporary parent");
+        let parent = std::env::temp_dir()
+            .canonicalize()
+            .expect("temporary parent");
         for _ in 0..4096 {
             let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
             let root = parent.join(format!(
@@ -120,7 +122,10 @@ fn policy(replicas: u8) -> StoragePolicy {
 }
 
 fn seed(store: &StoragePlanStore) {
-    assert_eq!(store.set_policy("owner", policy(3)).unwrap().stamp.counter, 1);
+    assert_eq!(
+        store.set_policy("owner", policy(3)).unwrap().stamp.counter,
+        1
+    );
     assert_eq!(
         store
             .set_allocation("owner", "desk".into(), "disk".into(), 1_000, true)
@@ -221,7 +226,10 @@ fn absent_file_loads_exact_defaults_without_creating_state() {
 
 #[test]
 fn malformed_and_schema_invalid_files_are_quarantined_byte_for_byte() {
-    for bytes in [b"{\"policy\":".as_slice(), b"{\"allocations\":[]}".as_slice()] {
+    for bytes in [
+        b"{\"policy\":".as_slice(),
+        b"{\"allocations\":[]}".as_slice(),
+    ] {
         let directory = TestDirectory::new();
         let path = directory.path();
         fs::write(&path, bytes).unwrap();
@@ -296,7 +304,10 @@ fn load_sanitizes_before_ordered_caps_without_rewriting_or_pruning_counters() {
 
     let store = StoragePlanStore::load_at(Some(path.clone()));
     let loaded = store.snapshot();
-    assert_eq!(serde_json::to_value(loaded.policy).unwrap(), default_snapshot()["policy"]);
+    assert_eq!(
+        serde_json::to_value(loaded.policy).unwrap(),
+        default_snapshot()["policy"]
+    );
     assert_eq!(loaded.allocations.len(), 512);
     assert_eq!(loaded.device_intents.len(), 512);
     for (index, allocation) in loaded.allocations.iter().enumerate() {
@@ -305,13 +316,23 @@ fn load_sanitizes_before_ordered_caps_without_rewriting_or_pruning_counters() {
     for (index, intent) in loaded.device_intents.iter().enumerate() {
         assert_eq!(intent.device, format!("device-{index:03}"));
     }
-    assert_eq!(fs::read(&path).unwrap(), bytes, "load must not rewrite semantic invalidity");
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        bytes,
+        "load must not rewrite semantic invalidity"
+    );
     assert!(!sibling(&path, ".corrupt").exists());
     // Discarded records do not exhaust/advance the observed clock; unrelated
     // counters remain stored but do not become this actor's observed counter.
-    assert_eq!(store.set_policy("owner", policy(3)).unwrap().stamp.counter, 42);
+    assert_eq!(
+        store.set_policy("owner", policy(3)).unwrap().stamp.counter,
+        42
+    );
     let saved = read_document(&path);
-    assert_eq!(saved["counters"], json!({"": 901, "owner": 42, "unused": 9_001}));
+    assert_eq!(
+        saved["counters"],
+        json!({"": 901, "owner": 42, "unused": 9_001})
+    );
     assert_eq!(saved["allocations"].as_object().unwrap().len(), 512);
     assert_eq!(saved["device_intents"].as_object().unwrap().len(), 512);
     assert_round_trip(&store, &path);
@@ -423,12 +444,21 @@ fn each_setter_save_failure_restores_records_but_consumes_the_clock() {
         assert_eq!(snapshot(&store), before, "record rollback: {mutation:?}");
         assert_ne!(store.digest(), digest, "counter retention: {mutation:?}");
         assert_eq!(fs::read(&path).unwrap(), bytes);
-        assert_eq!(StoragePlanStore::load_at(Some(path.clone())).digest(), digest);
-        assert!(obstruction.is_dir(), "failed open must leave the obstruction alone");
+        assert_eq!(
+            StoragePlanStore::load_at(Some(path.clone())).digest(),
+            digest
+        );
+        assert!(
+            obstruction.is_dir(),
+            "failed open must leave the obstruction alone"
+        );
 
         fs::remove_dir(&obstruction).unwrap();
         let stamp = mutation.apply(&store).unwrap();
-        assert_eq!(stamp.counter, 5, "failed counter 4 remains consumed: {mutation:?}");
+        assert_eq!(
+            stamp.counter, 5,
+            "failed counter 4 remains consumed: {mutation:?}"
+        );
         assert_eq!(stamp.actor, "owner");
         assert_eq!(read_document(&path)["counters"]["owner"], 5);
         assert!(!obstruction.exists());
@@ -449,16 +479,32 @@ fn changed_merge_save_failure_restores_the_entire_state_and_can_retry() {
     fs::create_dir(&obstruction).unwrap();
     assert!(!remote_patch(&store));
     assert_eq!(snapshot(&store), before);
-    assert_eq!(store.digest(), digest, "merge must also roll back the counters");
+    assert_eq!(
+        store.digest(),
+        digest,
+        "merge must also roll back the counters"
+    );
     assert_eq!(fs::read(&path).unwrap(), bytes);
     assert_round_trip(&store, &path);
     fs::remove_dir(&obstruction).unwrap();
     // The failed remote counter 11 must not leak into a subsequent local write.
-    assert_eq!(store.set_policy("remote", policy(3)).unwrap().stamp.counter, 4);
-    assert!(remote_patch(&store), "the exact failed patch must remain retryable");
+    assert_eq!(
+        store.set_policy("remote", policy(3)).unwrap().stamp.counter,
+        4
+    );
+    assert!(
+        remote_patch(&store),
+        "the exact failed patch must remain retryable"
+    );
     assert!(!remote_patch(&store), "successful retry is idempotent");
-    assert_eq!(read_document(&path)["counters"], json!({"owner": 3, "remote": 11}));
-    assert_eq!(store.set_policy("owner", policy(5)).unwrap().stamp.counter, 12);
+    assert_eq!(
+        read_document(&path)["counters"],
+        json!({"owner": 3, "remote": 11})
+    );
+    assert_eq!(
+        store.set_policy("owner", policy(5)).unwrap().stamp.counter,
+        12
+    );
     assert_round_trip(&store, &path);
     assert!(!obstruction.exists());
 }
@@ -514,10 +560,16 @@ fn rename_failure_cleans_temporary_file_and_preserves_destination() {
     assert_eq!(snapshot(&store), default_snapshot());
     assert_eq!(store.digest(), EMPTY_WITH_OWNER_COUNTER_ONE_DIGEST);
     assert_eq!(fs::read(&sentinel).unwrap(), b"destination sentinel");
-    assert!(!sibling(&path, ".tmp").exists(), "rename failure cleans its temporary file");
+    assert!(
+        !sibling(&path, ".tmp").exists(),
+        "rename failure cleans its temporary file"
+    );
     fs::remove_file(sentinel).unwrap();
     fs::remove_dir(&path).unwrap();
-    assert_eq!(store.set_policy("owner", policy(3)).unwrap().stamp.counter, 2);
+    assert_eq!(
+        store.set_policy("owner", policy(3)).unwrap().stamp.counter,
+        2
+    );
     assert_round_trip(&store, &path);
 }
 
@@ -538,9 +590,16 @@ fn absent_persistence_path_is_successful_memory_operation() {
 
 #[test]
 fn empty_explicit_path_reports_exact_error_for_each_setter_and_rolls_back_merge() {
-    for mutation in [Mutation::Policy, Mutation::InsertAllocation, Mutation::InsertIntent] {
+    for mutation in [
+        Mutation::Policy,
+        Mutation::InsertAllocation,
+        Mutation::InsertIntent,
+    ] {
         let store = StoragePlanStore::load_at(Some(PathBuf::new()));
-        assert_eq!(mutation.apply(&store).unwrap_err(), "storage-plan path has no parent");
+        assert_eq!(
+            mutation.apply(&store).unwrap_err(),
+            "storage-plan path has no parent"
+        );
         assert_eq!(snapshot(&store), default_snapshot());
         assert_eq!(store.digest(), EMPTY_WITH_OWNER_COUNTER_ONE_DIGEST);
         assert!(!remote_patch(&store));
@@ -560,27 +619,47 @@ fn validation_before_and_after_stamping_preserves_errors_and_retry_counters() {
         store.set_policy("owner", policy(0)).unwrap_err(),
         "storage policy is outside its safe bounds"
     );
-    assert_eq!(store.set_policy("", policy(3)).unwrap_err(), "invalid storage-plan actor");
     assert_eq!(
-        store.set_allocation("", "".into(), "disk".into(), 1, true).unwrap_err(),
+        store.set_policy("", policy(3)).unwrap_err(),
+        "invalid storage-plan actor"
+    );
+    assert_eq!(
+        store
+            .set_allocation("", "".into(), "disk".into(), 1, true)
+            .unwrap_err(),
         "invalid storage resource identity"
     );
     assert_eq!(
-        store.set_device_intent("", "".into(), DeviceServiceRole::Automatic).unwrap_err(),
+        store
+            .set_device_intent("", "".into(), DeviceServiceRole::Automatic)
+            .unwrap_err(),
         "invalid device identity"
     );
-    assert_eq!(store.digest(), EMPTY_DIGEST, "pre-stamp errors consume no clock");
     assert_eq!(
-        store.set_allocation("owner", "desk".into(), "disk".into(), 0, true).unwrap_err(),
+        store.digest(),
+        EMPTY_DIGEST,
+        "pre-stamp errors consume no clock"
+    );
+    assert_eq!(
+        store
+            .set_allocation("owner", "desk".into(), "disk".into(), 0, true)
+            .unwrap_err(),
         "invalid storage allocation"
     );
     assert_eq!(snapshot(&store), default_snapshot());
     assert_eq!(store.digest(), EMPTY_WITH_OWNER_COUNTER_ONE_DIGEST);
     assert!(!path.exists());
-    let error = store.set_allocation("owner", "desk".into(), "disk".into(), 1, true).unwrap_err();
+    let error = store
+        .set_allocation("owner", "desk".into(), "disk".into(), 1, true)
+        .unwrap_err();
     assert_io_context(&error, "save fleet storage plan: ");
     fs::remove_dir(&obstruction).unwrap();
-    let allocation = store.set_allocation("owner", "desk".into(), "disk".into(), 1, true).unwrap();
-    assert_eq!(allocation.stamp.counter, 3, "validation and save failures both consumed a counter");
+    let allocation = store
+        .set_allocation("owner", "desk".into(), "disk".into(), 1, true)
+        .unwrap();
+    assert_eq!(
+        allocation.stamp.counter, 3,
+        "validation and save failures both consumed a counter"
+    );
     assert_round_trip(&store, &path);
 }

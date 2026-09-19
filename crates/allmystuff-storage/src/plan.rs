@@ -275,13 +275,13 @@ pub struct DeviceIntentUpdate<'a> {
 }
 
 impl<'a> DeviceIntentUpdate<'a> {
-    pub fn new(
-        actor: &'a str,
-        device: String,
-        role: DeviceServiceRole,
-    ) -> Result<Self, String> {
+    pub fn new(actor: &'a str, device: String, role: DeviceServiceRole) -> Result<Self, String> {
         valid_device(&device)?;
-        Ok(Self { actor, device, role })
+        Ok(Self {
+            actor,
+            device,
+            role,
+        })
     }
 
     /// A failed write restores the previous device intent, but retains the clock.
@@ -290,7 +290,11 @@ impl<'a> DeviceIntentUpdate<'a> {
         inner: &mut PlanState,
         persist: impl FnOnce(&PlanState) -> Result<(), String>,
     ) -> Result<DeviceServiceIntent, String> {
-        let Self { actor, device, role } = self;
+        let Self {
+            actor,
+            device,
+            role,
+        } = self;
         if !inner.device_intents.contains_key(&device)
             && inner.device_intents.len() >= MAX_DEVICE_INTENTS
         {
