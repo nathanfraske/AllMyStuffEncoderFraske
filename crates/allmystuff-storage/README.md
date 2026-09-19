@@ -10,7 +10,8 @@ maps and counters. Deserialize it and call `sanitize()` when loading durable
 state. Sanitization preserves the original validation and ordered truncation;
 it does not clean the counter map. `snapshot()` produces the existing public
 record lists, and `digest()` hashes the same compact JSON bytes as the node.
-The Serde name remains `Persisted` to preserve deserialization diagnostics.
+The Serde name remains `Persisted`, with an explicit `struct Persisted` visitor
+expectation to preserve deserialization diagnostics.
 
 Local mutations use `PolicyUpdate`, `AllocationUpdate` and
 `DeviceIntentUpdate`. Their constructors perform the original checks that

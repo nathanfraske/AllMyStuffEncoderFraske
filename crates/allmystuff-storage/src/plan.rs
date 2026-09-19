@@ -101,7 +101,7 @@ pub enum StoragePlanMessage {
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
-#[serde(default, rename = "Persisted")]
+#[serde(default, rename = "Persisted", expecting = "struct Persisted")]
 pub struct PlanState {
     policy: PolicyRecord,
     allocations: BTreeMap<String, StorageAllocation>,
