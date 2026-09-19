@@ -1,0 +1,116 @@
+{
+  "payload_cap": 4194304,
+  "literal_frames": [
+    {
+      "chunks_hex": [],
+      "poll_hex": ""
+    },
+    {
+      "chunks_hex": [
+        ""
+      ],
+      "poll_hex": "00000000"
+    },
+    {
+      "chunks_hex": [
+        "",
+        "6162",
+        "ff"
+      ],
+      "poll_hex": "0000000002000000616201000000ff"
+    },
+    {
+      "chunks_hex": [
+        "001bff7f"
+      ],
+      "poll_hex": "04000000001bff7f"
+    }
+  ],
+  "sequence": [
+    {
+      "operation": "enqueue_without_queue",
+      "input_hex": "61",
+      "poke": false,
+      "poll_hex": ""
+    },
+    {
+      "operation": "ensure_then_enqueue_empty_then_ab",
+      "poke_values": [
+        true,
+        false
+      ],
+      "poll_hex": "00000000020000006162"
+    },
+    {
+      "operation": "watch_r_watch_other_watch_r",
+      "tokens": [
+        1,
+        2,
+        3
+      ]
+    },
+    {
+      "operation": "unwatch_stale_token",
+      "queue_retained": true
+    },
+    {
+      "operation": "unwatch_current_token",
+      "queue_retained": false
+    },
+    {
+      "operation": "ensure_unwatch_zero",
+      "queue_retained": false
+    }
+  ],
+  "bounds": [
+    {
+      "case": "exact_cap",
+      "length": 4194304,
+      "poke": true,
+      "poll_prefix_hex": "00004000",
+      "payload_retained": 4194304
+    },
+    {
+      "case": "oversized_chunk",
+      "length": 4194305,
+      "poke": true,
+      "poll_hex": ""
+    },
+    {
+      "case": "whole_old_chunk_drop",
+      "chunk_lengths": [
+        4194303,
+        2
+      ],
+      "poke_values": [
+        true,
+        false
+      ],
+      "retained_chunk_lengths": [
+        2
+      ]
+    },
+    {
+      "case": "empty_chunks_count_no_payload",
+      "chunk_lengths": [
+        0,
+        4194304
+      ],
+      "poke_values": [
+        true,
+        false
+      ],
+      "retained_chunk_lengths": [
+        0,
+        4194304
+      ]
+    }
+  ],
+  "viewer_only_route_cleanup": {
+    "host_detach_retains_queue": false,
+    "stub_detach_retains_queue": true,
+    "close_retains_queue_both": true,
+    "stop_retains_queue_both": false
+  },
+  "trace_target": "allmystuff_byte_queues"
+}

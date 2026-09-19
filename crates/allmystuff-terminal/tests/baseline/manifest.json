@@ -1,0 +1,264 @@
+{
+  "source_commit": "ee9cc150f4bdc3fd49a547b563f0381dae3685f5",
+  "source_inputs": [
+    {
+      "path": "node/src/terminal.rs",
+      "git_blob": "2e6c0a323bc921264812048251554bc9a5bfeb5b",
+      "sha256": "b0e9793d20af7e0e474fe014edf8dd5b2172f39b053c966e8fee551c5bfc30bd",
+      "bytes": 50983,
+      "lines": 1317
+    },
+    {
+      "path": "node/src/stubs/terminal.rs",
+      "git_blob": "9c5bf31baf8cc6d07504a102d6b9347f16320fff",
+      "sha256": "37220025f212acd0331bc0576a2f4b930e1910a39570d76aff990177a38a6154",
+      "bytes": 4560,
+      "lines": 144
+    },
+    {
+      "path": "node/src/lib.rs",
+      "git_blob": "fe2dedd68e3010e0c9df81a70a481b6e3d1ca872",
+      "sha256": "ba062aea717a927dd60fdf7039f900ea16ae5f773ae0f55e778c536cb3b76426",
+      "bytes": 12248,
+      "lines": 252
+    },
+    {
+      "path": "node/src/byte_queues.rs",
+      "git_blob": "eb5c963b7f10f2ed03c32f384467dc4baa6d0352",
+      "sha256": "59af3426b43b83944118a92ea00119f1f3efbfad1b0fdbb65b69f361a533f0be",
+      "bytes": 115,
+      "lines": 3
+    },
+    {
+      "path": "crates/allmystuff-byte-queues/src/lib.rs",
+      "git_blob": "5ffa267df404f59758e16f660760d488e3c9bf4a",
+      "sha256": "409aa9203e1a186e1862fd035f48c906e41a350f4eeb111bd54900019146f737",
+      "bytes": 7341,
+      "lines": 202
+    },
+    {
+      "path": "crates/allmystuff-byte-queues/Cargo.toml",
+      "git_blob": "5ea3793d84a4430b8c72e2f950176e3e0a9b1900",
+      "sha256": "aa463926cfde139bbde1dccfb5b520f27ac68eb9ddde0344da65896899bf0faa",
+      "bytes": 363,
+      "lines": 13
+    },
+    {
+      "path": "node/src/mesh.rs",
+      "git_blob": "7152bfc26d664871dec54d1d1cc1fbab79cf06ef",
+      "sha256": "ba29eb2da4c9ef50df541809bf7ef80a9cd56c7715db734764faa8b16db9a884",
+      "bytes": 1098847,
+      "lines": 24364
+    },
+    {
+      "path": "node/src/node_control.rs",
+      "git_blob": "80d50edd03c2a791749e906526fe78e3e9a2e09d",
+      "sha256": "535f6f67a1cbbd814d4b60df1a31bcc882972416949bcac6072475e454c2cd26",
+      "bytes": 124891,
+      "lines": 2966
+    },
+    {
+      "path": "crates/allmystuff-session/src/media.rs",
+      "git_blob": "82bb5ec7076dd7924ea3c6b7f34025c4fa9883d7",
+      "sha256": "3cf9ee90a7119cee9b99d0ae8cb19833a4aaa6611b9fbf50c9906fc59b9c607c",
+      "bytes": 62955,
+      "lines": 1708
+    },
+    {
+      "path": "crates/allmystuff-protocol/src/app.rs",
+      "git_blob": "f5a52a29e93f48b4fa37c44c57924e4083aba7d0",
+      "sha256": "2b1338b79c8139ef09534f00d10549df67eda5181bceb6982c431d2a3bd18a71",
+      "bytes": 118738,
+      "lines": 2526
+    },
+    {
+      "path": "Cargo.toml",
+      "git_blob": "2c0b3336cd7f2e963fc3aaf94c39846e5c96e3a4",
+      "sha256": "f190b43a27850f08fd00dde1b1340dcad09f966097f83296e82eca474ad65e9a",
+      "bytes": 6197,
+      "lines": 170
+    },
+    {
+      "path": "node/Cargo.toml",
+      "git_blob": "48ef9c425f7e56f79c6994224fd0ed8f8ddaa00e",
+      "sha256": "b4222f1103b8f2d9ac0d8622272b8d4e2ef576068eff0b792a97a8921d36bf0c",
+      "bytes": 14767,
+      "lines": 324
+    },
+    {
+      "path": "gui/src-tauri/Cargo.toml",
+      "git_blob": "fb15a6f45a8aa9baa3b69090b80a122cb5d06d18",
+      "sha256": "b1a351753c42f07a82cfa66d3df76ac0a489a71411d286ceb3fedf94a6a49262",
+      "bytes": 8619,
+      "lines": 215
+    },
+    {
+      "path": "gui/mobile/Cargo.toml",
+      "git_blob": "dc6ef4d5b1273c801c613f32b0293a5d8647b591",
+      "sha256": "1f02db633993c5c79b510937155b151df6f18114de8ee425cbbced801e3df1a2",
+      "bytes": 5723,
+      "lines": 117
+    },
+    {
+      "path": "Cargo.lock",
+      "git_blob": "4b58a1be7ae74a678457ae9643f6fbed36fba5df",
+      "sha256": "7f62cf98dab1a59113d2c5d11223c2bb0ef79cca670c0461699ff1d197cf9b7f",
+      "bytes": 121823,
+      "lines": 4965
+    },
+    {
+      "path": "node/Cargo.lock",
+      "git_blob": "af50eeb433cbee2c66fcf443f273aee6a908d574",
+      "sha256": "e295d1d77026a0e292c9d57eaf120b2aec05075404ec948be4ebde65411e955b",
+      "bytes": 151083,
+      "lines": 6127
+    },
+    {
+      "path": "gui/src-tauri/Cargo.lock",
+      "git_blob": "78ff3ad2dd2bfaa7b1b0db5e6a2c211378770b91",
+      "sha256": "f0b659b191321b0f77e1569371798a0fd53453fb27a970259138d52162bb2644",
+      "bytes": 207792,
+      "lines": 8625
+    },
+    {
+      "path": "gui/mobile/Cargo.lock",
+      "git_blob": "180e85c0e7890189801717f2b473e5ecf4091fe6",
+      "sha256": "42ac499bbd13d567ab081d5e398abf8690c9cfce9ac1289b316ff8b2b94f1e7c",
+      "bytes": 188354,
+      "lines": 7920
+    }
+  ],
+  "snapshots": [
+    {
+      "path": "terminal.rs",
+      "source": "node/src/terminal.rs",
+      "line_ranges_inclusive": [
+        [
+          1,
+          1317
+        ]
+      ],
+      "sha256": "b0e9793d20af7e0e474fe014edf8dd5b2172f39b053c966e8fee551c5bfc30bd",
+      "bytes": 50983
+    },
+    {
+      "path": "terminal_stub.rs",
+      "source": "node/src/stubs/terminal.rs",
+      "line_ranges_inclusive": [
+        [
+          1,
+          144
+        ]
+      ],
+      "sha256": "37220025f212acd0331bc0576a2f4b930e1910a39570d76aff990177a38a6154",
+      "bytes": 4560
+    },
+    {
+      "path": "node_runtime.rs",
+      "source": "node/src/lib.rs",
+      "line_ranges_inclusive": [
+        [
+          214,
+          252
+        ]
+      ],
+      "sha256": "667febb7ba98b8ac57e2fdce937b53a6d9c7987ce2ceb08912f169249ee147b6",
+      "bytes": 1985
+    },
+    {
+      "path": "byte_queues.rs",
+      "source": "crates/allmystuff-byte-queues/src/lib.rs",
+      "line_ranges_inclusive": [
+        [
+          1,
+          202
+        ]
+      ],
+      "sha256": "409aa9203e1a186e1862fd035f48c906e41a350f4eeb111bd54900019146f737",
+      "bytes": 7341
+    },
+    {
+      "path": "mesh_terminal.rs",
+      "source": "node/src/mesh.rs",
+      "line_ranges_inclusive": [
+        [
+          13912,
+          14586
+        ]
+      ],
+      "sha256": "5c99ff8d9ca25547009330bc42144375e8115f9fe4187a211d8f12900c138e26",
+      "bytes": 32328
+    },
+    {
+      "path": "node_control_terminal.rs",
+      "source": "node/src/node_control.rs",
+      "line_ranges_inclusive": [
+        [
+          986,
+          1009
+        ]
+      ],
+      "sha256": "7e2515ed722a7bb641fefad18a776b3f2217d13589dceca03aee5c9a37a001a9",
+      "bytes": 1046
+    },
+    {
+      "path": "session_terminal.rs",
+      "source": "crates/allmystuff-session/src/media.rs",
+      "line_ranges_inclusive": [
+        [
+          121,
+          207
+        ]
+      ],
+      "sha256": "27d5cbed250f11cf4877de998d5b02113b0200dcae750a47982a846665c7e7d2",
+      "bytes": 2949
+    },
+    {
+      "path": "protocol_session_info.rs",
+      "source": "crates/allmystuff-protocol/src/app.rs",
+      "line_ranges_inclusive": [
+        [
+          1006,
+          1023
+        ]
+      ],
+      "sha256": "ebe9fcc6938b3f0b3ba8bdd1acc6d245a34189812d56955b3c94fe4cb0c20227",
+      "bytes": 989
+    },
+    {
+      "path": "node_terminal_test_inventory.rs",
+      "source": "node/src/mesh.rs",
+      "line_ranges_inclusive": [
+        [
+          22971,
+          23144
+        ]
+      ],
+      "sha256": "f1f0255fcfb923f1d9b78fa5e03c288e9e2c29cf5e160fcf7c1afc34d8044fb2",
+      "bytes": 7657
+    }
+  ],
+  "literal_vectors": [
+    {
+      "path": "contract_vectors.json",
+      "sha256": "2ce0a0580c042540e6b7a2b96c7b0f99bd713d28f4661793857cb8a22ea17671",
+      "bytes": 4168
+    },
+    {
+      "path": "scrollback_vectors.json",
+      "sha256": "ef7fd721496bbfe5fa63fa38b018d92eeb9c295bad55d8afa5b9a9b073829e01",
+      "bytes": 920
+    },
+    {
+      "path": "resize_vectors.json",
+      "sha256": "cda9e0ec2b9070d1b0c36e43409bad817a9f4ba546c87b27a8cec1f9a2ec4cc9",
+      "bytes": 1235
+    },
+    {
+      "path": "viewer_vectors.json",
+      "sha256": "35e7e78109256b98f430c1ae9c19187a1a13052ea0099e05708fbd0f42860835",
+      "bytes": 2120
+    }
+  ],
+  "qualification": "Read-only Git source copies and independent literal expectations; no Rust, PTY or test execution and no extracted source read."
+}

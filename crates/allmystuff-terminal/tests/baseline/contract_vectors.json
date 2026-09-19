@@ -1,0 +1,106 @@
+{
+  "basis": "Independent source-derived expectations frozen before reading the extraction; not runtime results.",
+  "constants": {
+    "read_buf": 8192,
+    "out_queue": 256,
+    "ctl_queue": 256,
+    "viewer_payload_cap": 4194304,
+    "scrollback_cap": 262144,
+    "session_idle_reap_ms": 3600000,
+    "max_local_sessions": 32,
+    "wait_exit_linger_ms": 120
+  },
+  "errors": {
+    "disabled_host": "this device cannot host a terminal",
+    "session_cap_32": "too many terminal sessions open here (32); close one before opening another",
+    "no_candidates": "couldn't start a shell: no shell candidates",
+    "runtime_missing": "allmystuff-node runtime not registered — Mesh::start calls set_runtime()",
+    "openpty_prefix": "openpty failed: ",
+    "reader_prefix": "pty reader: ",
+    "writer_prefix": "pty writer: ",
+    "spawn_prefix": "couldn't start a shell: "
+  },
+  "session_info_json": "{\"session_id\":\"s\\u0000é\",\"title\":\"shell\",\"created_unix\":42,\"attachers\":2}",
+  "outmsg_debug": [
+    "Data([0, 27, 255])",
+    "Resize { cols: 65535, rows: 0 }",
+    "Exit(None)",
+    "Exit(Some(-1))"
+  ],
+  "spawn_sites": {
+    "idle_reaper": 564,
+    "bridge": 727
+  },
+  "preserved_source_quirks": [
+    "Construction does not inspect or register a runtime; registry lookup occurs only at the two spawn calls.",
+    "Last detach removes route mapping, attacher and viewer queue before attempting to spawn the reaper.",
+    "Every created session gets generation 1; no source path increments generation on reattach/recreate.",
+    "The create cap check releases the session lock before opening a PTY; it is not a reservation.",
+    "Default shell candidates are constructed before open_with can choose attach or refuse the cap.",
+    "Attach ignores supplied dimensions and inherits the current reconciliation.",
+    "Reconcile always attempts a control send; changed-size broadcast and last_size update also occur on control-send failure.",
+    "Initial create passes raw u16 dimensions; only reconciliation clamps zero minima to one.",
+    "Session list order follows HashMap iteration, without sorting.",
+    "Bridge replays nonempty scrollback as one Data, forwards empty Data and Exit, and continues after Exit until channel close or send failure.",
+    "Bridge skips lagged broadcast messages and awaits each bounded mpsc send.",
+    "Close kills directly before best-effort Shutdown and route removal; it does not remove viewer queues.",
+    "Host detach removes the requested viewer queue even if there was no route/session; disabled-host detach is a no-op.",
+    "Stop closes the route's session, but removes only the requested route's viewer queue.",
+    "Thread-spawn failure logs an error and does not become an open error; worker join handles are not retained.",
+    "Exit waits 120ms and uses the scrollback guard, without a reader completion join or durable total-order guarantee."
+  ],
+  "shell_candidates": {
+    "windows": [
+      [
+        "pwsh.exe",
+        "-NoLogo"
+      ],
+      [
+        "powershell.exe",
+        "-NoLogo"
+      ],
+      [
+        "CommandBuilder::new_default_prog().get_shell()"
+      ]
+    ],
+    "unix": [
+      [
+        "default_shell",
+        "-l"
+      ],
+      [
+        "default_shell"
+      ],
+      [
+        "/bin/sh (only when different from default_shell)"
+      ]
+    ],
+    "cwd": "ALLMYSTUFF_USER_HOME var_os, otherwise dirs::home_dir; no environment mutation",
+    "environment": {
+      "TERM": "xterm-256color",
+      "COLORTERM": "truecolor"
+    }
+  },
+  "existing_tests": {
+    "pure_all_targets": [
+      "dsr_probe_counting_finds_each_query",
+      "scrollback_ring_caps_and_keeps_the_tail"
+    ],
+    "windows_pty": [
+      "spawn_cmd_echo_and_exit_without_cursor_handshake"
+    ],
+    "unix_pty": [
+      "spawn_echo_roundtrip",
+      "resize_reaches_the_pty",
+      "exit_code_surfaces",
+      "stop_kills_promptly",
+      "multi_attach_fan_out",
+      "scrollback_replay",
+      "shared_input_reaches_one_shell",
+      "detach_does_not_kill",
+      "resize_reconciles_to_min",
+      "attach_does_not_shrink_to_the_joiners_placeholder",
+      "double_open_reattaches"
+    ]
+  }
+}
