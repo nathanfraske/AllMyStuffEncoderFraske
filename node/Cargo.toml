@@ -5,10 +5,10 @@
 # — `allmystuff serve` on a headless box — while the GUI links the very same
 # code and supplies a Tauri-backed [`UiSink`] for its front-end events.
 #
-# Its own Cargo workspace (an empty `[workspace]` table) keeps the heavy
-# media stack (xcap / cpal / openh264 / nokhwa / opus / …) out of the root
-# library workspace, exactly like `gui/` — see the root `Cargo.toml`.
+# Keep the application in its own workspace. Pixels remains a member now
+# that the shared video library owns its path dependency.
 [workspace]
+members = ["pixels"]
 
 [patch.crates-io]
 # Experimental RISC-V target recognition; codec sources and version are unchanged.
