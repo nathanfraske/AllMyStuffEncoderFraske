@@ -19,6 +19,7 @@ artifact identities.
 
 | Library | Current contents | Direct dependencies |
 | --- | --- | --- |
+| [allmystuff-video](../crates/allmystuff-video/README.md) | Encoded-video rules, receive/handoff policy, optional decode workers and capture/encode backends. | Default: existing timing/metadata/pacing libraries and `tracing`; native dependencies are feature-gated. |
 | [allmystuff-byte-queues](../crates/allmystuff-byte-queues/src/lib.rs) | Viewer byte queues, watcher tokens and local IPC chunk packing. | `parking_lot` 0.12, `tracing` 0.1. |
 | [allmystuff-frame-timing](../crates/allmystuff-frame-timing/src/lib.rs) | `FrameCadence`, `AssemblyClock`, `SendBreakdown`, `send_breakdown` and `periodic_sample`. | Standard library only. |
 | [allmystuff-update-policy](../crates/allmystuff-update-policy/src/lib.rs) | `ApplyPolicy`, exact policy-token parsing, `compare_semver` and `policy_allows`. | `serde` 1; `serde_json` is test-only. |
@@ -26,8 +27,10 @@ artifact identities.
 | [allmystuff-inventory-model](../crates/allmystuff-inventory-model/src/lib.rs) | Inventory/device records, enum wire values and their existing pure helpers. | `serde` 1; `serde_json` is test-only. |
 | [allmystuff-video-metadata](../crates/allmystuff-video-metadata/src/lib.rs) | Annex-B offsets and AU identity marker insertion, inspection and removal. | `memchr` 2. |
 
-These packages do not depend on the node, GUI, codecs, capture backends or a
-Mesh transport. They inherit workspace version `0.2.121`, edition 2021 and declared
+These packages do not depend on the node, GUI or a Mesh transport. Their default
+features exclude native codecs and capture backends; the unified video package
+adds those through explicit features described below. They inherit workspace
+version `0.2.121`, edition 2021 and declared
 minimum Rust `1.88.0`; a declared minimum is not a new toolchain qualification.
 The node modules are compatibility shims: the public
 `allmystuff_node::byte_queues::ByteQueues` path remains available, and existing
@@ -41,6 +44,7 @@ a consumer beside this repository, choose the dependency lines it needs:
 
 ```toml
 [dependencies]
+allmystuff-video = { path = "../AllMyStuff/crates/allmystuff-video" }
 allmystuff-byte-queues = { path = "../AllMyStuff/crates/allmystuff-byte-queues" }
 allmystuff-frame-timing = { path = "../AllMyStuff/crates/allmystuff-frame-timing" }
 allmystuff-update-policy = { path = "../AllMyStuff/crates/allmystuff-update-policy" }
@@ -63,6 +67,25 @@ encoded-video consumers can inspect or add the existing AU metadata without
 linking a capture, decoder or node runtime.
 These choices require no running AllMyStuff host. The extractions supply no
 application SDK, provider registry or identity-approval system.
+
+**Unified video library.** `allmystuff-video` has an empty default feature set:
+metadata, timing, pacing, classification, the separate host/receive-only framing
+walks, route assembly, canonical-peer ingress and handoff policy are available
+without native media dependencies. `decode` adds software receive workers and
+a caller-supplied RGBA output policy. `host` includes `decode` and the existing
+capture/encode group with platform backends; `hwenc` includes `host` and the
+optional FFmpeg encoder ladder. Node always enables `decode` and forwards its
+existing `host` and `hwenc` flags, preserving its default and no-default mappings.
+
+Node retains route binding, authorization, local IPC envelopes/transport and
+process supervision. Its decoder output adapter writes directly into the
+existing final packet allocation; its desktop follower is constructed inside
+the original capture thread. Shared performance and wake state each have one
+implementation, with node compatibility reexports. Queue feedback, recovery,
+malformed-input differences, logging targets and backend selection retain their
+existing behavior. The [video extraction review](reviews/modular-foundation/video-library-extraction.md)
+records exact compatibility evidence and remaining platform/hardware limits;
+the [package README](../crates/allmystuff-video/README.md) describes its interfaces.
 
 **Byte-queue policy.** These are the existing policies, retained unchanged:
 

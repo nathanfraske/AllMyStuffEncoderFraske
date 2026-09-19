@@ -1,5 +1,11 @@
 # Remaining modularization opportunities
 
+**Status update (2026-09-19).** The [local IPC client extraction](ipc-client-extraction.md)
+is complete. The encoded-video, receive-policy and decoder/backend boundaries
+now live in one `allmystuff-video` package; the [video extraction report](video-library-extraction.md)
+tracks its current validation and qualifications. The ranking, proposals and
+source anchors below are preserved as a historical audit at the stated revision.
+
 Source review by C2 at `6602922dfa7c4eba937e1c8fa4d8eda200da010b`.
 This is a ranked proposal after the timing, byte-queue, pacing, update-policy,
 inventory-model and video-metadata extractions. It changes no application

@@ -59,8 +59,8 @@ Existing timing, pacing, metadata and pixels packages remain implementation
 dependencies. Platform capture discovery still uses its original application
 model/path helpers. Runtime capability negotiation remains caller-owned.
 
-Native source movement and compatibility fixtures are under independent review.
-Central compilation, lock canonicalization and compatibility execution remain
-pending. Hardware tests may open real capture/GPU resources and are not covered
+The [compatibility review](../../docs/reviews/modular-foundation/video-library-extraction.md)
+records source comparisons, central validation and remaining qualifications.
+Hardware tests may open real capture/GPU resources and are not covered
 by an unqualified whole-library test command; the reviewed central test plan
 selects isolated policies and software codec paths explicitly.
