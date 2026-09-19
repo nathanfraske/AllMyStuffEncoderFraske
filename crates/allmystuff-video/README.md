@@ -14,12 +14,14 @@ receive/handoff policy without a native codec, capture device or transport.
 Node enables `decode` in every build and forwards its existing `host` and
 `hwenc` flags. The capture and encode code remains grouped as before; these
 features do not introduce new backend priorities or independent hardware
-capability claims. AV1 decode remains the existing unsupported branch.
+capability claims. Windows `host` builds retain AV1 dispatch through NVDEC and
+D3D11VA, whose `open` and `decode` methods currently return not-yet-implemented
+errors. Other `decode` builds retain the unsupported-platform AV1 fallback.
 
 `framing::split_annexb_paced_host` and `framing::split_annexb_paced_stub` preserve
 the two existing walks, including their different malformed-prefix behavior.
 `codec::sniff_codec` classifies the original byte patterns; it is not a validator
-or a declaration that a decoder backend exists. AV1 decoding remains a stub.
+or a declaration that a decoder backend exists.
 
 The caller owns peer authentication, route binding, IPC headers, queue admission,
 recovery requests and process supervision. `receive::accept_paced_fragment`
