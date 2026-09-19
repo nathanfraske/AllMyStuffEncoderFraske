@@ -300,6 +300,38 @@ fn count(bytes: &[u8], needle: &[u8]) -> usize {
         .count()
 }
 
+fn diagnose_replay(phase: &str, a: &Viewer, b: &Viewer) {
+    // Diagnostic only: inspect already-consumed output, without draining either
+    // receiver or altering the existing command/acknowledgement sequence.
+    const BYTE_LIMIT: usize = 1024;
+    const SIZE_LIMIT: usize = 16;
+    for (observer, viewer) in [("a", a), ("b", b)] {
+        eprintln!(
+            "replay-diagnostic phase={phase} observer={observer} before_count={} after_count={} sizes_total={} sizes_prefix={:?}",
+            count(&viewer.bytes, b"AMS:BEFORE"),
+            count(&viewer.bytes, b"AMS:AFTER"),
+            viewer.sizes.len(),
+            &viewer.sizes[..viewer.sizes.len().min(SIZE_LIMIT)]
+        );
+        for (part, bytes) in [
+            ("replay", viewer.replay.as_slice()),
+            ("live", &viewer.bytes[viewer.replay.len()..]),
+        ] {
+            let prefix = &bytes[..bytes.len().min(BYTE_LIMIT)];
+            let escaped: String = prefix
+                .iter()
+                .flat_map(|byte| std::ascii::escape_default(*byte))
+                .map(char::from)
+                .collect();
+            eprintln!(
+                "replay-diagnostic phase={phase} observer={observer} part={part} total_bytes={} omitted_bytes={} raw_hex={prefix:02x?} escaped={escaped}",
+                bytes.len(),
+                bytes.len() - prefix.len()
+            );
+        }
+    }
+}
+
 fn isolate_command(mut command: CommandBuilder, cwd: &Path) -> CommandBuilder {
     command.cwd(cwd);
     // These are per-child values, never process-global environment changes.
@@ -472,6 +504,7 @@ fn scrollback_then_live_output_has_no_gap_or_duplicate() {
     fixture.send("a", "before");
     a.wait_marker(b"AMS:BEFORE");
     let mut b = fixture.attach("replay", "b");
+    diagnose_replay("attached", &a, &b);
     assert_eq!(count(&b.replay, b"AMS:BEFORE"), 1);
     assert!(!contains(&b.replay, b"AMS:AFTER"));
 
@@ -479,8 +512,11 @@ fn scrollback_then_live_output_has_no_gap_or_duplicate() {
     a.wait_marker(b"AMS:AFTER");
     b.wait_marker(b"AMS:AFTER");
     // A later shell acknowledgement is a causal fence for prior output.
+    diagnose_replay("before-confirm", &a, &b);
     fixture.send("b", "confirm");
     b.wait_marker(b"AMS:CONFIRM");
+    // Only B consumed CONFIRM; A remains at its existing AFTER boundary.
+    diagnose_replay("after-confirm-a-still-at-after", &a, &b);
     assert_eq!(count(&b.bytes, b"AMS:BEFORE"), 1);
     assert_eq!(count(&b.bytes, b"AMS:AFTER"), 1);
     let transcript = String::from_utf8_lossy(&b.bytes);
