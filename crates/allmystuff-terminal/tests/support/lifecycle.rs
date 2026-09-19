@@ -293,45 +293,6 @@ fn contains(bytes: &[u8], needle: &[u8]) -> bool {
     bytes.windows(needle.len()).any(|window| window == needle)
 }
 
-fn count(bytes: &[u8], needle: &[u8]) -> usize {
-    bytes
-        .windows(needle.len())
-        .filter(|window| *window == needle)
-        .count()
-}
-
-fn diagnose_replay(phase: &str, a: &Viewer, b: &Viewer) {
-    // Diagnostic only: inspect already-consumed output, without draining either
-    // receiver or altering the existing command/acknowledgement sequence.
-    const BYTE_LIMIT: usize = 1024;
-    const SIZE_LIMIT: usize = 16;
-    for (observer, viewer) in [("a", a), ("b", b)] {
-        eprintln!(
-            "replay-diagnostic phase={phase} observer={observer} before_count={} after_count={} sizes_total={} sizes_prefix={:?}",
-            count(&viewer.bytes, b"AMS:BEFORE"),
-            count(&viewer.bytes, b"AMS:AFTER"),
-            viewer.sizes.len(),
-            &viewer.sizes[..viewer.sizes.len().min(SIZE_LIMIT)]
-        );
-        for (part, bytes) in [
-            ("replay", viewer.replay.as_slice()),
-            ("live", &viewer.bytes[viewer.replay.len()..]),
-        ] {
-            let prefix = &bytes[..bytes.len().min(BYTE_LIMIT)];
-            let escaped: String = prefix
-                .iter()
-                .flat_map(|byte| std::ascii::escape_default(*byte))
-                .map(char::from)
-                .collect();
-            eprintln!(
-                "replay-diagnostic phase={phase} observer={observer} part={part} total_bytes={} omitted_bytes={} raw_hex={prefix:02x?} escaped={escaped}",
-                bytes.len(),
-                bytes.len() - prefix.len()
-            );
-        }
-    }
-}
-
 fn isolate_command(mut command: CommandBuilder, cwd: &Path) -> CommandBuilder {
     command.cwd(cwd);
     // These are per-child values, never process-global environment changes.
@@ -501,24 +462,31 @@ fn multi_attach_fans_out_and_shared_input_reaches_one_shell() {
 fn scrollback_then_live_output_has_no_gap_or_duplicate() {
     let mut fixture = Fixture::new();
     let mut a = fixture.start("replay", "a");
+    assert!(a.replay.is_empty(), "first observer receives only live bytes");
     fixture.send("a", "before");
     a.wait_marker(b"AMS:BEFORE");
     let mut b = fixture.attach("replay", "b");
-    diagnose_replay("attached", &a, &b);
-    assert_eq!(count(&b.replay, b"AMS:BEFORE"), 1);
+    assert!(contains(&b.replay, b"AMS:BEFORE"));
     assert!(!contains(&b.replay, b"AMS:AFTER"));
 
     fixture.send("a", "after");
     a.wait_marker(b"AMS:AFTER");
     b.wait_marker(b"AMS:AFTER");
     // A later shell acknowledgement is a causal fence for prior output.
-    diagnose_replay("before-confirm", &a, &b);
+    assert!(!contains(&a.bytes, b"AMS:CONFIRM"));
+    assert!(!contains(&b.bytes, b"AMS:CONFIRM"));
     fixture.send("b", "confirm");
+    a.wait_marker(b"AMS:CONFIRM");
     b.wait_marker(b"AMS:CONFIRM");
-    // Only B consumed CONFIRM; A remains at its existing AFTER boundary.
-    diagnose_replay("after-confirm-a-still-at-after", &a, &b);
-    assert_eq!(count(&b.bytes, b"AMS:BEFORE"), 1);
-    assert_eq!(count(&b.bytes, b"AMS:AFTER"), 1);
+    // ConPTY can repaint prior text after the attach's native resize. Preserve
+    // every raw byte and compare both observers at the same fresh fence: any
+    // extra, lost or reordered byte at the replay/live split must still fail.
+    assert!(
+        a.bytes.len() < super::SCROLLBACK_CAP,
+        "fixture transcript must fit entirely in scrollback"
+    );
+    assert!(a.bytes.starts_with(&b.replay), "replay must be an exact prefix");
+    assert_eq!(a.bytes, b.bytes, "replay plus live must equal original live output");
     let transcript = String::from_utf8_lossy(&b.bytes);
     assert!(transcript.find("AMS:BEFORE") < transcript.find("AMS:AFTER"));
     assert!(transcript.find("AMS:AFTER") < transcript.find("AMS:CONFIRM"));
