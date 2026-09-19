@@ -1,0 +1,85 @@
+    pub async fn fleet_storage_set_policy(
+        self: &Arc<Self>,
+        policy: StoragePolicy,
+    ) -> Result<Value, String> {
+        if !self.local_may_manage_storage().await {
+            return Err("only a fleet owner or manager can change storage policy".into());
+        }
+        let actor = self
+            .local_node_id()
+            .map(|node| pubkey_part(node.as_str()).to_string())
+            .ok_or("this device identity is not ready")?;
+        let record = self.storage_plan.set_policy(&actor, policy)?;
+        self.broadcast_storage_patch(Some(record.clone()), Vec::new(), Vec::new())
+            .await;
+        self.sink.emit(
+            "allmystuff://fleet-storage",
+            json!({ "plan": self.storage_plan.snapshot() }),
+        );
+        Ok(serde_json::to_value(record).unwrap_or(Value::Null))
+    }
+
+    pub async fn fleet_storage_set_allocation(
+        self: &Arc<Self>,
+        device: String,
+        volume: String,
+        quota_bytes: u64,
+        enabled: bool,
+    ) -> Result<Value, String> {
+        let actor = self
+            .local_node_id()
+            .map(|node| pubkey_part(node.as_str()).to_string())
+            .ok_or("this device identity is not ready")?;
+        let device = pubkey_part(&device).to_string();
+        let local = same_node(&actor, &device);
+        if !local && !self.local_may_manage_storage().await {
+            return Err("only a fleet owner or manager can allocate another device".into());
+        }
+        let resource = self
+            .known_storage_volume(&device, &volume)
+            .ok_or("that volume is not currently advertised by the device")?;
+        if quota_bytes == 0 || quota_bytes > resource.total_bytes {
+            return Err("allocation must fit within the volume's total capacity".into());
+        }
+        if local && enabled {
+            self.materialize_local_storage_root(&volume)?;
+        }
+        let allocation = self.storage_plan.set_allocation(
+            &actor,
+            device,
+            volume.clone(),
+            quota_bytes,
+            enabled,
+        )?;
+        self.reconcile_local_storage_allocations();
+        self.broadcast_storage_patch(None, vec![allocation.clone()], Vec::new())
+            .await;
+        self.sink.emit(
+            "allmystuff://fleet-storage",
+            json!({ "plan": self.storage_plan.snapshot() }),
+        );
+        Ok(serde_json::to_value(allocation).unwrap_or(Value::Null))
+    }
+    pub async fn fleet_storage_set_device_role(
+        self: &Arc<Self>,
+        device: String,
+        role: DeviceServiceRole,
+    ) -> Result<Value, String> {
+        let actor = self
+            .local_node_id()
+            .map(|node| pubkey_part(node.as_str()).to_string())
+            .ok_or("this device identity is not ready")?;
+        let device = pubkey_part(&device).to_string();
+        let local = same_node(&actor, &device);
+        if !local && !self.local_may_manage_storage().await {
+            return Err("only a fleet owner or manager can set another device's role".into());
+        }
+        let intent = self.storage_plan.set_device_intent(&actor, device, role)?;
+        self.broadcast_storage_patch(None, Vec::new(), vec![intent.clone()])
+            .await;
+        self.sink.emit(
+            "allmystuff://fleet-storage",
+            json!({ "plan": self.storage_plan.snapshot() }),
+        );
+        Ok(serde_json::to_value(intent).unwrap_or(Value::Null))
+    }

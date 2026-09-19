@@ -1,0 +1,124 @@
+{
+  "schema": 1,
+  "source_revision": "ac548bddd23f413de60c4edd4b47c8e0b60342e0",
+  "method": "Raw Git UTF-8/LF input frozen before reading the extracted implementation. Literal expectations are source-derived, not execution results.",
+  "sources": {
+    "node/src/storage_plan.rs": {
+      "git_blob": "367b85c012c322b4fc571af2ddf951625ec07f67",
+      "sha256": "28a4b8e7939aa4980c7d3d8ec7257aae273bf2865f155a2b8f2b588e39a1f965",
+      "bytes": 19702,
+      "lines": 604
+    },
+    "node/src/persist.rs": {
+      "git_blob": "150d824afc7e9d179398dbbd0658779e1bdfe72a",
+      "sha256": "b77a626fffd84d15f5aa70f833deed19d1ea8ce47444aaf9cb6ea24692501a72",
+      "bytes": 4571,
+      "lines": 123
+    },
+    "node/src/mesh.rs": {
+      "git_blob": "7152bfc26d664871dec54d1d1cc1fbab79cf06ef",
+      "sha256": "ba29eb2da4c9ef50df541809bf7ef80a9cd56c7715db734764faa8b16db9a884",
+      "bytes": 1098847,
+      "lines": 24364
+    },
+    "node/src/node_control.rs": {
+      "git_blob": "80d50edd03c2a791749e906526fe78e3e9a2e09d",
+      "sha256": "535f6f67a1cbbd814d4b60df1a31bcc882972416949bcac6072475e454c2cd26",
+      "bytes": 124891,
+      "lines": 2966
+    },
+    "node/src/lib.rs": {
+      "git_blob": "fe2dedd68e3010e0c9df81a70a481b6e3d1ca872",
+      "sha256": "ba062aea717a927dd60fdf7039f900ea16ae5f773ae0f55e778c536cb3b76426",
+      "bytes": 12248,
+      "lines": 252
+    },
+    "Cargo.toml": {
+      "git_blob": "0f4a888f34b6e6a661ffe8ac97d31225cf0f9f7e",
+      "sha256": "9ff4a6a8e1d2ba484a7dbc9de9c5c5742280fbaea09d19afff05763a428688a1",
+      "bytes": 6083,
+      "lines": 168
+    },
+    "node/Cargo.toml": {
+      "git_blob": "a009eeaf84c2bb72c8b4868dd38032a7997cb4de",
+      "sha256": "c290bcccb57cadbf939a0ef933d23e77e52abd245e9c5a95af85209501e90ea3",
+      "bytes": 14704,
+      "lines": 323
+    },
+    "Cargo.lock": {
+      "git_blob": "9bb3301c85d958188e2f4facf00a894dba109b50",
+      "sha256": "b7ccb0f5e63c21c5304b536429c4aab65449f1093bf62fdce70319009c457abb",
+      "bytes": 121702,
+      "lines": 4956
+    },
+    "node/Cargo.lock": {
+      "git_blob": "ccd2b4ff544680f7f943705d048a4b570ce9d9c4",
+      "sha256": "25a47cf239c171082bfb662a82042c24640b0f838c45575209109d35bebbdc7d",
+      "bytes": 150955,
+      "lines": 6118
+    },
+    "gui/src-tauri/Cargo.lock": {
+      "git_blob": "a48eafd4bde8d2c19ee67b0f65599e0fee00880d",
+      "sha256": "af84285031fbaaed4bb3dfe8e83bb61ccda549a6e47749d10ceb5afb12d17500",
+      "bytes": 207664,
+      "lines": 8616
+    },
+    "gui/mobile/Cargo.lock": {
+      "git_blob": "03cf3c6658114a764b3d4ee8c0f14d77733fd684",
+      "sha256": "adee9f63cf691a168c78a33ac89645d5ac5b3a10e83ea8481a8e972bf8946da2",
+      "bytes": 188226,
+      "lines": 7911
+    }
+  },
+  "snapshots": {
+    "storage_plan.rs.txt": {
+      "source": "node/src/storage_plan.rs",
+      "start_line": 1,
+      "end_line": 604,
+      "sha256": "28a4b8e7939aa4980c7d3d8ec7257aae273bf2865f155a2b8f2b588e39a1f965",
+      "bytes": 19702
+    },
+    "persist.rs.txt": {
+      "source": "node/src/persist.rs",
+      "start_line": 1,
+      "end_line": 123,
+      "sha256": "b77a626fffd84d15f5aa70f833deed19d1ea8ce47444aaf9cb6ea24692501a72",
+      "bytes": 4571
+    },
+    "fleet_storage_auth.rs.txt": {
+      "source": "node/src/mesh.rs",
+      "start_line": 5279,
+      "end_line": 5327,
+      "sha256": "a4172b1038ab105d475f3db26bd14442fa321b1b79e2b7686ebe8969b2451669",
+      "bytes": 2329
+    },
+    "local_storage_commands.rs.txt": {
+      "source": "node/src/mesh.rs",
+      "start_line": 15742,
+      "end_line": 15826,
+      "sha256": "f5a3eba87b0f3de6022a748837ab4eaf7cc15e3044a3312bda2f4a7c8eb424aa",
+      "bytes": 3456
+    },
+    "storage_sync.rs.txt": {
+      "source": "node/src/mesh.rs",
+      "start_line": 19830,
+      "end_line": 19955,
+      "sha256": "548f7127c192f2f3efb61a264cff7c87feb8af4064531aac70add4839b47e0f8",
+      "bytes": 4853
+    }
+  },
+  "vectors": {
+    "wire_vectors.json": {
+      "sha256": "ef8dd0ea09864d427aeba1db606e4ed119a8df439e6031aedc8cbe93f7ac8875",
+      "bytes": 2316
+    },
+    "digest_vectors.json": {
+      "sha256": "5e127e51323c72688ae4e93f784e7ce08b8770f72ecc5cd75187fec3982e1af5",
+      "bytes": 2632
+    },
+    "contract_vectors.json": {
+      "sha256": "c8af09c5128f1359f4dd4644db693bbc672b66b6cb25f3618cb870ac757b0caa",
+      "bytes": 3284
+    }
+  }
+}

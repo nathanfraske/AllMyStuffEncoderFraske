@@ -1,0 +1,131 @@
+{
+  "limits": {
+    "allocations": 512,
+    "device_intents": 512,
+    "chunk": 16,
+    "actor_bytes": 512,
+    "device_bytes": 512,
+    "volume_bytes": 512
+  },
+  "errors": {
+    "policy": "storage policy is outside its safe bounds",
+    "actor": "invalid storage-plan actor",
+    "clock": "storage-plan clock exhausted",
+    "resource": "invalid storage resource identity",
+    "device": "invalid device identity",
+    "allocation": "invalid storage allocation",
+    "allocations_cap": "the fleet storage plan has too many allocations",
+    "intents_cap": "the fleet storage plan has too many device roles"
+  },
+  "policy_cases": [
+    {
+      "field": "replicas",
+      "accepted": [
+        1,
+        8
+      ],
+      "rejected": [
+        0,
+        9,
+        255
+      ]
+    },
+    {
+      "field": "reservePercent",
+      "accepted": [
+        5,
+        50
+      ],
+      "rejected": [
+        0,
+        4,
+        51,
+        255
+      ]
+    },
+    {
+      "field": "versionRetentionDays",
+      "accepted": [
+        0,
+        3650
+      ],
+      "rejected": [
+        3651,
+        65535
+      ]
+    },
+    {
+      "field": "rebalanceGibPerDay",
+      "accepted": [
+        0,
+        10000
+      ],
+      "rejected": [
+        10001,
+        4294967295
+      ]
+    }
+  ],
+  "identity_cases": [
+    {
+      "device": "device:volume",
+      "volume": "tail",
+      "id": "13:device:volumetail"
+    },
+    {
+      "device": "device",
+      "volume": "volume:tail",
+      "id": "6:devicevolume:tail"
+    },
+    {
+      "device": "é",
+      "volume": ":",
+      "id": "2:é:"
+    },
+    {
+      "device": "a",
+      "volume": "bc",
+      "id": "1:abc"
+    },
+    {
+      "device": "ab",
+      "volume": "c",
+      "id": "2:abc"
+    }
+  ],
+  "actor_nul_allowed": true,
+  "device_or_volume_nul_allowed": false,
+  "stamp_order": [
+    {
+      "counter": 0,
+      "actor": ""
+    },
+    {
+      "counter": 1,
+      "actor": "a"
+    },
+    {
+      "counter": 1,
+      "actor": "b"
+    },
+    {
+      "counter": 2,
+      "actor": "a"
+    }
+  ],
+  "operation_observations": [
+    "Equal-value local setter still advances the clock and persists.",
+    "Invalid zero quota consumes a new actor clock but inserts no allocation.",
+    "Invalid policy/device/resource/cap checks occur before next_stamp.",
+    "Policy merge replaces its record but does not directly add a counter entry.",
+    "Only accepted newer allocation/intent records update counters.",
+    "Manager sender validation is nonempty only; it may relay valid other actors.",
+    "Ordinary member requires device==sender and actor==sender.",
+    "Equal stamps keep the existing value; conflicting equal input duplicates keep the first accepted value.",
+    "Input vectors above512 reject the whole patch even if all elements are invalid.",
+    "At capacity, an existing id may update; a new id is ignored; incoming order determines the final admitted free slot.",
+    "next_stamp observes maximum live-record counter and only the requested actor counter, checked_add without wrapping.",
+    "Setters restore affected record only after persistence failure; merge restores its full snapshot.",
+    "Load preserves arbitrary counters and truncates valid record maps by lexicographic key order after sanitization."
+  ]
+}

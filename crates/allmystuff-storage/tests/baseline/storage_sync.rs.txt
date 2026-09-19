@@ -1,0 +1,126 @@
+    async fn broadcast_storage_patch(
+        &self,
+        policy: Option<PolicyRecord>,
+        allocations: Vec<StorageAllocation>,
+        device_intents: Vec<DeviceServiceIntent>,
+    ) {
+        let Some(network) = self.ownership.fleet_network_id() else {
+            return;
+        };
+        let chunk_count = allocations
+            .len()
+            .max(device_intents.len())
+            .max(1)
+            .div_ceil(PLAN_CHUNK);
+        for index in 0..chunk_count {
+            let start = index * PLAN_CHUNK;
+            let allocation_start = start.min(allocations.len());
+            let allocation_end = (start + PLAN_CHUNK).min(allocations.len());
+            let intent_start = start.min(device_intents.len());
+            let intent_end = (start + PLAN_CHUNK).min(device_intents.len());
+            let message = StoragePlanMessage::Patch {
+                policy: (index == 0).then(|| policy.clone()).flatten(),
+                allocations: allocations[allocation_start..allocation_end].to_vec(),
+                device_intents: device_intents[intent_start..intent_end].to_vec(),
+            };
+            let Ok(payload) = serde_json::to_value(message) else {
+                continue;
+            };
+            let response = self
+                .client
+                .request(&Request::ChannelSendAll {
+                    network: network.clone(),
+                    channel: CHANNEL_FLEET_STORAGE.into(),
+                    payload,
+                })
+                .await;
+            if !matches!(response, Ok(response) if response.ok) {
+                tracing::debug!("fleet storage patch will converge on reconnect");
+                break;
+            }
+        }
+    }
+
+    async fn sync_storage_plan_to(&self, peer: &str, network: &str) {
+        if !self.is_fleet_network(network) || !self.sender_may_control(peer) {
+            return;
+        }
+        let Some(local) = self
+            .local_node_id()
+            .map(|node| pubkey_part(node.as_str()).to_string())
+        else {
+            return;
+        };
+        let may_manage = self.local_may_manage_storage().await;
+        let snapshot = self.storage_plan.snapshot();
+        let allocations = if may_manage {
+            snapshot.allocations
+        } else {
+            snapshot
+                .allocations
+                .into_iter()
+                .filter(|allocation| allocation.device == local && allocation.stamp.actor == local)
+                .collect()
+        };
+        let device_intents = if may_manage {
+            snapshot.device_intents
+        } else {
+            snapshot
+                .device_intents
+                .into_iter()
+                .filter(|intent| intent.device == local && intent.stamp.actor == local)
+                .collect()
+        };
+
+        let policy = may_manage.then_some(snapshot.policy);
+        if policy.is_none() && allocations.is_empty() && device_intents.is_empty() {
+            return;
+        }
+        let chunk_count = allocations
+            .len()
+            .max(device_intents.len())
+            .max(1)
+            .div_ceil(PLAN_CHUNK);
+        for index in 0..chunk_count {
+            let start = index * PLAN_CHUNK;
+            let allocation_start = start.min(allocations.len());
+            let allocation_end = (start + PLAN_CHUNK).min(allocations.len());
+            let intent_start = start.min(device_intents.len());
+            let intent_end = (start + PLAN_CHUNK).min(device_intents.len());
+            let message = StoragePlanMessage::Patch {
+                policy: (index == 0).then(|| policy.clone()).flatten(),
+                allocations: allocations[allocation_start..allocation_end].to_vec(),
+                device_intents: device_intents[intent_start..intent_end].to_vec(),
+            };
+            let Ok(payload) = serde_json::to_value(message) else {
+                continue;
+            };
+            let response = self
+                .client
+                .request(&Request::ChannelSendTo {
+                    network: network.into(),
+                    channel: CHANNEL_FLEET_STORAGE.into(),
+                    peer: pubkey_part(peer).into(),
+                    payload,
+                })
+                .await;
+            if !matches!(response, Ok(response) if response.ok) {
+                break;
+            }
+        }
+    }
+
+    async fn request_storage_plan_from(&self, peer: &str, network: &str) {
+        let Ok(payload) = serde_json::to_value(StoragePlanMessage::SyncRequest) else {
+            return;
+        };
+        let _ = self
+            .client
+            .request(&Request::ChannelSendTo {
+                network: network.into(),
+                channel: CHANNEL_FLEET_STORAGE.into(),
+                peer: pubkey_part(peer).into(),
+                payload,
+            })
+            .await;
+    }

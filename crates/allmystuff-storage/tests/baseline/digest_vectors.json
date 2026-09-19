@@ -1,0 +1,32 @@
+[
+  {
+    "name": "default",
+    "persisted": "{\"policy\":{\"value\":{\"replicas\":2,\"reservePercent\":10,\"versionRetentionDays\":30,\"rebalanceGibPerDay\":50,\"pauseOnMetered\":true},\"stamp\":{\"counter\":0,\"actor\":\"\"}},\"allocations\":{},\"device_intents\":{},\"counters\":{}}",
+    "digest": "89ff81d50437e30f"
+  },
+  {
+    "name": "counter_only_after_invalid_allocation",
+    "persisted": "{\"policy\":{\"value\":{\"replicas\":2,\"reservePercent\":10,\"versionRetentionDays\":30,\"rebalanceGibPerDay\":50,\"pauseOnMetered\":true},\"stamp\":{\"counter\":0,\"actor\":\"\"}},\"allocations\":{},\"device_intents\":{},\"counters\":{\"owner\":1}}",
+    "digest": "dbfe50029192c55d"
+  },
+  {
+    "name": "policy_only",
+    "persisted": "{\"policy\":{\"value\":{\"replicas\":2,\"reservePercent\":10,\"versionRetentionDays\":30,\"rebalanceGibPerDay\":50,\"pauseOnMetered\":true},\"stamp\":{\"counter\":1,\"actor\":\"owner\"}},\"allocations\":{},\"device_intents\":{},\"counters\":{\"owner\":1}}",
+    "digest": "664baf41070ab753"
+  },
+  {
+    "name": "manager_policy_merge_no_counter_entry",
+    "persisted": "{\"policy\":{\"value\":{\"replicas\":2,\"reservePercent\":10,\"versionRetentionDays\":30,\"rebalanceGibPerDay\":50,\"pauseOnMetered\":true},\"stamp\":{\"counter\":7,\"actor\":\"remote\"}},\"allocations\":{},\"device_intents\":{},\"counters\":{}}",
+    "digest": "eb12e8b0aeed961e"
+  },
+  {
+    "name": "mixed_sorted_records",
+    "persisted": "{\"policy\":{\"value\":{\"replicas\":2,\"reservePercent\":10,\"versionRetentionDays\":30,\"rebalanceGibPerDay\":50,\"pauseOnMetered\":true},\"stamp\":{\"counter\":0,\"actor\":\"\"}},\"allocations\":{\"1:ab\":{\"id\":\"1:ab\",\"device\":\"a\",\"volume\":\"b\",\"quotaBytes\":1,\"enabled\":true,\"stamp\":{\"counter\":2,\"actor\":\"owner\"}},\"2:abc\":{\"id\":\"2:abc\",\"device\":\"ab\",\"volume\":\"c\",\"quotaBytes\":1,\"enabled\":true,\"stamp\":{\"counter\":1,\"actor\":\"owner\"}}},\"device_intents\":{\"desk\":{\"device\":\"desk\",\"role\":\"personal\",\"stamp\":{\"counter\":3,\"actor\":\"owner\"}}},\"counters\":{\"owner\":3}}",
+    "digest": "9516a8807c14e291"
+  },
+  {
+    "name": "utf8_device_nul_actor",
+    "persisted": "{\"policy\":{\"value\":{\"replicas\":2,\"reservePercent\":10,\"versionRetentionDays\":30,\"rebalanceGibPerDay\":50,\"pauseOnMetered\":true},\"stamp\":{\"counter\":0,\"actor\":\"\"}},\"allocations\":{\"2:é:\":{\"id\":\"2:é:\",\"device\":\"é\",\"volume\":\":\",\"quotaBytes\":1,\"enabled\":true,\"stamp\":{\"counter\":1,\"actor\":\"x\\u0000y\"}}},\"device_intents\":{},\"counters\":{\"x\\u0000y\":1}}",
+    "digest": "613ce994767791f1"
+  }
+]

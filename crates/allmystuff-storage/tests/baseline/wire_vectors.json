@@ -1,0 +1,65 @@
+{
+  "policy_default": "{\"replicas\":2,\"reservePercent\":10,\"versionRetentionDays\":30,\"rebalanceGibPerDay\":50,\"pauseOnMetered\":true}",
+  "policy_alias_input": "{\"ordinaryReplicas\":4,\"criticalReplicas\":6}",
+  "policy_alias_output": "{\"replicas\":4,\"reservePercent\":10,\"versionRetentionDays\":30,\"rebalanceGibPerDay\":50,\"pauseOnMetered\":true}",
+  "policy_unknown_input": "{\"unknown\":7,\"reserve_percent\":49}",
+  "policy_unknown_output": "{\"replicas\":2,\"reservePercent\":10,\"versionRetentionDays\":30,\"rebalanceGibPerDay\":50,\"pauseOnMetered\":true}",
+  "policy_duplicate_input": "{\"replicas\":2,\"ordinaryReplicas\":3}",
+  "snapshot_default": "{\"policy\":{\"value\":{\"replicas\":2,\"reservePercent\":10,\"versionRetentionDays\":30,\"rebalanceGibPerDay\":50,\"pauseOnMetered\":true},\"stamp\":{\"counter\":0,\"actor\":\"\"}},\"allocations\":[],\"deviceIntents\":[]}",
+  "persisted_default": "{\"policy\":{\"value\":{\"replicas\":2,\"reservePercent\":10,\"versionRetentionDays\":30,\"rebalanceGibPerDay\":50,\"pauseOnMetered\":true},\"stamp\":{\"counter\":0,\"actor\":\"\"}},\"allocations\":{},\"device_intents\":{},\"counters\":{}}",
+  "patch_default": "{\"kind\":\"patch\",\"policy\":null,\"allocations\":[],\"device_intents\":[]}",
+  "patch_legacy_input": "{\"kind\":\"patch\",\"allocations\":[]}",
+  "digest_message": "{\"kind\":\"digest\",\"digest\":\"0000000000000000\"}",
+  "sync_request": "{\"kind\":\"sync_request\"}",
+  "roles": [
+    "automatic",
+    "alwaysOn",
+    "personal"
+  ],
+  "required_failures": [
+    {
+      "type": "stamp",
+      "json": "{}"
+    },
+    {
+      "type": "policy_record",
+      "json": "{}"
+    },
+    {
+      "type": "allocation",
+      "json": "{}"
+    },
+    {
+      "type": "intent",
+      "json": "{}"
+    },
+    {
+      "type": "snapshot",
+      "json": "{}"
+    },
+    {
+      "type": "message",
+      "json": "{\"kind\":\"patch\"}"
+    },
+    {
+      "type": "message",
+      "json": "{\"kind\":\"patch\",\"allocations\":null}"
+    },
+    {
+      "type": "message",
+      "json": "{\"kind\":\"patch\",\"allocations\":[],\"device_intents\":null}"
+    },
+    {
+      "type": "policy",
+      "json": "null"
+    },
+    {
+      "type": "role",
+      "json": "\"always_on\""
+    },
+    {
+      "type": "persisted",
+      "json": "null"
+    }
+  ]
+}
