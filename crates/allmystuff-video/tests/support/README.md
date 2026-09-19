@@ -31,6 +31,24 @@ Its mutable RGBA view is the allocation's tail. Under `host`, the inert desktop
 follower is for existing isolated worker tests only; it is not a production
 default and does not establish real desktop/session behavior.
 
+`ingress_compatibility.rs` includes the frozen ingress and inbound frame bodies
+unchanged. Its import shims resolve the original classifier, metadata and marker
+paths to frozen source; only the unchanged timing helper is reused. A wrapper
+exposes original operations and the pending-map observation. Two actual local
+bounded Tokio channels supply sent/full/closed feedback; the extracted policy
+receives it through a synchronous test `Sink`, with no runtime or executor.
+Each step compares return value, remaining capacity and pending state, and drains
+compare complete event envelopes and order against the frozen implementation.
+Thirteen tests also assert independently chosen literal outcomes, including
+canonical peer/lane isolation, Reset/Gradual changes while fenced, first-reason
+retention, exact marker closure, bounds, and closure observed only when a send
+occurs. Opaque frame kind is preserved through assembly. The one age case waits
+1,100 ms during central test execution; it distinguishes stale data arrival
+from a matching stale closing marker, without claiming exact threshold equality
+or equal clocks. The original unchecked first-fragment size remains exercised.
+Unused declarations in the frozen modules have narrow module-level dead-code
+allowances; the new fixture code does not suppress warnings.
+
 These fixtures perform no global environment mutation, endpoint access or
 device discovery. Worker preparation is source-only. Central compilation,
 formatting and execution remain separate evidence gates.
