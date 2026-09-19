@@ -269,9 +269,15 @@ fn metadata_reexport_keeps_identity_bytes_and_removal() {
             let expected = [&input[..5], marker.as_slice(), &input[5..]].concat();
             assert_eq!(current, expected);
             assert_eq!(current, old);
-            assert_eq!(metadata::annexb_nals(&current), video_wire::annexb_nals(&old));
+            assert_eq!(
+                metadata::annexb_nals(&current),
+                video_wire::annexb_nals(&old)
+            );
             assert_eq!(metadata::peek_au_identity_marker(&current), Some(identity));
-            assert_eq!(video_wire::peek_au_identity_marker(&old), Some(old_identity));
+            assert_eq!(
+                video_wire::peek_au_identity_marker(&old),
+                Some(old_identity)
+            );
             assert_eq!(
                 metadata::take_au_identity_marker(&mut current),
                 Some(identity)

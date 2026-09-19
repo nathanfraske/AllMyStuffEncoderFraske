@@ -168,7 +168,10 @@ impl Pair {
         while let Ok(event) = self.new_rx.try_recv() {
             actual.push(event);
         }
-        assert_eq!(actual, expected, "delivered event order and exact envelopes");
+        assert_eq!(
+            actual, expected,
+            "delivered event order and exact envelopes"
+        );
         actual
     }
 
@@ -180,7 +183,8 @@ impl Pair {
     fn discard(&mut self, frame: Frame<u8>, borrowed_lane: bool) {
         self.original.discard(&old_frame(frame.clone()));
         if borrowed_lane {
-            self.current.discard_paced_peer_lane(&frame.from, frame.stream);
+            self.current
+                .discard_paced_peer_lane(&frame.from, frame.stream);
         } else {
             self.current.discard_paced_lane(&frame);
         }
@@ -303,7 +307,10 @@ fn gradual_frames_remain_inline_until_admitted_then_normal_forwarding_resumes() 
     assert!(pair.send(Action::Frame, gradual(2))); // Retain recovery across full.
     pair.drain();
     assert!(pair.send(Action::Frame, gradual(3)));
-    assert_eq!(pair.drain(), vec![gap("peer", 1, OVERFLOW, Some(gradual(3)))]);
+    assert_eq!(
+        pair.drain(),
+        vec![gap("peer", 1, OVERFLOW, Some(gradual(3)))]
+    );
     assert!(pair.send(Action::Frame, delta(4)));
     assert_eq!(pair.drain(), vec![Event::Frame(delta(4))]);
     assert!(pair.send(Action::Gap, delta(5)));
@@ -318,7 +325,10 @@ fn identity_changes_recovery_mode_even_while_the_lane_is_fenced() {
     assert!(pair.send(Action::Gap, delta(0)));
     pair.drain();
     assert!(pair.send(Action::Frame, gradual(1)));
-    assert_eq!(pair.drain(), vec![gap("peer", 1, TRANSPORT, Some(gradual(1)))]);
+    assert_eq!(
+        pair.drain(),
+        vec![gap("peer", 1, TRANSPORT, Some(gradual(1)))]
+    );
     assert!(pair.send(Action::Frame, delta(2)));
     assert!(pair.send(Action::Frame, gradual(3))); // Full with remembered Gradual.
     pair.drain();
@@ -405,12 +415,15 @@ fn replacement_survives_full_feedback_and_first_loss_reason_is_retained() {
     assert!(pair.send(Action::Paced, frame("peer", 1, 100, true, &[2])));
     let replacement = frame("peer", 1, 101, true, &[3]);
     assert!(pair.send(Action::Paced, replacement.clone())); // Gap cannot yet enter queue.
-    // Drops pending while retaining the first loss reason.
+                                                            // Drops pending while retaining the first loss reason.
     assert!(pair.send(Action::Gap, frame("peer", 1, 102, false, &[])));
     pair.drain();
     assert!(pair.send(Action::Paced, replacement.clone()));
     assert!(pair.send(Action::Paced, closing("peer", 1, 101, 1)));
-    assert_eq!(pair.drain(), vec![gap("peer", 1, MISSING, Some(replacement))]);
+    assert_eq!(
+        pair.drain(),
+        vec![gap("peer", 1, MISSING, Some(replacement))]
+    );
 }
 
 #[test]

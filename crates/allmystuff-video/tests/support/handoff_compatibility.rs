@@ -42,7 +42,10 @@ impl Pair {
             ),
             original::state(&self.original)
         );
-        assert_eq!(self.current.is_empty(), original::state(&self.original).0 == 0);
+        assert_eq!(
+            self.current.is_empty(),
+            original::state(&self.original).0 == 0
+        );
     }
 
     fn push(&mut self, data: Vec<u8>, now: Instant, gradual: bool) -> Enqueue {
@@ -101,7 +104,8 @@ fn literal_outcome(step: &Value) -> Enqueue {
 
 #[test]
 fn source_derived_traces_preserve_results_batches_and_recovery_state() {
-    let all: Value = serde_json::from_str(include_str!("../baseline/handoff_vectors.json")).unwrap();
+    let all: Value =
+        serde_json::from_str(include_str!("../baseline/handoff_vectors.json")).unwrap();
     assert_eq!(Current::default().max_age, Duration::from_millis(200));
     assert_eq!(Current::default().max_bytes, 64 * 1024 * 1024);
     for trace in all["traces"].as_array().unwrap() {
@@ -142,13 +146,28 @@ fn memory_limit_accepts_exact_budget_then_fences_whole_reference_chain() {
     let now = Instant::now();
     let limit = original::packet_charge(3, now) * 2;
     let mut pair = Pair::limited(Duration::from_secs(1), limit);
-    assert_eq!(pair.push(vec![2, 1, 1], now, false), Enqueue::Enqueued { skipped: 0 });
-    assert_eq!(pair.push(vec![2, 0, 2], now, false), Enqueue::Enqueued { skipped: 0 });
+    assert_eq!(
+        pair.push(vec![2, 1, 1], now, false),
+        Enqueue::Enqueued { skipped: 0 }
+    );
+    assert_eq!(
+        pair.push(vec![2, 0, 2], now, false),
+        Enqueue::Enqueued { skipped: 0 }
+    );
     assert_eq!(pair.current.bytes, limit);
-    assert_eq!(pair.push(vec![2, 0, 3], now, false), Enqueue::AwaitingKey { started: true });
+    assert_eq!(
+        pair.push(vec![2, 0, 3], now, false),
+        Enqueue::AwaitingKey { started: true }
+    );
     assert!(pair.take().is_empty());
-    assert_eq!(pair.push(vec![2, 0, 4], now, false), Enqueue::AwaitingKey { started: false });
-    assert_eq!(pair.push(vec![2, 1, 5], now, false), Enqueue::Enqueued { skipped: 0 });
+    assert_eq!(
+        pair.push(vec![2, 0, 4], now, false),
+        Enqueue::AwaitingKey { started: false }
+    );
+    assert_eq!(
+        pair.push(vec![2, 1, 5], now, false),
+        Enqueue::Enqueued { skipped: 0 }
+    );
     assert_eq!(pair.take(), hex("03000000020105"));
 }
 
@@ -160,9 +179,15 @@ fn memory_trimming_keeps_latest_whole_key_suffix_only_when_it_fits() {
     pair.push(vec![2, 0, 1], now, false);
     pair.push(vec![2, 1, 2], now, false);
     pair.push(vec![2, 0, 3], now, false);
-    assert_eq!(pair.push(vec![2, 0, 4], now, false), Enqueue::Enqueued { skipped: 1 });
+    assert_eq!(
+        pair.push(vec![2, 0, 4], now, false),
+        Enqueue::Enqueued { skipped: 1 }
+    );
     assert_eq!(pair.current.bytes, limit);
-    assert_eq!(pair.take(), hex("030000000201020300000002000303000000020004"));
+    assert_eq!(
+        pair.take(),
+        hex("030000000201020300000002000303000000020004")
+    );
 }
 
 #[test]
@@ -172,8 +197,14 @@ fn oversize_key_cannot_release_fence_but_replace_retains_its_separate_policy() {
     let mut pair = Pair::limited(Duration::from_secs(1), limit);
     let mut large = vec![9; limit + 1];
     large[..2].copy_from_slice(&[2, 1]);
-    assert_eq!(pair.push(large.clone(), now, false), Enqueue::AwaitingKey { started: true });
-    assert_eq!(pair.push(large, now, true), Enqueue::AwaitingKey { started: false });
+    assert_eq!(
+        pair.push(large.clone(), now, false),
+        Enqueue::AwaitingKey { started: true }
+    );
+    assert_eq!(
+        pair.push(large, now, true),
+        Enqueue::AwaitingKey { started: false }
+    );
     assert!(pair.take().is_empty());
     assert!(pair.current.awaiting_key);
     // Original replace accepts a self-contained packet even beyond the cap.
@@ -182,7 +213,10 @@ fn oversize_key_cannot_release_fence_but_replace_retains_its_separate_policy() {
     assert!(pair.current.bytes > limit);
     assert!(!pair.current.awaiting_key);
     let batch = pair.take();
-    assert_eq!(&batch[..4], &u32::try_from(replacement.len()).unwrap().to_le_bytes());
+    assert_eq!(
+        &batch[..4],
+        &u32::try_from(replacement.len()).unwrap().to_le_bytes()
+    );
     assert_eq!(&batch[4..], replacement.as_slice());
 }
 
@@ -192,11 +226,20 @@ fn key_recognition_remains_specific_to_node_encoded_packet_prefix() {
     let late = start + Duration::from_millis(200);
     let mut pair = Pair::default();
     pair.push(vec![2, 1, 1], start, false);
-    assert_eq!(pair.push(vec![2, 0, 2], late, false), Enqueue::AwaitingKey { started: true });
+    assert_eq!(
+        pair.push(vec![2, 0, 2], late, false),
+        Enqueue::AwaitingKey { started: true }
+    );
     for data in [vec![], vec![2], vec![2, 2], vec![3, 1], vec![1, 1]] {
-        assert_eq!(pair.push(data, late, false), Enqueue::AwaitingKey { started: false });
+        assert_eq!(
+            pair.push(data, late, false),
+            Enqueue::AwaitingKey { started: false }
+        );
     }
-    assert_eq!(pair.push(vec![2, 1], late, false), Enqueue::Enqueued { skipped: 0 });
+    assert_eq!(
+        pair.push(vec![2, 1], late, false),
+        Enqueue::Enqueued { skipped: 0 }
+    );
     assert_eq!(pair.take(), hex("020000000201"));
 }
 
@@ -206,10 +249,16 @@ fn gradual_mode_can_leave_reset_fence_without_claiming_an_independent_key() {
     let late = start + Duration::from_millis(200);
     let mut pair = Pair::default();
     pair.push(vec![2, 1, 1], start, false);
-    assert_eq!(pair.push(vec![2, 0, 2], late, false), Enqueue::AwaitingKey { started: true });
+    assert_eq!(
+        pair.push(vec![2, 0, 2], late, false),
+        Enqueue::AwaitingKey { started: true }
+    );
     assert_eq!(
         pair.push(vec![2, 0, 3], late, true),
-        Enqueue::Converging { skipped: 0, started: true }
+        Enqueue::Converging {
+            skipped: 0,
+            started: true
+        }
     );
     assert!(!pair.current.awaiting_key);
     assert!(pair.current.convergence_requested);

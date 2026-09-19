@@ -126,11 +126,17 @@ fn completion_waits_for_exact_marker_and_ors_fragment_keys() {
     let mut pair = Pair::default();
     assert_eq!(pair.step("r", 9, false, vec![1, 2]), (None, false));
     assert_eq!(pair.step("r", 9, true, vec![3, 4]), (None, false));
-    assert_eq!(pair.step("r", 9, false, marker(2)), completed(9, true, &[1, 2, 3, 4], 2));
+    assert_eq!(
+        pair.step("r", 9, false, marker(2)),
+        completed(9, true, &[1, 2, 3, 4], 2)
+    );
     assert_eq!(pair.step("r", 9, true, marker(2)), (None, true));
     assert_eq!(pair.step("r", 10, false, vec![7]), (None, false));
     // A key flag on the closing marker does not mark the completed payload key.
-    assert_eq!(pair.step("r", 10, true, marker(1)), completed(10, false, &[7], 1));
+    assert_eq!(
+        pair.step("r", 10, true, marker(1)),
+        completed(10, false, &[7], 1)
+    );
 }
 
 #[test]
@@ -153,7 +159,10 @@ fn new_timestamp_reports_damage_but_retains_new_train() {
     let mut pair = Pair::default();
     assert_eq!(pair.step("r", u32::MAX, true, vec![1]), (None, false));
     assert_eq!(pair.step("r", 0, false, vec![2]), (None, true));
-    assert_eq!(pair.step("r", 0, false, marker(1)), completed(0, false, &[2], 1));
+    assert_eq!(
+        pair.step("r", 0, false, marker(1)),
+        completed(0, false, &[2], 1)
+    );
 }
 
 #[test]
@@ -162,8 +171,14 @@ fn route_keys_are_exact_and_empty_fragments_still_count() {
     assert_eq!(pair.step("peer-abc12", 3, false, vec![]), (None, false));
     assert_eq!(pair.step("peer", 4, false, vec![4]), (None, false));
     assert_eq!(pair.step("peer-abc12", 3, false, vec![3]), (None, false));
-    assert_eq!(pair.step("peer", 4, false, marker(1)), completed(4, false, &[4], 1));
-    assert_eq!(pair.step("peer-abc12", 3, false, marker(2)), completed(3, false, &[3], 2));
+    assert_eq!(
+        pair.step("peer", 4, false, marker(1)),
+        completed(4, false, &[4], 1)
+    );
+    assert_eq!(
+        pair.step("peer-abc12", 3, false, marker(2)),
+        completed(3, false, &[3], 2)
+    );
 }
 
 #[test]
@@ -172,7 +187,10 @@ fn marker_lookalike_is_payload_until_the_exact_closer() {
     let mut ordinary = marker(1);
     ordinary[25] ^= 1;
     assert_eq!(pair.step("r", 1, false, ordinary.clone()), (None, false));
-    assert_eq!(pair.step("r", 1, false, marker(1)), completed(1, false, &ordinary, 1));
+    assert_eq!(
+        pair.step("r", 1, false, marker(1)),
+        completed(1, false, &ordinary, 1)
+    );
 }
 
 #[test]
@@ -182,9 +200,15 @@ fn route_chunk_ceiling_is_inclusive_then_recovery_discards_overflow() {
         assert_eq!(pair.step("at-limit", 1, false, vec![]), (None, false));
         assert_eq!(pair.step("over-limit", 1, false, vec![]), (None, false));
     }
-    assert_eq!(pair.step("at-limit", 1, false, marker(2048)), completed(1, false, &[], 2048));
+    assert_eq!(
+        pair.step("at-limit", 1, false, marker(2048)),
+        completed(1, false, &[], 2048)
+    );
     assert_eq!(pair.step("over-limit", 1, false, vec![]), (None, true));
-    assert_eq!(pair.step("over-limit", 1, false, marker(2048)), (None, true));
+    assert_eq!(
+        pair.step("over-limit", 1, false, marker(2048)),
+        (None, true)
+    );
 }
 
 #[test]
@@ -206,7 +230,10 @@ fn route_byte_ceiling_and_existing_first_fragment_exception_are_preserved() {
     assert_eq!(pair.step("append", 2, false, marker(1)), (None, true));
 
     // The original first insertion is not checked against the byte ceiling.
-    assert_eq!(pair.step("first", 3, true, vec![6; LIMIT + 1]), (None, false));
+    assert_eq!(
+        pair.step("first", 3, true, vec![6; LIMIT + 1]),
+        (None, false)
+    );
     let (complete, damaged) = pair.step("first", 3, false, marker(1));
     assert!(!damaged);
     let complete = complete.unwrap();
