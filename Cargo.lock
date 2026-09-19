@@ -193,6 +193,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "allmystuff-video"
+version = "0.2.121"
+dependencies = [
+ "allmystuff-frame-timing",
+ "allmystuff-video-metadata",
+ "allmystuff-video-pacing",
+ "memchr",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "allmystuff-video-metadata"
 version = "0.2.121"
 dependencies = [

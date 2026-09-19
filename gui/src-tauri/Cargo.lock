@@ -146,7 +146,6 @@ dependencies = [
  "allmystuff-byte-queues",
  "allmystuff-cec-consent",
  "allmystuff-cec-protocol",
- "allmystuff-frame-timing",
  "allmystuff-graph",
  "allmystuff-inventory",
  "allmystuff-node-client",
@@ -154,8 +153,7 @@ dependencies = [
  "allmystuff-protocol",
  "allmystuff-session",
  "allmystuff-updater",
- "allmystuff-video-metadata",
- "allmystuff-video-pacing",
+ "allmystuff-video",
  "anyhow",
  "base64 0.22.1",
  "bytes",
@@ -276,6 +274,16 @@ dependencies = [
  "tokio",
  "tracing",
  "zip",
+]
+
+[[package]]
+name = "allmystuff-video"
+version = "0.2.121"
+dependencies = [
+ "allmystuff-frame-timing",
+ "allmystuff-video-metadata",
+ "allmystuff-video-pacing",
+ "tracing",
 ]
 
 [[package]]

@@ -113,6 +113,7 @@ host = [
 audio-io = ["dep:cpal", "dep:libloading"]
 
 [dependencies]
+allmystuff-video = { path = "../crates/allmystuff-video" }
 # Hardware H.264 (and later HEVC/AV1) encode across every vendor behind one
 # API — `h264_nvenc` is real NVENC, plus AMF/QSV/VideoToolbox/VA-API. Optional
 # so a software-only build needs no FFmpeg toolchain; see the `hwenc` feature.
@@ -155,9 +156,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # AllMyStuff's own crates — the scanner, the graph model, the wire types,
 # the hardware→capability bridge, the session state machine, and the
 # self-updater. Pulled by path from the sibling library workspace.
-allmystuff-video-metadata = { path = "../crates/allmystuff-video-metadata" }
-allmystuff-video-pacing = { path = "../crates/allmystuff-video-pacing" }
-allmystuff-frame-timing = { path = "../crates/allmystuff-frame-timing" }
 allmystuff-byte-queues = { path = "../crates/allmystuff-byte-queues" }
 allmystuff-inventory = { path = "../crates/allmystuff-inventory" }
 allmystuff-graph = { path = "../crates/allmystuff-graph" }

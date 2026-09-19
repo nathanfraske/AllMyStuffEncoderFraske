@@ -1,0 +1,22 @@
+[package]
+name = "allmystuff-video"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Reusable video processing with application-owned transport and routing."
+
+[features]
+default = []
+
+[dependencies]
+allmystuff-frame-timing.workspace = true
+allmystuff-video-metadata.workspace = true
+allmystuff-video-pacing.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+memchr = "2"
