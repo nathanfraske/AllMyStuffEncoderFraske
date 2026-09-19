@@ -50,6 +50,9 @@ occurs while the same guard is held. Mesh keeps network admission, local manager
 checks, advertised-volume/capacity checks, root materialization, reconciliation
 and broadcasts. File-transfer, mounts, sites and adapters are outside this slice.
 
-Source and compatibility fixtures are under independent review. Central
-compilation, lint and isolated core/persistence tests remain pending; source
-preservation alone does not establish runtime or platform coverage.
+Windows validation passed all 52 focused storage and persistence tests, root and
+node formatting and strict lint checks, and the node no-default-feature build
+check. The [independent review](../../docs/reviews/modular-foundation/storage-library-extraction.md)
+records the commands, retained failures and corrections, and coverage limits.
+These runs cover isolated Windows state; Unix permissions, live fleet workflows
+and crash durability remain unqualified.
