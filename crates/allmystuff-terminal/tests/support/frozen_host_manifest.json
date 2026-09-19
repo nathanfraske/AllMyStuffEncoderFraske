@@ -1,0 +1,24 @@
+{
+  "baseline": "ee9cc150f4bdc3fd49a547b563f0381dae3685f5",
+  "input": "tests/baseline/terminal.rs",
+  "input_span": [
+    1,
+    805
+  ],
+  "span_sha256": "f905f278aaeb1004f41d7772c969d707b76ebb5f36ee99f00f7ba51801c028de",
+  "substitutions": [
+    {
+      "from": "use crate::byte_queues::ByteQueues;",
+      "to": "use allmystuff_byte_queues::ByteQueues;",
+      "count": 1
+    },
+    {
+      "from": "crate::spawn(",
+      "to": "super::spawn_original(",
+      "count": 2
+    }
+  ],
+  "adapted_prefix_sha256": "a53515f4ebea14cc6810b8d8519450daf6a3f0d186ffc0cc55f03710a5309aa9",
+  "adapter_suffix_bytes": 249,
+  "output_sha256": "a2900a765ab3ab208996654f624a8f9327b6cd929f59952408481fc82ab85024"
+}
