@@ -36,7 +36,7 @@
         ]
       ],
       "oracle": "node_client.rs",
-      "oracle_sha256": "ddd4e44eed0bdf68c17eda6c5a4c54aac70f97004fe2f0be1a881994aebb7594"
+      "oracle_sha256": "184200e00ed51cb794beb1ae3559ff8c712886266b2152a467ed20b6b8ad633b"
     },
     "crates/allmystuff-term/src/client.rs": {
       "git_blob": "30f0138d1799893ace0b532cf2f90d0f60d69631",
@@ -75,6 +75,8 @@
     "Select only framing, data types, client methods and SocketAddr::to_name; omit engine/server/process dependencies.",
     "Replace new()/global resolver/probe/wait with for_fixture(path or name); connect/request/event method bodies are verbatim.",
     "Original method documentation has unresolved application links; oracle is test-only and not rustdoc input.",
-    "Tracing macro default targets reflect the test module; compare baseline warning message/level, and separately require the extracted node target allmystuff_node::node_control."
-  ]
+    "Tracing macro default targets reflect the test module; compare baseline warning message/level, and separately require the extracted node target allmystuff_node::node_control.",
+    "Gate the test-only PathBuf import with cfg(unix) to avoid a Windows unused-import warning; no frozen method body changes."
+  ],
+  "hash_encoding": "Source hashes use Git blob UTF-8 bytes; oracle hashes use UTF-8 LF text (normalize checkout CRLF to LF when verifying)."
 }

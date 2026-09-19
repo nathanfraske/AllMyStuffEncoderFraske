@@ -3,6 +3,7 @@
 // Do not update this oracle to agree with an extracted implementation.
 #![allow(dead_code)]
 
+#[cfg(unix)]
 use std::path::PathBuf;
 use anyhow::{anyhow, bail, Context, Result};
 use interprocess::local_socket::tokio::prelude::*;
