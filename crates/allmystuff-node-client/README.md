@@ -32,12 +32,12 @@ spawns the event reader, keeps the socket writer alive, and awaits each channel
 send. A `TAG_EVENT` containing `Restart` remains an ordinary event; `TAG_RESTART`
 delivers a restart and ends the reader.
 
-Existing imports through `allmystuff_node::node_control` and
-`allmystuff_term::client` remain usable. Runtime-owner arbitration, server
-binding and permissions, dispatch and child-process supervision stay in their
-original callers. The terminal's wait/retry helper also stays there. The GUI
-still depends on the node for those other operations, and mobile still embeds
-its existing engine.
+Public imports through `allmystuff_node::node_control` remain compatible.
+The terminal's private `client` module retains the names used by its unchanged
+callers. Runtime-owner arbitration, server binding and permissions, dispatch
+and child-process supervision stay in their original callers. The terminal's
+wait/retry helper also stays there. The GUI still depends on the node for those
+other operations, and mobile still embeds its existing engine.
 
 `NodeClient::connect` exposes the existing connection operation for the Windows
 host's named-pipe owner inspection. Its visibility changes at the crate boundary;
