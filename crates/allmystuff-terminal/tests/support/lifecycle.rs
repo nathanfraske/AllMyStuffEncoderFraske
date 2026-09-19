@@ -462,7 +462,10 @@ fn multi_attach_fans_out_and_shared_input_reaches_one_shell() {
 fn scrollback_then_live_output_has_no_gap_or_duplicate() {
     let mut fixture = Fixture::new();
     let mut a = fixture.start("replay", "a");
-    assert!(a.replay.is_empty(), "first observer receives only live bytes");
+    assert!(
+        a.replay.is_empty(),
+        "first observer receives only live bytes"
+    );
     fixture.send("a", "before");
     a.wait_marker(b"AMS:BEFORE");
     let mut b = fixture.attach("replay", "b");
@@ -485,8 +488,14 @@ fn scrollback_then_live_output_has_no_gap_or_duplicate() {
         a.bytes.len() < super::SCROLLBACK_CAP,
         "fixture transcript must fit entirely in scrollback"
     );
-    assert!(a.bytes.starts_with(&b.replay), "replay must be an exact prefix");
-    assert_eq!(a.bytes, b.bytes, "replay plus live must equal original live output");
+    assert!(
+        a.bytes.starts_with(&b.replay),
+        "replay must be an exact prefix"
+    );
+    assert_eq!(
+        a.bytes, b.bytes,
+        "replay plus live must equal original live output"
+    );
     let transcript = String::from_utf8_lossy(&b.bytes);
     assert!(transcript.find("AMS:BEFORE") < transcript.find("AMS:AFTER"));
     assert!(transcript.find("AMS:AFTER") < transcript.find("AMS:CONFIRM"));
