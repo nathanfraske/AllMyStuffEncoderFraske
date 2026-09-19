@@ -48,6 +48,6 @@ the deadline by one millisecond; exact timer-tick equality is not asserted.
 nine Windows/Unix cases use real, isolated PTYs and explicit shell commands.
 Those cases and the retained platform tests require manager-run native validation.
 
-At this source checkpoint all new tests are authored and independently reviewable;
-compiler, formatter and runtime outcomes remain pending. Final commands, results
-and platform limits belong in the [extraction report](../../../docs/reviews/modular-foundation/terminal-library-extraction.md).
+Manager-owned compiler, formatter and runtime results, retained failures and
+platform limits are recorded in the [extraction report](../../../docs/reviews/modular-foundation/terminal-library-extraction.md).
+Fixture definitions alone do not establish execution on every supported target.

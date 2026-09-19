@@ -1,16 +1,20 @@
 # Terminal library extraction: compatibility and validation
 
-Source checkpoint, 2026-09-19. The operator authorized one reusable terminal/PTY
+Validation record, 2026-09-19. The operator authorized one reusable terminal/PTY
 package with behavior retained and scoped testing. The frozen input is
 `ee9cc150f4bdc3fd49a547b563f0381dae3685f5`, after the completed storage extraction.
 This report belongs to C2's original assignment
 `manager:f272ab36-6959-4312-bb0f-91cda702f403`; the known task-board projection
 failure does not create a replacement assignment.
 
-**Current status:** the production source has independent acceptance and the
-new contract tests are awaiting exact peer review and central validation. The
-only executed terminal checks recorded here are the four baseline cases below.
-No extracted-library compiler, formatter, lint or runtime pass is claimed yet.
+**Current status:** all 67 distinct selected Windows test definitions passed,
+including the corrected nine-case native lifecycle suite. The selected commands
+produced 84 passing executions, including 17 public definitions repeated in
+viewer and host builds.
+All four dependency graphs and planned formatter, lint and consumer checks passed.
+The initial replay fixture assumption and formatting failures remain recorded.
+Production behavior is unchanged. Verified cleanup reclaimed 2.17 GiB while
+preserving the retained binaries and evidence described below.
 
 ## Frozen evidence and ownership
 
@@ -45,12 +49,26 @@ Before that commit A1 caught a fixture expectation missing the four-byte length
 prefix in `poll("b")`; the fixture was corrected to the frozen framing contract.
 That was a test-authoring correction, not a production behavior change.
 
+C1 accepted C2's exact seven-file fixture/report checkpoint, committed as
+`449756c1802d666d4dea1e9b101e12d8d5ecef59`. The final host fixture at that
+checkpoint is blob `57c1479933a4e1c406922342a3458f89536abebe`, LF SHA256
+`4da3a0b8b992af3ccce22ceac7cf7e217031e8c5817663c2d1c576171b2bbfad`.
+Peer review corrected one helper comment to distinguish manually polled bridges
+from captured reaper futures later run on a private paused runtime. No test code,
+literal expectation or oracle byte changed in that correction.
+
 Manager integration `63b78ded-3ff0-4185-944c-e36a8c520306` succeeded (exit 0,
 0.181 s, 1,597 stdout/0 stderr bytes). It mapped baseline `99d7c122` to
 `32d3ddc5d7ea03dbdba7805a2f1bf6939014a1e7` and lifecycle `ba5cf08c` to
 `fcb03f69a80bb2b5c0822a8e30b94652a58d9693`. The manager verified empty path
 diffs to both source commits and a tracked-clean checkout, apart from managed
 `AGENTS.md`. This integration is not a compiler or runtime result.
+
+Production integration `f36307a8-2894-4e53-8f4f-507edef5ad24` succeeded (exit 0,
+0.150 s, 476 stdout/0 stderr bytes), mapping C1 `6a39465f` to central
+`c4229627b809604d8f7372224a85b1d9605e6668`. The manager's complete tracked-tree
+comparison matched the reviewed source. C2 independently read both integration
+records completely.
 
 ## Library and application boundary
 
@@ -169,8 +187,8 @@ matches the baseline node package.
 
 Node grows 607 to 608 records, GUI 804 to 805 and mobile 735 to 736. Only the new
 local package and intended node-to-terminal routing change; historical consumer
-version differences remain. No Cargo resolver success is inferred from these
-source-level comparisons. Central locked/offline closure checks remain pending.
+version differences remain. Those source comparisons alone do not establish
+resolution; the separate Cargo evidence below establishes the captured graphs.
 
 The final crate manifest is blob `e090ab2640468932e49009c418d9f1b7333ea2d3`,
 LF SHA256 `b83fdb2b7f29f6163314f0ed59dc9cdb01889e93e940f0e1d22dc6458bc54c68`.
@@ -178,10 +196,48 @@ Serde JSON is dev-only for literal fixtures. Tokio's dev-only `test-util` featur
 enables paused-clock checks; pinned Tokio source expands it to the already-used
 rt/sync/time features without a new dependency record or production feature.
 
+Four Cargo metadata runs at central `c4229627` used
+`metadata --format-version 1 --filter-platform x86_64-pc-windows-msvc --locked --offline`,
+with the additional arguments in the table. They ran through retained
+`target/terminal-validation-20260919-01/capture-metadata.py`, SHA256
+`608830805288acf03e69a8dfe8a8b5747d1b7ac078b6dd91d78bed86dd9903b6`.
+The wrapper writes each complete JSON to an exclusively created file in that
+directory, preserves stderr in the durable run and reports the exact Cargo
+vector, exit code, file size and hash. C2 read the wrapper and all four terminal
+run streams, rehashed all JSONs and independently walked their normal/build
+edges. The four reviewed lock hashes remained unchanged afterward.
+
+| Graph and extra arguments | Run | Exit, seconds, stdout/stderr bytes |
+| --- | --- | --- |
+| Root default; none | `607386c8-62c2-44f2-bf9d-2b99f8c2629b` | 0; 5.441; 1,427/0 |
+| Root host; `--features allmystuff-terminal/host` | `6984b512-75f1-4aa4-ad9c-279cd8a0ef28` | 0; 0.718; 2,064/0 |
+| Node default; `--manifest-path node/Cargo.toml` | `20d4e37f-68e1-45aa-939b-4f42070b931a` | 0; 2.286; 1,875/0 |
+| Node viewer; `--manifest-path node/Cargo.toml --no-default-features` | `5f6c6c60-3c74-4f70-b9c4-b36dec9868d9` | 0; 0.902; 1,305/0 |
+
+The exact retained JSON identities are:
+
+| File in the validation directory | Bytes | SHA256 |
+| --- | ---: | --- |
+| `root-default-metadata.json` | 1,039,718 | `a303cd2ee3af625c0c34592ae6fb979f0a32d295c76d7166936e370fce0d4fc6` |
+| `root-host-metadata.json` | 1,089,141 | `daae086af650baae76bff916f387724f1beb30bf89740bc2a178a8a2898a2e89` |
+| `node-default-metadata.json` | 1,667,384 | `473cb20bb8378bb5d2847d34def9e7b10ecb45874d3d6a04cb322d8d12996ef9` |
+| `node-no-default-metadata.json` | 1,362,387 | `ad5c0c1034cfb6d737f9f4811ca42638f33385749e26dc85657871cf59f3ebf3` |
+
+The two viewer graphs enable terminal's `default` feature only and reach 28
+normal/build package identities including terminal. Their direct normal edges
+are byte queues, Serde and Tokio. Both host graphs enable `default, host`, add the
+dirs/parking_lot/tracing/xpty direct edges and reach 52 identities. In all four,
+the only local packages reached are terminal and byte queues: no reverse node,
+node-client or CLI edge exists. Xpty appears exactly in the two host closures.
+These are Windows workspace-resolved graphs, with workspace/dev feature
+unification reflected in dependency nodes, including Tokio IO/runtime support.
+They are not universal minimum-feature or cross-platform closure claims.
+
 ## Test inventory and isolation
 
 The [fixture guide](../../../crates/allmystuff-terminal/tests/README.md) describes
-the frozen oracle and new tests. These are source counts, pending execution:
+the frozen oracle and new tests. Source counts and isolation are listed here;
+actual platform-selected execution is recorded below:
 
 | Group | Source inventory | Isolation |
 | --- | ---: | --- |
@@ -200,9 +256,10 @@ are excluded from that module and are not accidentally executed twice.
 
 A2's native fixtures own an exclusive canonical directory and explicit child
 commands. They retain receivers for teardown observation, close sessions on Drop
-and keep the directory when shutdown cannot be observed. Windows cmd and native
-dimension helpers, Unix fixed-path shell/stty behavior and synchronous native
-open/close still require central platform execution and an outer run timeout.
+and keep the directory when shutdown cannot be observed. The Windows cmd and
+native dimension helpers were exercised in the scoped runs below. Unix fixed-path
+shell/stty behavior remains unexecuted. Synchronous native open/close is bounded
+by the manager run's outer timeout.
 
 A1 identified narrow existing node filters for terminal route shape, canonical
 loopback identity, privileged-offer refusal and per-plane share grants. The
@@ -235,13 +292,223 @@ from a plain OS thread; it constructs no Mesh or default application state.
 These are four distinct baseline tests, with no warning/error diagnostics in the
 retained streams. They do not validate the newly extracted library.
 
-## Pending validation and limits
+## Initial formatting gates
 
-Central compiler, formatting, strict lint, default/host library tests, node
-default/no-default checks, selected caller tests and resolved dependency closure
-evidence remain pending. New fixture source acceptance and final include bytes
-will be recorded before those results are used to close this task. No final
-cleanup result is claimed at this checkpoint.
+The manager assembled the accepted source, fixtures and both test-only includes
+at `0068be54e8e0fbfdb55f221fb924acdfacb4d276`, with a tracked Git tree identical
+to C1's `5a41451b44d12461fcafbb27e356384da81aa95f`. C2 independently read both
+complete formatting records to EOF:
+
+| Run | Cargo arguments | Result |
+| --- | --- | --- |
+| `d51d99f4-f5f1-413a-a7c8-53b1b4cbee27` | `fmt --all -- --check` | Exit 1, 3.705 s; 38,102 stdout / 0 stderr bytes |
+| `a2e26508-de51-44cc-aac9-5b4c8f8ce5d9` | `fmt --manifest-path node/Cargo.toml --all -- --check` | Exit 1, 2.185 s; 38,102 stdout / 0 stderr bytes |
+
+Both stdout streams are byte-identical and contain exactly 52 formatting hunks:
+37 in the channel fixtures, ten in the lifecycle fixtures and five in the public
+contract fixtures. There are no production, frozen-baseline, oracle or harness
+formatting hunks. C1 applied this bounded correction. C2 independently
+reconstructed every requested file from the retained output and original Git
+blobs, matched the resulting bytes and accepted them. All literal sequences,
+test names and assertion counts remain; the other 841 tracked files, including
+production, frozen baselines, oracle and shared harness, are unchanged.
+
+| Corrected fixture | LF SHA256 | Git blob |
+| --- | --- | --- |
+| `tests/support/host_compatibility.rs` | `7f5dd118304e883a854771836d66e11b16ac6c2111ff86fad76871b53689c7c2` | `6279f0c301faa83d3ee9ab1508e270cee607100b` |
+| `tests/support/lifecycle.rs` | `336e358e46237dc5ce6c8bb3ec9eb881597c856648d22bbc772969adc9be1d10` | `2219a0ef9ade3d619b6cb5f77442414ca72d9f26` |
+| `tests/contract_compatibility.rs` | `e9b5679bb7928c9c324f1550ca0f38139f667005410d3265c4d6af70294f1ab8` | `e2b981a2e3659d08b767d1e71691ca1d70e427b2` |
+
+C2 retains the original log, exact data-only reconstruction and acceptance in
+`target/terminal-extraction/formatter-independent-review.json`. The common
+stdout SHA256 is
+`609a8fd994c53851b92e207956630b17c49827acc89e4db2719db30ac29ce2af`.
+These initial failures remain part of the evidence and are not runtime-test
+results. No worker ran Rust formatting, compilation or tests.
+
+C1 committed the exact correction as
+`b2cb2eae1c2b3ac4303607e6b607fad7f4835273`. Integration
+`d9b71a74-b567-4c42-96ca-0ac04d2d53f1` succeeded, exit 0 in 0.104 s,
+169/0 stdout/stderr bytes, yielding manager source
+`29d982f93e567aa95c4cce5605271c814522dbc0` with the same tracked tree.
+
+## Executed extraction validation
+
+The following gates ran centrally on Windows x64 at `29d982f`. C2 read every
+retained stream completely, verified byte lengths and terminal status, and found
+no compiler warnings. Cargo commands use the manager's existing native build
+environment, debug information and incrementality disabled, with TEMP/TMP in
+the private terminal-validation scratch directory. Tests are serialized with
+`--test-threads=1`; no ordinary application state or broad Mesh suite is used.
+Durations below are durable run wall times, not Cargo's internal compile times.
+
+| Gate / exact Cargo arguments | Run | Exit 0 duration; stdout/stderr bytes |
+| --- | --- | --- |
+| `fmt --all -- --check` | `5ad009a9-74c2-4424-8b13-0ba0dbb9980a` | 4.993 s; 0/0 |
+| `fmt --manifest-path node/Cargo.toml --all -- --check` | `3e5724e2-8047-4fd4-b191-a94d38b3710b` | 2.655 s; 0/0 |
+| `clippy --workspace --all-targets --locked --offline -- -D warnings` | `7a3120b5-539f-4331-833e-6b87109f062d` | 44.112 s; 0/8,296 |
+| `clippy -p allmystuff-terminal --features host --all-targets --locked --offline -- -D warnings` | `fda0ff2a-ed94-46fd-8c01-e4957693c685` | 38.930 s; 0/1,022 |
+| `clippy --manifest-path node/Cargo.toml --all-targets --locked --offline -- -D warnings` | `8989a778-e22d-4cff-9cda-96a1a5675eac` | 88.839 s; 0/9,913 |
+| `check --manifest-path node/Cargo.toml --all-targets --no-default-features --locked --offline` | `3370c846-dfc4-4c87-94da-422db3823542` | 46.529 s; 0/1,785 |
+
+All four following Cargo test commands end with `-- --test-threads=1`:
+
+| Exact Cargo arguments before that suffix | Run | Actual result; duration; stdout/stderr bytes |
+| --- | --- | --- |
+| `test -p allmystuff-terminal --no-default-features --locked --offline` | `0ac8a4fd-d408-4595-93f0-2639510ea35d` | 17 passed; 16.117 s; 1,535/1,392 |
+| `test -p allmystuff-terminal --features host --locked --offline --test contract_compatibility` | `8707b82c-62fb-4688-b1a7-b6e384affb4c` | 18 passed; 7.925 s; 1,371/1,098 |
+| `test -p allmystuff-terminal --features host --locked --offline --lib host::compatibility::` | `f07705ec-eee5-42f7-85b3-7ed46430ce25` | 30 passed, 12 filtered; 2.620 s; 3,217/294 |
+| `test -p allmystuff-terminal --features host --locked --offline --lib host::tests::` | `44f7f786-ddbf-4ff3-a7a6-b6d8bad4979a` | 3 passed, 39 filtered; 0.555 s; 314/156 |
+
+These four test groups exited 0 without failures or ignored tests. The default
+library unit and doc-test targets each contain zero tests; they add no cases.
+Seventeen public definitions run in both feature configurations, so 17 plus 18
+is a feature matrix, not 35 distinct definitions. The host marker auto-trait
+case accounts for the extra host-only definition. The three retained Windows
+tests are the same definitions exercised in the baseline, now in the library.
+
+## Reproduced native replay fixture failure
+
+The first lifecycle command was `cargo test -p allmystuff-terminal --features
+host --locked --offline --lib host::lifecycle:: -- --test-threads=1` at
+`29d982f`. Run `e0f66a83-fbee-4086-a95f-1ee2fdb7e8ea` failed with exit 101
+in 2.565 s, 1,422/221 stdout/stderr bytes: eight passed, one failed and 33 were
+filtered. `scrollback_then_live_output_has_no_gap_or_duplicate` observed two
+`AMS:BEFORE` occurrences where its fixture expected one. All other lifecycle
+cases, including native Windows size reconciliation, passed in that run.
+
+Run `d13816ba-a37f-453a-a2d0-8c95fd2af0c2` reused the same retained host-test
+binary with that exact test and `--exact --test-threads=1`. It reproduced the
+same count failure: exit 101, 0.258 s, 683/0 bytes; one failed, 41 filtered.
+The recorded binary SHA256 is
+`abd011e712d69b2fbf476a9f3fe6e50e899488504f2d6c57d9cd19d0e11fd612`.
+This historical identity predates the later diagnostic rebuild of that path.
+
+A1 reviewed A2's diagnostic-only commit
+`161b8b11c9109f5ecafde58076106a6f9eb1fc01`: 36 lines of bounded escaped/raw
+observations, preserving commands, assertions and poll order. Integration
+`390ab09f-1f58-414d-a738-faa75d7d75e5` succeeded, exit 0 in 0.104 s with
+149/0 bytes, producing `c4ae019a45177fdfb5e1d9a4f9b2d8d760d7393e`.
+Only the lifecycle fixture differs from `29d982f`; all production is identical.
+
+Diagnostic run `226a4a3c-dfa3-4470-b963-75065a646b48` selected that one test
+with `--exact --test-threads=1 --nocapture`, failed again with exit 101 in
+2.493 s, and retained 297/12,062 stdout/stderr bytes. C2 independently decoded
+all 12 raw byte segments and verified every reported length, with no omitted
+bytes. At attach, A's 101 live bytes equal B's 101 replay bytes. Before CONFIRM,
+A's full 359 bytes exactly equal B's 101 replay plus 258 live bytes. Both have
+two BEFORE markers; the shared suffix contains cursor-home and erase-line
+repaint sequences. Thus the extra marker was already present in the original
+live-only observer, not introduced solely by replay. The final diagnostic
+phase stops A at AFTER and B at CONFIRM, so that phase proves no equal-fence
+comparison. No production resize, output filtering or deduplication was added.
+
+A1 accepted A2's sole-fixture correction
+`a79ecc4b63a22dd1a519e8fa7df9474f67c2b843`, blob
+`6087e1ce90d123cbdc13168950b9faec699aa546`, LF SHA256
+`3e4d2b3b4d72e7ed3955b49bf22ff4237586d3c75fa3f3ce66efd248322ec3ce`.
+C2 read the complete difference from the formatted fixture: it uses the same
+fresh CONFIRM acknowledgment for both observers, then compares their complete
+raw streams and exact replay prefix, with an explicit scrollback-cap guard.
+Temporary diagnostics and the unused counting helper are removed; commands,
+other fixtures, cleanup and production remain unchanged. This replaces the
+single-marker assumption with strict byte equality, without filtering output,
+changing native resize, hardcoding two occurrences or adding retries. Integration
+`7db57b5b-8c96-47f5-bfa7-eb9d4c3b65a0` succeeded, exit 0 in 0.120 s,
+170/0 stdout/stderr bytes, producing
+`7300cf71ae0ee9c9049c9029c6d74d62b588a40c`. The subsequent root formatting run
+`c00a0004-5b8b-42a1-a5e4-55f489ab64a1` failed with exit 1 in 2.215 s,
+1,567/0 bytes. C2 read both complete records; the latter contains two hunks
+wrapping only three new assertions. A1 independently reconstructed and accepted
+A2's formatter-only commit `eea5a6c1cc7a132e3e687d11c128e4e346d50265`, final
+fixture blob `5b2e3905555fb95d388e6fc1d2df25ff89987fe3`, LF SHA256
+`7f2fd66921754cd16e5eb75bed793243f6ca5ef19ddceeb4e5b50f6baba12dd6`.
+Integration `b3392e53-e3be-468d-8859-36751c84f66e` succeeded with exit 0 in
+0.097 s, 147/0 bytes, producing final tested source
+`82af488dc926d5ded8711e511a54b91aef21d7c3`. C2 verified that only the lifecycle
+fixture differs from the first tested `29d982f`; production and the previously
+passing test groups remain byte-identical.
+
+C2 independently read all four final affected gate records to EOF:
+
+| Exact Cargo arguments | Run | Exit 0 duration; stdout/stderr bytes |
+| --- | --- | --- |
+| `fmt --all -- --check` | `2fcdf45f-b1b1-4c03-bc20-40049a92b9e1` | 2.182 s; 0/0 |
+| `fmt --manifest-path node/Cargo.toml --all -- --check` | `b811cfa3-cd1d-44cf-a9a7-711d6a3e914c` | 2.101 s; 0/0 |
+| `test -p allmystuff-terminal --features host --locked --offline --lib host::lifecycle:: -- --test-threads=1` | `eb449aa4-fe6a-40c8-a189-47966625cd03` | 4.872 s; 933/294 |
+| `clippy -p allmystuff-terminal --features host --all-targets --locked --offline -- -D warnings` | `7c16f892-61eb-4a53-8fc2-64acd28bcd92` | 1.258 s; 0/198 |
+
+The final lifecycle run passed all nine cases, zero failed or ignored, 33
+filtered. It includes the corrected full raw replay/live equality assertion and
+the original eight successful lifecycle cases. There were no compiler warnings.
+Initial failures and diagnostic remain evidence and are not counted as passes.
+
+## Selected node runtime and caller evidence
+
+Run `71f4ea9e-ae54-449a-801c-aa3c41fab16a` used
+`cargo test --manifest-path node/Cargo.toml --locked --offline --lib
+mesh::tests::engine_spawn_runs_tasks_from_a_non_runtime_thread -- --exact
+--test-threads=1` at `c4ae019`. It passed one test, 337 filtered, exit 0 in
+101.687 s, with 189/10,289 stdout/stderr bytes and no compiler warnings.
+The new node binary is `target/debug/deps/allmystuff_node-0d876981d2166e53.exe`;
+C2 independently verified SHA256
+`602adf0e62b55adcaeb20b9a2417a36ef3832568429f34179cfd96f96a6f81e9`.
+
+The following six separate processes reused that binary. Every argument is
+`mesh::tests::<name> --exact --test-threads=1`, with one pass, zero failures or
+ignored tests, 337 filtered, and empty stderr:
+
+| Name | Run | Duration; stdout bytes |
+| --- | --- | --- |
+| `terminal_routes_are_recognized_by_shape` | `e945b141-d424-4803-9720-403823c8326a` | 0.076 s; 179 |
+| `loopback_terminal_route_is_recognized_as_self_hosted` | `fcdee9e5-7cfa-43d0-82f1-fb696d8ed156` | 0.071 s; 192 |
+| `loopback_is_detected_across_node_id_forms` | `11005834-3695-477a-9c87-99456b8f14af` | 0.060 s; 181 |
+| `term_send_loopback_check_is_canonical_across_id_forms` | `45dbc737-17f3-402e-85ef-95b8d1b4c496` | 0.073 s; 193 |
+| `privileged_offers_are_refused_exactly_when_unauthorized` | `95b1a8e3-5d3a-4bf7-a495-b9229838bed8` | 0.120 s; 195 |
+| `share_grants_authorize_exactly_their_own_plane` | `9f3af63a-0503-4135-bd79-dd2e095ee630` | 0.047 s; 186 |
+
+These seven cases cover the isolated caller/runtime selections, not a complete
+Mesh session or live authority exchange. The final selected set contains 67
+distinct definitions: 18 public, 30 channel, nine native lifecycle, three retained
+terminal and seven node cases. Across both public feature configurations and
+the other selected groups, this yields 84 passing executions. Baseline passes, failed attempts
+and diagnostic reruns do not inflate either final count. C2 retains the first
+22 completed record reads and byte-level diagnostic review in
+`target/terminal-extraction/audited-validation-01.json` and
+`runtime-cleanup-independent-review.json`.
+
+## Verified cleanup and remaining limits
+
+C2 read and accepted C1's minimally adapted cleanup script, LF SHA256
+`c22bdc2858bed0ca7990a2e0c22c3b5c19093ef37ccbe0c3f87f4b4ce88136b3`,
+6,781 bytes. Reversing only its expected-HEAD parameter, terminal evidence path
+and receipt-label changes reproduces the prior reviewed storage script exactly.
+The fixed manager workspace and target guards, reparse checks, three permitted
+intermediate directories, five permitted dependency-file extensions, protected
+file SHA256 checks, Git status check and refusal to reuse plan/result receipts
+remain unchanged. The manager ran that exact script after final gates with
+`-ExpectedHead 82af488dc926d5ded8711e511a54b91aef21d7c3`. Durable run
+`e3e40836-a04b-4506-b147-bb5aec5427a3` succeeded with exit 0 in 25.065 s,
+956/0 stdout/stderr bytes. C2 read the complete command and streams to EOF and
+independently verified the resulting plan, receipt and all protected hashes.
+
+The cleanup removed 2,333,247,573 bytes (2.17 GiB), 6,730 regenerable files,
+including 2,045 direct dependency intermediates. Only `target/debug/build`,
+`.fingerprint`, `incremental` and the allowed `.rlib`, `.rmeta`, `.d`, `.lib`
+and `.exp` files directly in `target/debug/deps` were selected. C2 confirmed
+the selected paths were absent and independently rehashed all 1,336 protected
+files, totaling 774,217,132 bytes, including retained EXE/DLL/PDB files, prior
+proofs, metadata, source inputs and validation evidence. Git status was unchanged,
+with only managed `AGENTS.md` untracked; source and test bytes were unaffected.
+
+The recorded target size changed from 3,107,464,705 to 774,620,718 bytes before
+the final receipt. The difference includes the newly written 403,586-byte plan:
+`3,107,464,705 - 2,333,247,573 + 403,586 = 774,620,718`. The manager retains
+`target/terminal-validation-20260919-01/cleanup-plan.json` and
+`cleanup-result.json`; C2's independent receipt is
+`target/terminal-extraction/cleanup-result-independent-review.json`.
+The cleanup script was not replayed, and no worker executed deletion,
+Rust tools or a PTY.
 
 Windows evidence must remain separate from Unix/macOS/mobile execution. A
 feature-disabled compile does not prove mobile signing, packaging or runtime

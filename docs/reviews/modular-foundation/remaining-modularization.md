@@ -6,8 +6,12 @@ now live in one `allmystuff-video` package; the [video extraction report](video-
 tracks its current validation and qualifications. Fleet storage-plan records,
 validation and transitions now live in `allmystuff-storage::plan`, with the
 durable adapter retained in node; the [storage extraction report](storage-library-extraction.md)
-records compatibility and validation evidence. The ranking, proposals and source
-anchors below are preserved as a historical audit at the stated revision.
+records compatibility and validation evidence. Terminal viewer queues and the
+optional shared PTY host now live in `allmystuff-terminal`; node retains runtime
+and authority adapters. The [terminal extraction report](terminal-library-extraction.md)
+records compatibility, isolated native validation and remaining qualifications.
+The ranking, proposals and source anchors below are preserved as a historical
+audit at the stated revision.
 
 Source review by C2 at `6602922dfa7c4eba937e1c8fa4d8eda200da010b`.
 This is a ranked proposal after the timing, byte-queue, pacing, update-policy,

@@ -19,6 +19,7 @@ artifact identities.
 
 | Library | Current contents | Direct dependencies |
 | --- | --- | --- |
+| [allmystuff-terminal](../crates/allmystuff-terminal/README.md) | Viewer queues and optional shared PTY sessions, scrollback, resize and lifecycle. | Default: byte queues, `serde`, `tokio`; `host` adds `dirs`, `parking_lot`, `tracing` and existing `xpty` under its `portable-pty` alias. |
 | [allmystuff-storage](../crates/allmystuff-storage/README.md) | Fleet storage-plan records, validation, ordered transitions and digest, with caller-supplied persistence. | `serde` and `serde_json`; `parking_lot` is test-only. |
 | [allmystuff-video](../crates/allmystuff-video/README.md) | Encoded-video rules, receive/handoff policy, optional decode workers and capture/encode backends. | Default: existing timing/metadata/pacing libraries and `tracing`; native dependencies are feature-gated. |
 | [allmystuff-byte-queues](../crates/allmystuff-byte-queues/src/lib.rs) | Viewer byte queues, watcher tokens and local IPC chunk packing. | `parking_lot` 0.12, `tracing` 0.1. |
@@ -45,6 +46,7 @@ a consumer beside this repository, choose the dependency lines it needs:
 
 ```toml
 [dependencies]
+allmystuff-terminal = { path = "../AllMyStuff/crates/allmystuff-terminal" }
 allmystuff-storage = { path = "../AllMyStuff/crates/allmystuff-storage" }
 allmystuff-video = { path = "../AllMyStuff/crates/allmystuff-video" }
 allmystuff-byte-queues = { path = "../AllMyStuff/crates/allmystuff-byte-queues" }
@@ -88,6 +90,22 @@ malformed-input differences, logging targets and backend selection retain their
 existing behavior. The [video extraction review](reviews/modular-foundation/video-library-extraction.md)
 records exact compatibility evidence and remaining platform/hardware limits;
 the [package README](../crates/allmystuff-video/README.md) describes its interfaces.
+
+**Terminal library.** `allmystuff-terminal` has an empty default feature set
+and supplies the existing viewer API and queues. Enable `host` for real PTY
+sessions; `host::TerminalHost<S>` accepts a static `TaskSpawner` policy for the
+existing idle-reaper and legacy-output-bridge task sites. It does not capture a
+runtime during construction. The always-available `viewer` module retains
+hosting refusal even when another consumer enables `host` in a shared graph.
+This package is distinct from the `allmystuff-term` command-line application.
+
+Node retains its public terminal paths, forwards its existing `host` feature
+and supplies its original global spawn behavior. Authentication, terminal-share
+consent, route binding and IPC dispatch remain in the application. Existing
+close/stop and detach behavior, queue bounds, scrollback bytes and resize rules
+are preserved. The [terminal extraction report](reviews/modular-foundation/terminal-library-extraction.md)
+records the frozen comparisons, isolated PTY tests and actual validation limits;
+the [package README](../crates/allmystuff-terminal/README.md) describes the API.
 
 **Storage plan library.** `allmystuff-storage::plan` provides the existing
 records, validation, ordered merge decisions and serialized digest without a
