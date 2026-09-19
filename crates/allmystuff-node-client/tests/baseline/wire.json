@@ -1,0 +1,17 @@
+[
+  {"name":"empty JSON", "wire":"0000000100", "outcome":"frame", "tag":0, "payload":""},
+  {"name":"empty bytes", "wire":"0000000101", "outcome":"frame", "tag":1, "payload":""},
+  {"name":"binary including newline", "wire":"0000000601000aff7f00", "outcome":"frame", "tag":1, "payload":"000aff7f00"},
+  {"name":"event JSON", "wire":"00000003027b7d", "outcome":"frame", "tag":2, "payload":"7b7d"},
+  {"name":"restart", "wire":"0000000103", "outcome":"frame", "tag":3, "payload":""},
+  {"name":"unknown tag preserved", "wire":"00000003ff0102", "outcome":"frame", "tag":255, "payload":"0102"},
+  {"name":"EOF", "wire":"", "outcome":"eof"},
+  {"name":"one length byte then EOF", "wire":"00", "outcome":"eof"},
+  {"name":"two length bytes then EOF", "wire":"0000", "outcome":"eof"},
+  {"name":"three length bytes then EOF", "wire":"000000", "outcome":"eof"},
+  {"name":"zero length", "wire":"00000000", "outcome":"invalid", "message":"zero-length frame (missing tag byte)"},
+  {"name":"over 256 MiB", "wire":"10000001", "outcome":"invalid", "message":"frame length 268435457 exceeds the 268435456-byte ceiling"},
+  {"name":"max u32", "wire":"ffffffff", "outcome":"invalid", "message":"frame length 4294967295 exceeds the 268435456-byte ceiling"},
+  {"name":"missing tag", "wire":"00000001", "outcome":"truncated"},
+  {"name":"truncated payload", "wire":"00000004007b", "outcome":"truncated"}
+]

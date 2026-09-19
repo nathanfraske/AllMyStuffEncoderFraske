@@ -1,0 +1,80 @@
+{
+  "baseline_commit": "1bb9bff6a3d7598565513bd4496bab8faf3b4a8f",
+  "purpose": "Independent pre-extraction client oracle; never refreshed to follow the extracted implementation.",
+  "sources": {
+    "node/src/node_control.rs": {
+      "git_blob": "1e2b293dc7409d8f2bcb0b0a90fc3f33bd3a5b5a",
+      "source_sha256": "392230cafa4eab235da7b9992b6486b9c7ff60375a9265709af84a60a853d804",
+      "included_line_ranges": [
+        [
+          65,
+          150
+        ],
+        [
+          250,
+          261
+        ],
+        [
+          281,
+          286
+        ],
+        [
+          310,
+          335
+        ],
+        [
+          346,
+          348
+        ],
+        [
+          358,
+          477
+        ],
+        [
+          488,
+          496
+        ]
+      ],
+      "oracle": "node_client.rs",
+      "oracle_sha256": "ddd4e44eed0bdf68c17eda6c5a4c54aac70f97004fe2f0be1a881994aebb7594"
+    },
+    "crates/allmystuff-term/src/client.rs": {
+      "git_blob": "30f0138d1799893ace0b532cf2f90d0f60d69631",
+      "source_sha256": "b7702452c099772ac43c3d233be36c2d93fc344edc038480af6eaed610e5710a",
+      "included_line_ranges": [
+        [
+          20,
+          123
+        ],
+        [
+          131,
+          136
+        ],
+        [
+          155,
+          170
+        ],
+        [
+          177,
+          179
+        ],
+        [
+          188,
+          193
+        ],
+        [
+          203,
+          307
+        ]
+      ],
+      "oracle": "terminal_client.rs",
+      "oracle_sha256": "d064ba1401d9dff612c36b1fe4c108550ab8a0b72e872a36974fbf622e44d5fd"
+    }
+  },
+  "adaptations": [
+    "Select only framing, data types, client methods and SocketAddr::to_name; omit engine/server/process dependencies.",
+    "Replace new()/global resolver/probe/wait with for_fixture(path or name); connect/request/event method bodies are verbatim.",
+    "Original method documentation has unresolved application links; oracle is test-only and not rustdoc input.",
+    "Tracing macro default targets reflect the test module; compare baseline warning message/level, and separately require the extracted node target allmystuff_node::node_control."
+  ]
+}
