@@ -4,10 +4,12 @@
 No package installation, dependency updates, app startup or hardware discovery.
 Test binaries are built with Cargo's locked graph, enumerated against the fixed
 name inventory, and executed serially in a private environment. Logs survive
-failures. The workflow's always step independently retries cleanup, never tests.
+failures. The always step takes over cleanup after stopping the original runner.
 """
 
 import argparse
+import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -22,7 +24,7 @@ import sys
 import tempfile
 import time
 
-from macos_processes import MARKER, ProcessGuard, write_json
+from macos_processes import DarwinProcesses, MARKER, ProcessGuard, write_json
 
 
 HERE = Path(__file__).resolve().parent
@@ -42,6 +44,53 @@ def digest(path):
 
 def lock_identities(workspace):
     return {name: digest(workspace / name) for name in LOCKS}
+
+
+def request_stop(control):
+    # A persistent one-way latch, including when the original supervisor did
+    # not receive the workflow's cancellation signal. Never remove it.
+    (control / "stop.requested").touch(exist_ok=True)
+
+
+def acquire_cleanup_lease(control, lease, evidence):
+    """Quiesce the original supervisor before touching its journal or files."""
+    started = time.monotonic()
+    api = None
+    identity = None
+    sent = set()
+    evidence.update({"signals": [], "lease_acquired": False})
+    while time.monotonic() - started < 45:
+        try:
+            fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            evidence["lease_acquired"] = True
+            evidence["elapsed_seconds"] = round(time.monotonic() - started, 3)
+            return
+        except OSError as error:
+            if error.errno not in (errno.EACCES, errno.EAGAIN):
+                raise
+        receipt = control / "supervisor.json"
+        if identity is None and receipt.is_file():
+            identity = tuple(json.loads(receipt.read_text(encoding="utf-8"))["identity"])
+            if (len(identity) != 4 or not all(type(value) is int for value in identity)
+                    or identity[0] <= 1 or identity[0] == os.getpid()
+                    or identity[1] != os.getuid() or identity[2] <= 0
+                    or not 0 <= identity[3] < 1_000_000):
+                raise RuntimeError("unsafe supervisor identity in cleanup receipt")
+            api = DarwinProcesses()
+            evidence["identity"] = identity
+        elapsed = time.monotonic() - started
+        sig = signal.SIGKILL if elapsed >= 30 else signal.SIGTERM if elapsed >= 2 else None
+        if identity is not None and sig is not None and sig not in sent:
+            current = api.info(identity[0])
+            if current is not None and current.identity() == identity and current.status != 5:
+                try:
+                    os.kill(identity[0], sig)
+                    evidence["signals"].append({"identity": identity, "signal": sig.name})
+                except ProcessLookupError:
+                    pass
+                sent.add(sig)
+        time.sleep(0.2)
+    raise TimeoutError("original supervisor did not release its lifetime lease within 45 seconds")
 
 
 def private_environment(root, original):
@@ -96,16 +145,20 @@ class Runner:
         print(f"FAIL {context}: {error}", flush=True)
         self.save()
 
+    def stopping(self):
+        return CANCELLED or (self.control / "stop.requested").exists() or time.monotonic() >= self.deadline
+
     def run(self, label, command, timeout, cwd=None):
-        if CANCELLED or time.monotonic() >= self.deadline:
-            raise RuntimeError("run cancelled or total 70-minute deadline reached")
+        if self.stopping():
+            raise RuntimeError("run stopped, cancelled or total 70-minute deadline reached")
         if not self.clean:
             raise RuntimeError("previous child cleanup was not verified")
         index = len(self.report["commands"])
         stem = f"{index:02d}-{label}"
         stdout = self.artifacts / (stem + ".stdout.log")
         stderr = self.artifacts / (stem + ".stderr.log")
-        record = {"label": label, "argv": command, "stdout": stdout.name, "stderr": stderr.name}
+        record = {"label": label, "argv": command, "stdout": stdout.name, "stderr": stderr.name,
+                  "started_unix_ns": time.time_ns()}
         self.report["commands"].append(record)
         self.save()
         print(f"RUN {label}", flush=True)
@@ -118,15 +171,19 @@ class Runner:
                                          stdout=out, stderr=err, start_new_session=True)
                 self.guard.register(child.pid)
                 record["pid"] = child.pid
+                self.save()
                 limit = min(self.deadline, started + timeout)
                 while child.poll() is None:
                     self.guard.scan()
-                    if CANCELLED or time.monotonic() >= limit:
+                    if self.stopping() or time.monotonic() >= limit:
                         raise TimeoutError("command cancelled or deadline reached")
                     if stdout.stat().st_size + stderr.stat().st_size > 128 * 1024 * 1024:
                         raise RuntimeError("command output exceeded 128 MiB bound")
                     time.sleep(0.2)
                 record["exit_code"] = child.returncode
+                if child.returncode < 0:
+                    request_stop(self.control)
+                    record["stop_reason"] = "child terminated by signal; no later command may launch"
         except (OSError, RuntimeError, ValueError) as error:
             record["error"] = str(error)
             # Popen retains direct, unreaped-child ownership even if inspection
@@ -138,6 +195,7 @@ class Runner:
             self.clean = cleanup["clean"]
             record["cleanup"] = cleanup
             record["elapsed_seconds"] = round(time.monotonic() - started, 3)
+            record["finished_unix_ns"] = time.time_ns()
             record["stdout_bytes"] = stdout.stat().st_size if stdout.exists() else 0
             record["stderr_bytes"] = stderr.stat().st_size if stderr.exists() else 0
             record["ok"] = record.get("exit_code") == 0 and "error" not in record and self.clean
@@ -152,6 +210,8 @@ class Runner:
         return (self.artifacts / record["stdout"]).read_text(encoding="utf-8", errors="replace").strip()
 
     def prepare(self):
+        if self.stopping():
+            raise RuntimeError("cleanup or cancellation was requested before preparation")
         if sys.version_info < (3, 11):
             raise RuntimeError("the preinstalled Python must be 3.11 or newer")
         if sys.platform != "darwin" or platform.machine() != self.args.arch:
@@ -170,6 +230,11 @@ class Runner:
         if len(os.fsencode(socket_example)) >= 104:
             raise RuntimeError("private IPC path exceeds the Darwin pathname socket budget")
         self.guard = ProcessGuard(self.control / "processes.json")
+        supervisor = self.guard.api.info(os.getpid())
+        if supervisor is None or supervisor.uid != os.getuid():
+            raise RuntimeError("cannot record the original supervisor identity")
+        write_json(self.control / "supervisor.json", {"identity": supervisor.identity()})
+        self.report["supervisor_identity"] = supervisor.identity()
         self.environment[MARKER] = self.guard.token
         os.chdir(self.root / "cwd")
         self.report["isolation"] = {
@@ -254,7 +319,7 @@ class Runner:
                 self.test_suite(suite, artifacts[source])
             except (OSError, RuntimeError, ValueError) as error:
                 self.failure(suite["id"], error)
-                if not self.clean or CANCELLED:
+                if not self.clean or self.stopping():
                     raise
 
     def execute(self):
@@ -287,7 +352,7 @@ class Runner:
             self.report["passed_executions"] = sum(suite["expected_count"] for suite in self.report["suites"] if suite.get("passed"))
             if self.report["passed_executions"] != self.report.get("expected_executions"):
                 self.failure("coverage", "not all expected executions passed")
-            self.report["passed"] = not self.report["failures"] and not CANCELLED
+            self.report["passed"] = not self.report["failures"] and not self.stopping()
             self.save()
             summary = os.environ.get("GITHUB_STEP_SUMMARY")
             if summary:
@@ -299,33 +364,48 @@ class Runner:
 
 def cleanup(args):
     control = Path(args.control).resolve()
-    root_receipt = control / "root.json"
-    if not root_receipt.exists():
-        print("No private root receipt exists; child launch did not begin.", flush=True)
-        return 0
-    receipt = json.loads(root_receipt.read_text(encoding="utf-8"))
-    artifacts = Path(receipt["artifacts"])
-    journal = control / "processes.json"
-    if not journal.exists():
-        # No child can be launched before this journal exists.
-        result = {"clean": True, "reason": "process guard was never initialized"}
-    else:
-        guard = ProcessGuard(journal, restore=True)
-        result = guard.clean()
-    root = Path(receipt["root"])
-    if result["clean"] and root.exists():
-        actual = root.resolve(strict=True)
-        info = actual.stat()
-        if (root.is_symlink() or actual != root or actual.parent != Path("/tmp").resolve()
-                or not actual.name.startswith("ams-mac-") or info.st_uid != os.getuid()
-                or stat.S_IMODE(info.st_mode) != 0o700
-                or (info.st_dev, info.st_ino) != (receipt["device"], receipt["inode"])):
-            raise RuntimeError("refusing cleanup: private root identity changed")
-        os.chdir(control)
-        shutil.rmtree(actual)
-        result["private_root_removed"] = not actual.exists()
-    write_json(artifacts / "always-cleanup.json", result)
-    print(json.dumps(result, indent=2), flush=True)
+    artifacts = Path(args.artifacts).resolve()
+    control.mkdir(mode=0o700, parents=True, exist_ok=True)
+    artifacts.mkdir(mode=0o700, parents=True, exist_ok=True)
+    result = {"clean": False, "supervisor_handoff": {}}
+    try:
+        request_stop(control)
+        with (control / "supervisor.lock").open("a+b") as lease:
+            # The original supervisor holds this through its final journal and
+            # summary writes. Holding it here excludes future child launches.
+            acquire_cleanup_lease(control, lease, result["supervisor_handoff"])
+            root_receipt = control / "root.json"
+            if not root_receipt.exists():
+                result.update({"clean": True, "reason": "private-root receipt absent; no child launch could begin"})
+            else:
+                receipt = json.loads(root_receipt.read_text(encoding="utf-8"))
+                journal = control / "processes.json"
+                if not journal.exists():
+                    # No child can be launched before this journal exists.
+                    result.update({"clean": True, "reason": "process guard was never initialized"})
+                else:
+                    guard = ProcessGuard(journal, restore=True)
+                    result.update(guard.clean())
+                # Preserve process evidence even if directory removal fails.
+                write_json(artifacts / "always-cleanup.json", result)
+                root = Path(receipt["root"])
+                if result["clean"] and root.exists():
+                    actual = root.resolve(strict=True)
+                    info = actual.stat()
+                    if (root.is_symlink() or actual != root or actual.parent != Path("/tmp").resolve()
+                            or not actual.name.startswith("ams-mac-") or info.st_uid != os.getuid()
+                            or stat.S_IMODE(info.st_mode) != 0o700
+                            or (info.st_dev, info.st_ino) != (receipt["device"], receipt["inode"])):
+                        raise RuntimeError("refusing cleanup: private root identity changed")
+                    os.chdir(control)
+                    shutil.rmtree(actual)
+                    result["private_root_removed"] = not actual.exists()
+    except (OSError, RuntimeError, ValueError, KeyError) as error:
+        result.update({"clean": False, "error": str(error)})
+        raise
+    finally:
+        write_json(artifacts / "always-cleanup.json", result)
+        print(json.dumps(result, indent=2), flush=True)
     return 0 if result["clean"] else 1
 
 
@@ -343,7 +423,10 @@ def main():
     os.umask(0o077)
     if args.cleanup_only:
         return cleanup(args)
-    return Runner(args).execute()
+    runner = Runner(args)
+    with (runner.control / "supervisor.lock").open("a+b") as lease:
+        fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return runner.execute()
 
 
 if __name__ == "__main__":

@@ -107,15 +107,26 @@ the actual image's visibility rules without racing stty's normal short lifetime.
 Apple can omit a restricted process's environment even when the sysctl succeeds;
 empty/incomplete environments therefore never count as a negative marker match.
 
-The workflow's `always()` cleanup step reloads the private process journal and
-scans again. It removes the private directory only after verified empty scans
+The workflow starts Python with `exec` so it is the step's entry process. The
+supervisor holds an exclusive file lease throughout preparation, child launches,
+and its final journal/summary writes. A permanent stop request prevents later
+commands after cleanup starts or a child terminates by signal. The `always()`
+step sets that request, then obtains the same lease before reading or changing
+the shared process journal, even when no private-root receipt exists yet. It
+allows 45 seconds for the handoff, with TERM after two seconds and KILL after
+30 seconds only for the recorded supervisor's exact UID/start identity. Missing
+or unverifiable ownership cannot authorize a signal or directory removal.
+
+Once it has the lease, cleanup reloads the private process journal and scans
+again. It removes the private directory only after verified empty scans
 and checking its canonical location, UID, mode, device and inode. Unknown
-survivors retain the directory and fail the step. A forced runner/VM termination
+survivors retain the directory and fail the step. Removal errors are saved with
+the process evidence and re-raised; directory removal is never retried. A forced runner/VM termination
 can interrupt this machinery; the standard hosted job's fresh VM is the final
 boundary. This is a reviewed cleanup mechanism for the selected inherited-env
 fixtures, not a security sandbox or a promise about arbitrary child programs.
-The first Intel and arm64 runs must qualify the native ABI and cleanup behavior;
-source review alone is not runtime evidence.
+Native Intel and arm64 runs must qualify the ABI, cancellation handoff and cleanup
+behavior; source review alone is not runtime evidence.
 
 Relevant primary sources, frozen to Apple's Darwin 24 family where available:
 
@@ -124,3 +135,5 @@ Relevant primary sources, frozen to Apple's Darwin 24 family where available:
 - [Argument/environment visibility and omission](https://github.com/apple-oss-distributions/xnu/blob/xnu-11417.140.69/bsd/kern/kern_sysctl.c)
 - [Spawn flags](https://github.com/apple-oss-distributions/xnu/blob/xnu-11417.140.69/bsd/sys/spawn.h)
 - [Opaque spawn types and prototypes](https://github.com/apple-oss-distributions/xnu/blob/xnu-11417.140.69/libsyscall/wrappers/spawn/spawn.h)
+- [Python file locking](https://docs.python.org/3/library/fcntl.html)
+- [GitHub workflow cancellation](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-cancellation)

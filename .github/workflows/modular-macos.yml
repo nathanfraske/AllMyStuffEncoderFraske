@@ -33,7 +33,7 @@ jobs:
         env:
           PYTHONDONTWRITEBYTECODE: '1'
         run: >-
-          python3 scripts/ci/modular_macos.py
+          exec python3 scripts/ci/modular_macos.py
           --arch '${{ matrix.arch }}' --label '${{ matrix.runner }}'
           --artifacts "$RUNNER_TEMP/modular-macos-artifacts"
           --control "$RUNNER_TEMP/modular-macos-control"
@@ -44,7 +44,7 @@ jobs:
         env:
           PYTHONDONTWRITEBYTECODE: '1'
         run: >-
-          python3 scripts/ci/modular_macos.py --cleanup-only
+          exec python3 scripts/ci/modular_macos.py --cleanup-only
           --artifacts "$RUNNER_TEMP/modular-macos-artifacts"
           --control "$RUNNER_TEMP/modular-macos-control"
       - name: Retain exact commands, identities, counts and complete logs
