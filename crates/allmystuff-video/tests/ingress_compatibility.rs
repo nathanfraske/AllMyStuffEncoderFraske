@@ -533,10 +533,7 @@ fn byte_bound_is_inclusive_for_initial_and_timestamp_replacement() {
         if replacement {
             assert!(pair.send(Action::Paced, frame("peer", 1, 99, true, &[1])));
         }
-        assert!(pair.send(
-            Action::Paced,
-            sized_frame("peer", 1, 100, BYTE_LIMIT)
-        ));
+        assert!(pair.send(Action::Paced, sized_frame("peer", 1, 100, BYTE_LIMIT)));
         assert!(pair.current.has_pending_paced());
         let expected = if replacement {
             vec![gap("peer", 1, MISSING, None)]
@@ -560,10 +557,7 @@ fn byte_bound_is_inclusive_for_cumulative_continuations() {
     for extra in [0, 1] {
         let mut pair = Pair::new(4);
         for _ in 0..2 {
-            assert!(pair.send(
-                Action::Paced,
-                sized_frame("peer", 1, 100, BYTE_LIMIT / 2)
-            ));
+            assert!(pair.send(Action::Paced, sized_frame("peer", 1, 100, BYTE_LIMIT / 2)));
         }
         assert!(pair.send(Action::Paced, frame("peer", 1, 100, false, &[])));
         assert!(pair.current.has_pending_paced());
@@ -591,10 +585,7 @@ fn byte_bound_is_inclusive_for_cumulative_continuations() {
 fn oversized_continuation_discards_pending_and_preserves_historical_feedback() {
     let mut pair = Pair::new(4);
     assert!(pair.send(Action::Paced, frame("peer", 1, 100, true, &[1])));
-    assert!(pair.send(
-        Action::Paced,
-        sized_frame("peer", 1, 100, BYTE_LIMIT + 1)
-    ));
+    assert!(pair.send(Action::Paced, sized_frame("peer", 1, 100, BYTE_LIMIT + 1)));
     assert!(!pair.current.has_pending_paced());
     assert_eq!(pair.drain(), vec![gap("peer", 1, BOUNDS, None)]);
     assert!(pair.send(Action::Paced, closing("peer", 1, 100, 2)));
@@ -646,11 +637,11 @@ fn oversized_initial_and_replacement_intentionally_diverge_from_frozen_behavior(
         if replacement {
             assert!(current.send(Action::Paced, frame("peer", 1, 99, true, &[1])));
         }
-        assert!(current.send(
-            Action::Paced,
-            sized_frame("peer", 1, 100, BYTE_LIMIT + 1)
-        ));
-        assert!(!current.state.has_pending_paced(), "rejected input retained");
+        assert!(current.send(Action::Paced, sized_frame("peer", 1, 100, BYTE_LIMIT + 1)));
+        assert!(
+            !current.state.has_pending_paced(),
+            "rejected input retained"
+        );
         assert_eq!(current.drain(), vec![gap("peer", 1, BOUNDS, None)]);
         // Neither the old pending timestamp nor the rejected input may close.
         for stamp in [99, 100] {
@@ -664,10 +655,7 @@ fn oversized_initial_and_replacement_intentionally_diverge_from_frozen_behavior(
 #[test]
 fn oversized_rejection_requires_a_clean_reset_entry_before_paced_deltas_resume() {
     let mut current = Current::new(4);
-    assert!(current.send(
-        Action::Paced,
-        sized_frame("peer", 1, 100, BYTE_LIMIT + 1)
-    ));
+    assert!(current.send(Action::Paced, sized_frame("peer", 1, 100, BYTE_LIMIT + 1)));
     assert!(!current.state.has_pending_paced());
     assert_eq!(current.drain(), vec![gap("peer", 1, BOUNDS, None)]);
     assert!(current.send(Action::Paced, closing("peer", 1, 100, 1)));
@@ -692,10 +680,7 @@ fn oversized_rejection_preserves_remembered_gradual_recovery() {
     let mut current = Current::new(4);
     assert!(current.send(Action::Frame, gradual(0)));
     assert_eq!(current.drain(), vec![Event::Frame(gradual(0))]);
-    assert!(current.send(
-        Action::Paced,
-        sized_frame("peer", 1, 100, BYTE_LIMIT + 1)
-    ));
+    assert!(current.send(Action::Paced, sized_frame("peer", 1, 100, BYTE_LIMIT + 1)));
     assert!(!current.state.has_pending_paced());
     assert_eq!(current.drain(), vec![gap("peer", 1, BOUNDS, None)]);
     // Successful Gradual gap delivery clears the fence. The closing marker
@@ -710,7 +695,8 @@ fn oversized_rejection_preserves_remembered_gradual_recovery() {
 
 #[test]
 fn oversized_rejection_with_full_sink_preserves_the_first_gap_until_admission() {
-    for (gradual_mode, replacement) in [(false, false), (false, true), (true, false), (true, true)] {
+    for (gradual_mode, replacement) in [(false, false), (false, true), (true, false), (true, true)]
+    {
         let mut current = Current::new(1);
         if gradual_mode {
             assert!(current.send(Action::Frame, gradual(0)));
@@ -721,10 +707,7 @@ fn oversized_rejection_with_full_sink_preserves_the_first_gap_until_admission() 
         if replacement {
             assert!(current.send(Action::Paced, frame("peer", 1, 99, true, &[1])));
         }
-        assert!(current.send(
-            Action::Paced,
-            sized_frame("peer", 1, 100, BYTE_LIMIT + 1)
-        ));
+        assert!(current.send(Action::Paced, sized_frame("peer", 1, 100, BYTE_LIMIT + 1)));
         assert!(!current.state.has_pending_paced());
         assert_eq!(current.tx.capacity(), 0);
         for stamp in [99, 100] {
@@ -766,10 +749,7 @@ fn oversized_rejection_with_closed_sink_drops_pending_and_returns_false() {
             assert!(current.send(Action::Paced, frame("peer", 1, 99, true, &[1])));
         }
         current.rx.close();
-        assert!(!current.send(
-            Action::Paced,
-            sized_frame("peer", 1, 100, BYTE_LIMIT + 1)
-        ));
+        assert!(!current.send(Action::Paced, sized_frame("peer", 1, 100, BYTE_LIMIT + 1)));
         assert!(!current.state.has_pending_paced());
         for stamp in [99, 100] {
             assert!(!current.send(Action::Paced, closing("peer", 1, stamp, 1)));
