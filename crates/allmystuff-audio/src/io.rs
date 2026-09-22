@@ -762,7 +762,9 @@ fn run_playback(
         ),
         cpal::SampleFormat::U16 => device.build_output_stream(
             &config,
-            move |data: &mut [u16], _: &_| fill!(ring, channels, data, |s: i16| (s as i32 + 32768) as u16),
+            move |data: &mut [u16], _: &_| {
+                fill!(ring, channels, data, |s: i16| (s as i32 + 32768) as u16)
+            },
             err,
             None,
         ),

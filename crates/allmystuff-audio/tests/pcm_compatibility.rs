@@ -74,8 +74,16 @@ fn resampler_matches_independent_literal_vectors() {
         let from = row["from"].as_u64().unwrap() as u32;
         let to = row["to"].as_u64().unwrap() as u32;
         let name = row["name"].as_str().unwrap();
-        assert_eq!(original::resample_linear(&input, from, to), expected, "original {name}");
-        assert_eq!(pcm::resample_linear(&input, from, to), expected, "extracted {name}");
+        assert_eq!(
+            original::resample_linear(&input, from, to),
+            expected,
+            "original {name}"
+        );
+        assert_eq!(
+            pcm::resample_linear(&input, from, to),
+            expected,
+            "extracted {name}"
+        );
     }
 }
 
@@ -132,7 +140,9 @@ fn playback_ring_preserves_strict_threshold_tail_and_low_rate_literals() {
         let initial = if let Some(range) = row.get("initial_range") {
             let start = range[0].as_i64().unwrap();
             let count = range[1].as_u64().unwrap();
-            (0..count).map(|offset| (start + offset as i64) as i16).collect()
+            (0..count)
+                .map(|offset| (start + offset as i64) as i16)
+                .collect()
         } else {
             samples(&row["initial"])
         };
@@ -141,12 +151,24 @@ fn playback_ring_preserves_strict_threshold_tail_and_low_rate_literals() {
         let append = samples(&row["append"]);
         let rate = row["rate"].as_u64().unwrap() as u32;
         let expected = row["held_ms"].as_u64().map(|value| value as usize);
-        assert_eq!(original::append(&mut old_ring, append.clone(), rate), expected);
-        assert_eq!(pcm::buffer_playback_samples(&mut new_ring, append, rate), expected);
+        assert_eq!(
+            original::append(&mut old_ring, append.clone(), rate),
+            expected
+        );
+        assert_eq!(
+            pcm::buffer_playback_samples(&mut new_ring, append, rate),
+            expected
+        );
         assert_eq!(new_ring, old_ring, "{}", row["name"].as_str().unwrap());
         assert_eq!(new_ring.len(), row["len"].as_u64().unwrap() as usize);
-        assert_eq!(new_ring.front().copied(), row["first"].as_i64().map(|value| value as i16));
-        assert_eq!(new_ring.back().copied(), row["last"].as_i64().map(|value| value as i16));
+        assert_eq!(
+            new_ring.front().copied(),
+            row["first"].as_i64().map(|value| value as i16)
+        );
+        assert_eq!(
+            new_ring.back().copied(),
+            row["last"].as_i64().map(|value| value as i16)
+        );
     }
 }
 
@@ -157,7 +179,10 @@ fn repeated_bursts_preserve_hysteresis_and_report_the_pretrim_depth() {
     let expected = [None, None, Some(300), None, Some(280)];
     for held in expected {
         assert_eq!(original::append(&mut old_ring, vec![1; 4800], 48000), held);
-        assert_eq!(pcm::buffer_playback_samples(&mut new_ring, vec![1; 4800], 48000), held);
+        assert_eq!(
+            pcm::buffer_playback_samples(&mut new_ring, vec![1; 4800], 48000),
+            held
+        );
         assert_eq!(new_ring, old_ring);
     }
     assert_eq!(new_ring, VecDeque::from(vec![1; 3840]));

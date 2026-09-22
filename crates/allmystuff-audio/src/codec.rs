@@ -48,7 +48,9 @@ impl OpusStream {
             match self.enc.encode_vec(frame, 4000) {
                 Ok(pkt) => emit(pkt),
                 // A failed frame costs 20 ms of sound, never the stream.
-                Err(e) => tracing::debug!(target: "allmystuff_node::audio", "opus encode failed: {e}"),
+                Err(e) => {
+                    tracing::debug!(target: "allmystuff_node::audio", "opus encode failed: {e}")
+                }
             }
             off += OPUS_FRAME_SAMPLES;
         }

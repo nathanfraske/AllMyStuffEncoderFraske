@@ -48,8 +48,14 @@ fn arbitrary_capture_cadence_matches_frozen_packet_counts_and_remainders() {
         for (index, count) in row["push_samples"].as_array().unwrap().iter().enumerate() {
             let count = count.as_u64().unwrap() as usize;
             let packets = pair.push(&signal(offset, count), row["rate"].as_u64().unwrap() as u32);
-            assert_eq!(packets.len(), row["emitted_per_push"][index].as_u64().unwrap() as usize);
-            assert_eq!(pair.new.buf.len(), row["remaining_per_push"][index].as_u64().unwrap() as usize);
+            assert_eq!(
+                packets.len(),
+                row["emitted_per_push"][index].as_u64().unwrap() as usize
+            );
+            assert_eq!(
+                pair.new.buf.len(),
+                row["remaining_per_push"][index].as_u64().unwrap() as usize
+            );
             offset += count;
         }
     }
@@ -70,9 +76,18 @@ fn zero_capture_rate_matches_the_existing_48khz_passthrough() {
 fn mixed_rate_pushes_keep_original_state_and_stateless_resampling() {
     let mut pair = Pair::new();
     for (index, (rate, len)) in [
-        (44100, 881), (24000, 721), (48000, 19), (32000, 1001),
-        (0, 0), (96000, 1931), (8000, 161), (48000, 3000),
-    ].into_iter().enumerate() {
+        (44100, 881),
+        (24000, 721),
+        (48000, 19),
+        (32000, 1001),
+        (0, 0),
+        (96000, 1931),
+        (8000, 161),
+        (48000, 3000),
+    ]
+    .into_iter()
+    .enumerate()
+    {
         pair.push(&signal(index * 1000, len), rate);
     }
     let mut split = Pair::new();
@@ -93,13 +108,17 @@ fn synchronous_emit_panic_keeps_original_input_and_advanced_codec_state() {
     let old_panic = catch_unwind(AssertUnwindSafe(|| {
         pair.old.push(&pcm, 48000, |packet| {
             old_packets.push(packet);
-            if old_packets.len() == 2 { panic!("second original emit"); }
+            if old_packets.len() == 2 {
+                panic!("second original emit");
+            }
         });
     }));
     let new_panic = catch_unwind(AssertUnwindSafe(|| {
         pair.new.push(&pcm, 48000, |packet| {
             new_packets.push(packet);
-            if new_packets.len() == 2 { panic!("second extracted emit"); }
+            if new_packets.len() == 2 {
+                panic!("second extracted emit");
+            }
         });
     }));
     assert!(old_panic.is_err() && new_panic.is_err());
@@ -139,7 +158,10 @@ impl Decoders {
         // This is the original Mesh call, including false FEC and caller allocation.
         let old = self.old.decode(packet, &mut old_pcm, false);
         let new = self.new.decode(packet, &mut new_pcm);
-        assert_eq!(new_pcm, old_pcm, "entire caller buffer, including the untouched tail");
+        assert_eq!(
+            new_pcm, old_pcm,
+            "entire caller buffer, including the untouched tail"
+        );
         match (old, new) {
             (Ok(old_count), Ok(new_count)) => {
                 assert_eq!(new_count, old_count);

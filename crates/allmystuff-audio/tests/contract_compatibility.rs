@@ -11,7 +11,10 @@ fn clock_frame_duration_and_capture_variants_keep_the_original_values() {
     assert_eq!(allmystuff_audio::OPUS_FRAME_SAMPLES, 960);
     assert_eq!(allmystuff_audio::OPUS_FRAME_US, 20000);
     assert_eq!(format!("{:?}", allmystuff_audio::CaptureSource::Mic), "Mic");
-    assert_eq!(format!("{:?}", allmystuff_audio::CaptureSource::System), "System");
+    assert_eq!(
+        format!("{:?}", allmystuff_audio::CaptureSource::System),
+        "System"
+    );
 }
 
 #[cfg(feature = "codec")]
@@ -23,7 +26,12 @@ mod codec_contracts {
     use std::sync::{Arc, Mutex};
 
     fn pcm(value: &Value) -> Vec<i16> {
-        value.as_array().unwrap().iter().map(|n| n.as_i64().unwrap() as i16).collect()
+        value
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n.as_i64().unwrap() as i16)
+            .collect()
     }
 
     #[test]
@@ -32,7 +40,10 @@ mod codec_contracts {
         assert_eq!(original::OpusStream::new().err().unwrap(), expected);
         assert_eq!(disabled::OpusStream::new().err().unwrap(), expected);
         assert_eq!(original::OPUS_RATE, allmystuff_audio::OPUS_RATE);
-        assert_eq!(original::OPUS_FRAME_SAMPLES, allmystuff_audio::OPUS_FRAME_SAMPLES);
+        assert_eq!(
+            original::OPUS_FRAME_SAMPLES,
+            allmystuff_audio::OPUS_FRAME_SAMPLES
+        );
         assert_eq!(original::OPUS_FRAME_US, allmystuff_audio::OPUS_FRAME_US);
     }
 
@@ -157,7 +168,9 @@ mod codec_contracts {
             "audio capture for r unavailable: capture-less build",
             "audio playback for r unavailable: capture-less build",
         ];
-        for (index, ((_, old_level, old_message), (target, level, message))) in old.iter().zip(new.iter()).enumerate() {
+        for (index, ((_, old_level, old_message), (target, level, message))) in
+            old.iter().zip(new.iter()).enumerate()
+        {
             assert_eq!(old_level, "INFO");
             assert_eq!(level, old_level);
             assert_eq!(message, old_message);
@@ -190,7 +203,10 @@ mod codec_contracts {
             let text = row["json"].as_str().unwrap();
             assert_eq!(serde_json::to_string(&frame).unwrap(), text);
             assert_eq!(serde_json::from_str::<AudioFrame>(text).unwrap(), frame);
-            assert_eq!(frame.frame_count(), row["frame_count"].as_u64().unwrap() as usize);
+            assert_eq!(
+                frame.frame_count(),
+                row["frame_count"].as_u64().unwrap() as usize
+            );
         }
     }
 
@@ -201,7 +217,8 @@ mod codec_contracts {
             let frame: AudioFrame = serde_json::from_value(json!({
                 "route": "r", "seq": 0, "sample_rate": 0, "channels": 0,
                 "pcm": row["base64"], "unknown": "ignored"
-            })).unwrap();
+            }))
+            .unwrap();
             assert_eq!(frame.pcm, pcm(&row["expected_pcm"]));
             assert_eq!(frame.frame_count(), frame.pcm.len());
         }
@@ -213,19 +230,26 @@ mod codec_contracts {
         for field in ["route", "seq", "sample_rate", "channels", "pcm"] {
             let mut missing = full.clone();
             missing.as_object_mut().unwrap().remove(field);
-            let error = serde_json::from_value::<AudioFrame>(missing).unwrap_err().to_string();
+            let error = serde_json::from_value::<AudioFrame>(missing)
+                .unwrap_err()
+                .to_string();
             assert_eq!(error, format!("missing field `{field}`"));
         }
         for wrong in [json!([1, 2]), json!(false), json!(null)] {
             let mut value = full.clone();
             value["pcm"] = wrong;
-            let error = serde_json::from_value::<AudioFrame>(value).unwrap_err().to_string();
+            let error = serde_json::from_value::<AudioFrame>(value)
+                .unwrap_err()
+                .to_string();
             assert!(error.contains("expected a string"), "{error}");
         }
         for invalid in ["!", "A", "A===", "AQ"] {
             let mut value = full.clone();
             value["pcm"] = json!(invalid);
-            assert!(serde_json::from_value::<AudioFrame>(value).is_err(), "{invalid}");
+            assert!(
+                serde_json::from_value::<AudioFrame>(value).is_err(),
+                "{invalid}"
+            );
         }
     }
 
@@ -239,7 +263,9 @@ mod codec_contracts {
             if let Some(tag) = tag {
                 value["t"] = tag;
             }
-            assert!(matches!(MediaPayload::decode(value), Some(MediaPayload::Audio(decoded)) if decoded == frame));
+            assert!(
+                matches!(MediaPayload::decode(value), Some(MediaPayload::Audio(decoded)) if decoded == frame)
+            );
         }
         let mut unknown = full;
         unknown["t"] = json!("unknown");

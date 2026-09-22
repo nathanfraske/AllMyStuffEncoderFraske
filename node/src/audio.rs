@@ -1,7 +1,7 @@
 //! Compatibility paths for the shared audio implementation.
 
-pub use allmystuff_audio::CaptureSource;
 pub(crate) use allmystuff_audio::codec::{OpusDecoder, OpusStream};
+pub use allmystuff_audio::CaptureSource;
 pub(crate) use allmystuff_audio::{OPUS_FRAME_SAMPLES, OPUS_FRAME_US, OPUS_RATE};
 
 pub type AudioBridge = allmystuff_audio::io::AudioBridge<NodeStats>;
