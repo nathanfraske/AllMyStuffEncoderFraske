@@ -1,0 +1,57 @@
+name: Modular macOS validation
+
+on:
+  push:
+    branches: [agent/1503a621-audio-macos]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cumulative:
+    name: Cumulative libraries (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Current standard labels: macos-15 is ARM64; Intel is explicit.
+          # https://docs.github.com/en/actions/reference/runners/github-hosted-runners
+          - runner: macos-15-intel
+            arch: x86_64
+          - runner: macos-15
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 80
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Locked cumulative tests and Mac host compilation
+        timeout-minutes: 72
+        shell: bash
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: >-
+          python3 scripts/ci/modular_macos.py
+          --arch '${{ matrix.arch }}' --label '${{ matrix.runner }}'
+          --artifacts "$RUNNER_TEMP/modular-macos-artifacts"
+          --control "$RUNNER_TEMP/modular-macos-control"
+      - name: Verify descendant cleanup and remove private build state
+        if: always()
+        timeout-minutes: 5
+        shell: bash
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: >-
+          python3 scripts/ci/modular_macos.py --cleanup-only
+          --artifacts "$RUNNER_TEMP/modular-macos-artifacts"
+          --control "$RUNNER_TEMP/modular-macos-control"
+      - name: Retain exact commands, identities, counts and complete logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: modular-macos-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/modular-macos-artifacts
+          if-no-files-found: error
+          retention-days: 14

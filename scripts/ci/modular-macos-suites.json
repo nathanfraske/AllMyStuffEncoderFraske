@@ -1,0 +1,528 @@
+{
+  "audited_base": "e6340b31daa6d9c2058c4ee345564d3e0c0ecebf",
+  "groups": [
+    {
+      "id": "core",
+      "cargo_args": [
+        "--no-default-features",
+        "-p",
+        "allmystuff-frame-timing",
+        "-p",
+        "allmystuff-byte-queues",
+        "-p",
+        "allmystuff-video-pacing",
+        "-p",
+        "allmystuff-update-policy",
+        "-p",
+        "allmystuff-inventory-model",
+        "-p",
+        "allmystuff-video-metadata",
+        "-p",
+        "allmystuff-node-client",
+        "-p",
+        "allmystuff-storage",
+        "-p",
+        "allmystuff-video",
+        "--lib",
+        "--tests"
+      ],
+      "suites": [
+        {
+          "id": "frame-timing-unit",
+          "source": "crates/allmystuff-frame-timing/src/lib.rs",
+          "filter": "tests::",
+          "tests": [
+            "tests::breakdown_separates_intentional_wait_from_writes_and_other_work",
+            "tests::cadence_does_not_accumulate_millisecond_wakeup_rounding",
+            "tests::cadence_skips_late_slots_without_a_catchup_burst",
+            "tests::closing_marker_delay_is_not_lost",
+            "tests::continuous_fragments_can_hide_a_slow_complete_frame"
+          ],
+          "timeout_seconds": 120
+        },
+        {
+          "id": "byte-queues-unit",
+          "source": "crates/allmystuff-byte-queues/src/lib.rs",
+          "filter": "tests::",
+          "tests": [
+            "tests::framing_is_byte_exact",
+            "tests::overflow_drops_oldest_not_newest",
+            "tests::watch_adopts_the_eager_queue_and_scopes_unwatch"
+          ],
+          "timeout_seconds": 120
+        },
+        {
+          "id": "byte-queues-public",
+          "source": "crates/allmystuff-byte-queues/tests/public_api.rs",
+          "filter": "",
+          "tests": [
+            "oversized_chunks_preserve_drop_and_notification_policy"
+          ],
+          "timeout_seconds": 120
+        },
+        {
+          "id": "video-pacing-unit",
+          "source": "crates/allmystuff-video-pacing/src/lib.rs",
+          "filter": "tests::",
+          "tests": [
+            "tests::consecutive_large_frames_keep_debt_and_idle_refills_only_one_burst",
+            "tests::frame_target_and_explicit_wan_limits_are_respected",
+            "tests::measured_scene_change_fits_60fps_without_a_larger_burst",
+            "tests::simultaneous_routes_cannot_multiply_the_lan_ceiling"
+          ],
+          "timeout_seconds": 120
+        },
+        {
+          "id": "video-pacing-public",
+          "source": "crates/allmystuff-video-pacing/tests/public_api.rs",
+          "filter": "",
+          "tests": [
+            "public_frame_vectors_keep_direction_override_and_ceiling_rules",
+            "public_policy_vectors_preserve_floors_headroom_ceiling_and_overrides",
+            "public_state_trace_accepts_large_values_with_representable_deadlines",
+            "public_state_trace_keeps_debt_zero_reservations_and_idle_burst",
+            "public_state_trace_keeps_outstanding_debt_across_policy_changes",
+            "public_state_trace_preserves_zero_rate_and_rounding_boundaries"
+          ],
+          "timeout_seconds": 120
+        },
+        {
+          "id": "update-policy-unit",
+          "source": "crates/allmystuff-update-policy/src/lib.rs",
+          "filter": "tests::",
+          "tests": [
+            "tests::compare_basic",
+            "tests::compare_prerelease",
+            "tests::policy_gates"
+          ],
+          "timeout_seconds": 120
+        },
+        {
+          "id": "update-policy-public",
+          "source": "crates/allmystuff-update-policy/tests/public_api.rs",
+          "filter": "",
+          "tests": [
+            "policy_decisions_preserve_upgrade_and_version_edge_cases",
+            "policy_tokens_and_serde_remain_exact_lowercase_strings",
+            "version_ordering_preserves_permissive_compatibility_cases"
+          ],
+          "timeout_seconds": 120
+        },
+        {
+          "id": "inventory-model-public",
+          "source": "crates/allmystuff-inventory-model/tests/public_api.rs",
+          "filter": "",
+          "tests": [
+            "array_detection_preserves_direction_and_channel_boundaries",
+            "device_enum_tokens_remain_compatible",
+            "legacy_devices_keep_missing_option_and_additive_field_defaults",
+            "missing_collections_preserve_the_minimal_snapshot",
+            "populated_snapshot_round_trips_without_wire_shape_changes",
+            "required_fields_and_explicit_zero_remain_distinct_from_defaults",
+            "service_tokens_labels_schemes_and_web_flags_remain_compatible"
+          ],
+          "timeout_seconds": 120
+        },
+        {
+          "id": "video-metadata-public",
+          "source": "crates/allmystuff-video-metadata/tests/public_api.rs",
+          "filter": "",
+          "tests": [
+            "annexb_offsets_preserve_prefix_and_header_acceptance",
+            "every_truncated_marker_prefix_remains_untouched",
+            "insertion_matches_literal_bytes_and_fixed_positions",
+            "parsing_preserves_exact_acceptance_and_untouched_bytes",
+            "repeated_insertion_and_removal_preserve_first_marker_order"
+          ],
+          "timeout_seconds": 120
+        },
+        {
+          "id": "node-client-ipc",
+          "source": "crates/allmystuff-node-client/src/lib.rs",
+          "filter": "compatibility::",
+          "tests": [
+            "compatibility::acknowledgement_matrix_matches_old_clients",
+            "compatibility::bounded_channel_backpressure_keeps_order_and_receiver_drop_closes_the_reader",
+            "compatibility::connection_and_name_error_chains_remain_distinct",
+            "compatibility::event_policy_and_restart_semantics_match_the_original_readers",
+            "compatibility::event_read_failures_warn_only_for_node_and_partial_length_eof_is_quiet",
+            "compatibility::every_request_uses_a_fresh_connection_and_closes_the_old_one",
+            "compatibility::request_response_matrix_matches_old_clients_and_fixed_expectations",
+            "compatibility::subscription_waits_for_ack_and_retains_writer_until_tag_restart"
+          ],
+          "timeout_seconds": 300
+        },
+        {
+          "id": "node-client-public",
+          "source": "crates/allmystuff-node-client/tests/public_api.rs",
+          "filter": "",
+          "tests": [
+            "adjacent_frames_are_consumed_one_at_a_time",
+            "event_discriminators_and_required_fields_match_literal_json",
+            "exact_read_ceiling_is_inclusive_without_large_allocation",
+            "framing_matches_frozen_literal_vectors",
+            "legacy_constructor_result_types_remain_public_without_calling_them",
+            "request_defaults_and_serialization_match_the_baseline_contract",
+            "transport_write_and_flush_errors_are_not_reclassified",
+            "writer_matches_literal_frames_and_flushes"
+          ],
+          "timeout_seconds": 120
+        },
+        {
+          "id": "storage-plan",
+          "source": "crates/allmystuff-storage/tests/plan_compatibility.rs",
+          "filter": "",
+          "tests": [
+            "actors_keep_byte_bounds_and_the_existing_nul_acceptance",
+            "clock_observes_live_records_and_only_the_selected_actor_counter",
+            "equal_and_stale_stamps_preserve_first_value_and_skip_save",
+            "equal_value_setters_still_advance_and_save",
+            "exhausted_clock_never_wraps_or_persists",
+            "failed_merge_restores_full_state_and_noop_never_calls_persistence",
+            "failed_setters_restore_only_their_record_and_retries_skip_consumed_clock",
+            "full_maps_allow_updates_and_cap_errors_precede_actor_validation",
+            "invalid_peer_records_are_skipped_without_counter_effects",
+            "invalid_quota_consumes_clock_without_record_or_save",
+            "last_free_slot_obeys_input_order_and_rejected_records_do_not_raise_clocks",
+            "literal_compact_persisted_bytes_and_digests_match",
+            "managers_relay_and_sender_precheck_is_only_nonempty",
+            "messages_snapshots_and_persisted_state_keep_distinct_shapes",
+            "ordered_duplicates_affect_first_value_and_historical_counters",
+            "ordinary_members_require_both_device_and_original_actor",
+            "oversized_patch_rejects_policy_and_other_vectors_before_mutation",
+            "persisted_defaults_unknown_fields_and_numeric_type_failures",
+            "policy_defaults_aliases_unknowns_and_exact_bytes",
+            "policy_merge_has_no_direct_counter_entry_but_advances_next_local_stamp",
+            "policy_range_endpoints_and_error_precedence_preserve_state",
+            "prepared_updates_take_the_clock_from_apply_time_state",
+            "required_fields_and_type_errors_match_the_original_diagnostics",
+            "resource_ids_are_utf8_byte_prefixed_and_colon_safe",
+            "sanitize_removes_invalid_and_mismatched_records_without_counter_cleanup",
+            "sanitize_truncates_valid_maps_in_lexicographic_order_and_is_idempotent",
+            "stamp_order_is_counter_then_actor_and_chunk_stays_sixteen",
+            "zero_policy_stamp_and_nul_actor_validation_match_existing_rules"
+          ],
+          "timeout_seconds": 120
+        },
+        {
+          "id": "video-handoff",
+          "source": "crates/allmystuff-video/src/lib.rs",
+          "filter": "handoff::",
+          "tests": [
+            "handoff::compatibility::gradual_mode_can_leave_reset_fence_without_claiming_an_independent_key",
+            "handoff::compatibility::key_recognition_remains_specific_to_node_encoded_packet_prefix",
+            "handoff::compatibility::memory_limit_accepts_exact_budget_then_fences_whole_reference_chain",
+            "handoff::compatibility::memory_trimming_keeps_latest_whole_key_suffix_only_when_it_fits",
+            "handoff::compatibility::oversize_key_cannot_release_fence_but_replace_retains_its_separate_policy",
+            "handoff::compatibility::packet_accounting_keeps_original_metadata_and_length_prefix_charge",
+            "handoff::compatibility::source_derived_traces_preserve_results_batches_and_recovery_state",
+            "handoff::tests::gradual_stall_requests_one_wave_until_consumer_drains",
+            "handoff::tests::memory_bound_checks_the_whole_suffix_and_incoming_key",
+            "handoff::tests::real_unread_stall_fences_deltas_and_recovers_on_key",
+            "handoff::tests::repaired_burst_between_healthy_polls_preserves_every_reference",
+            "handoff::tests::stale_prefix_trims_only_to_a_fresh_complete_key_suffix"
+          ],
+          "timeout_seconds": 120
+        },
+        {
+          "id": "video-core-compatibility",
+          "source": "crates/allmystuff-video/tests/core_compatibility.rs",
+          "filter": "",
+          "tests": [
+            "codec_classification_matches_frozen_source_for_headers_and_truncation",
+            "dependent_suppression_only_fences_known_deltas",
+            "literal_codec_and_clean_entry_acceptance_includes_existing_quirks",
+            "literal_split_ranges_preserve_each_callers_policy",
+            "marker_bytes_and_builder_saturation_are_unchanged",
+            "marker_shape_is_strict_while_all_u16_counts_are_accepted",
+            "metadata_reexport_keeps_identity_bytes_and_removal",
+            "paced_dial_value_parser_preserves_exact_opt_outs_without_global_env",
+            "sequence_wrap_and_clean_entry_rules_match_frozen_boundaries",
+            "splitters_match_separate_frozen_walks_across_headers_and_caps"
+          ],
+          "timeout_seconds": 120
+        },
+        {
+          "id": "video-ingress-compatibility",
+          "source": "crates/allmystuff-video/tests/ingress_compatibility.rs",
+          "filter": "",
+          "tests": [
+            "age_check_is_on_data_arrival_while_an_old_matching_marker_still_closes",
+            "byte_bound_applies_to_append_but_first_fragment_remains_unchecked",
+            "chunk_limit_is_inclusive_and_empty_fragments_still_count",
+            "clean_entry_can_be_flagged_or_classified_and_is_carried_with_first_gap",
+            "closure_is_observed_at_send_not_before_suppressed_delta_or_queued_marker",
+            "four_slots_overflow_without_replay_and_recover_only_after_real_admission",
+            "gradual_frames_remain_inline_until_admitted_then_normal_forwarding_resumes",
+            "identity_changes_recovery_mode_even_while_the_lane_is_fenced",
+            "missing_or_mismatched_closing_markers_preserve_exact_gap_reasons",
+            "only_five_ascii_alphanumeric_suffixes_canonicalize_and_streams_stay_separate",
+            "paced_fragments_keep_first_envelope_or_key_and_close_as_one_queue_item",
+            "replacement_survives_full_feedback_and_first_loss_reason_is_retained",
+            "transport_gap_and_both_borrowed_discard_forms_remove_the_partial_lane"
+          ],
+          "timeout_seconds": 120
+        },
+        {
+          "id": "video-receive-compatibility",
+          "source": "crates/allmystuff-video/tests/receive_compatibility.rs",
+          "filter": "",
+          "tests": [
+            "completion_waits_for_exact_marker_and_ors_fragment_keys",
+            "marker_lookalike_is_payload_until_the_exact_closer",
+            "missing_wrong_count_and_wrong_timestamp_markers_discard_pending",
+            "new_timestamp_reports_damage_but_retains_new_train",
+            "route_byte_ceiling_and_existing_first_fragment_exception_are_preserved",
+            "route_chunk_ceiling_is_inclusive_then_recovery_discards_overflow",
+            "route_keys_are_exact_and_empty_fragments_still_count"
+          ],
+          "timeout_seconds": 120
+        }
+      ]
+    },
+    {
+      "id": "terminal-viewer",
+      "cargo_args": [
+        "-p",
+        "allmystuff-terminal",
+        "--no-default-features",
+        "--test",
+        "contract_compatibility"
+      ],
+      "suites": [
+        {
+          "id": "terminal-viewer",
+          "source": "crates/allmystuff-terminal/tests/contract_compatibility.rs",
+          "filter": "",
+          "tests": [
+            "attachment_fields_retain_an_owned_replay_and_broadcast_receiver",
+            "closing_a_nonexistent_session_retains_both_viewer_queues",
+            "construction_and_missing_routes_need_no_runtime_or_shell",
+            "detach_keeps_the_original_host_and_stub_viewer_difference",
+            "eager_and_replaced_watchers_retain_bytes_but_scope_unwatch",
+            "exact_four_mib_payload_cap_excludes_framing_and_empty_chunks",
+            "explicit_viewer_refuses_hosting_even_when_host_feature_is_unified",
+            "literal_framing_preserves_binary_and_empty_chunks",
+            "output_message_variants_and_clone_keep_the_original_shape",
+            "overflow_evicts_whole_old_chunks_and_restarts_the_empty_transition",
+            "oversized_single_chunk_is_evicted_but_still_requests_a_poll",
+            "queue_budget_and_watcher_tokens_are_per_route_and_host",
+            "repeated_ensure_preserves_the_queue_and_current_owner",
+            "session_info_preserves_snake_case_order_and_opaque_identity_bytes",
+            "stopping_a_viewer_route_removes_only_that_queue",
+            "unwatched_output_is_dropped_without_implicitly_creating_a_queue",
+            "zero_unwatch_removes_an_unclaimed_eager_queue"
+          ],
+          "timeout_seconds": 120
+        }
+      ]
+    },
+    {
+      "id": "terminal-host",
+      "cargo_args": [
+        "-p",
+        "allmystuff-terminal",
+        "--no-default-features",
+        "--features",
+        "host",
+        "--lib",
+        "--test",
+        "contract_compatibility"
+      ],
+      "suites": [
+        {
+          "id": "terminal-host-public",
+          "source": "crates/allmystuff-terminal/tests/contract_compatibility.rs",
+          "filter": "",
+          "tests": [
+            "attachment_fields_retain_an_owned_replay_and_broadcast_receiver",
+            "closing_a_nonexistent_session_retains_both_viewer_queues",
+            "construction_and_missing_routes_need_no_runtime_or_shell",
+            "detach_keeps_the_original_host_and_stub_viewer_difference",
+            "eager_and_replaced_watchers_retain_bytes_but_scope_unwatch",
+            "exact_four_mib_payload_cap_excludes_framing_and_empty_chunks",
+            "explicit_viewer_refuses_hosting_even_when_host_feature_is_unified",
+            "host_marker_does_not_add_send_or_sync_constraints",
+            "literal_framing_preserves_binary_and_empty_chunks",
+            "output_message_variants_and_clone_keep_the_original_shape",
+            "overflow_evicts_whole_old_chunks_and_restarts_the_empty_transition",
+            "oversized_single_chunk_is_evicted_but_still_requests_a_poll",
+            "queue_budget_and_watcher_tokens_are_per_route_and_host",
+            "repeated_ensure_preserves_the_queue_and_current_owner",
+            "session_info_preserves_snake_case_order_and_opaque_identity_bytes",
+            "stopping_a_viewer_route_removes_only_that_queue",
+            "unwatched_output_is_dropped_without_implicitly_creating_a_queue",
+            "zero_unwatch_removes_an_unclaimed_eager_queue"
+          ],
+          "timeout_seconds": 120
+        },
+        {
+          "id": "terminal-host-channel",
+          "source": "crates/allmystuff-terminal/src/lib.rs",
+          "filter": "host::compatibility::",
+          "tests": [
+            "host::compatibility::attach_replays_before_live_data_and_inherits_size_without_minting_an_id",
+            "host::compatibility::attach_succeeds_when_reconcile_queue_is_full_and_repeated_route_stays_one_attacher",
+            "host::compatibility::bridge_lag_skips_evicted_messages_and_keeps_retained_binary_and_exit",
+            "host::compatibility::bridge_replays_one_chunk_then_keeps_forwarding_after_exit_until_source_closes",
+            "host::compatibility::bridge_stalls_at_256_messages_and_resumes_in_order_after_the_sink_drains",
+            "host::compatibility::close_kills_once_despite_full_control_queue_and_preserves_viewer_buffers",
+            "host::compatibility::closed_sink_rejects_nonempty_replay_and_drops_the_broadcast_subscription",
+            "host::compatibility::closed_sink_with_empty_replay_waits_for_live_input_before_unsubscribing",
+            "host::compatibility::constants_preserve_both_queue_limits_scrollback_idle_delay_and_session_cap",
+            "host::compatibility::detach_one_viewer_reconciles_survivor_and_removes_only_its_queue_without_spawn",
+            "host::compatibility::disconnected_control_refuses_input_without_removing_session_or_route",
+            "host::compatibility::disconnected_resize_still_publishes_the_new_reconciled_size",
+            "host::compatibility::empty_replay_is_omitted_and_already_closed_source_finishes",
+            "host::compatibility::equal_resize_still_queues_control_without_rebroadcasting",
+            "host::compatibility::full_resize_updates_state_and_broadcast_even_when_control_send_fails",
+            "host::compatibility::full_size_scrollback_snapshots_remain_owned_and_cap_in_bytes",
+            "host::compatibility::idle_reaper_checks_generation_even_for_a_still_empty_session",
+            "host::compatibility::idle_reaper_keeps_a_reattached_session_without_bumping_generation",
+            "host::compatibility::idle_reaper_waits_the_original_hour_then_kills_and_shuts_down_empty_session",
+            "host::compatibility::input_preserves_binary_empty_order_and_exact_256_slot_rejection",
+            "host::compatibility::last_detach_mutates_maps_and_queue_before_the_spawn_policy_panics",
+            "host::compatibility::literal_resize_vectors_keep_independent_minima_and_maximum_sentinel_fallback",
+            "host::compatibility::literal_scrollback_traces_preserve_zero_exact_tail_and_binary_rules",
+            "host::compatibility::mapped_resize_reinserts_a_missing_attacher_but_absent_session_refuses",
+            "host::compatibility::missing_session_close_and_detach_clean_dangling_routes_without_spawning",
+            "host::compatibility::original_reaper_can_reap_a_recycled_empty_id_with_the_same_literal_generation",
+            "host::compatibility::reusing_a_route_for_another_session_retains_the_old_attacher_entry",
+            "host::compatibility::session_cap_rejects_creation_before_id_allocation_but_allows_existing_attach",
+            "host::compatibility::session_listing_preserves_metadata_and_counts_without_promising_hashmap_order",
+            "host::compatibility::stop_closes_shared_session_but_drops_only_the_requested_viewer_queue"
+          ],
+          "timeout_seconds": 120
+        },
+        {
+          "id": "terminal-unix-retained",
+          "source": "crates/allmystuff-terminal/src/lib.rs",
+          "filter": "host::tests::",
+          "tests": [
+            "host::tests::attach_does_not_shrink_to_the_joiners_placeholder",
+            "host::tests::detach_does_not_kill",
+            "host::tests::double_open_reattaches",
+            "host::tests::dsr_probe_counting_finds_each_query",
+            "host::tests::exit_code_surfaces",
+            "host::tests::multi_attach_fan_out",
+            "host::tests::resize_reaches_the_pty",
+            "host::tests::resize_reconciles_to_min",
+            "host::tests::scrollback_replay",
+            "host::tests::scrollback_ring_caps_and_keeps_the_tail",
+            "host::tests::shared_input_reaches_one_shell",
+            "host::tests::spawn_echo_roundtrip",
+            "host::tests::stop_kills_promptly"
+          ],
+          "timeout_seconds": 240
+        },
+        {
+          "id": "terminal-unix-lifecycle",
+          "source": "crates/allmystuff-terminal/src/lib.rs",
+          "filter": "host::lifecycle::",
+          "tests": [
+            "host::lifecycle::detach_one_viewer_keeps_the_shell_and_removes_only_its_route_queue",
+            "host::lifecycle::explicit_close_ends_waiting_shell_and_all_attached_routes",
+            "host::lifecycle::failed_candidate_leaves_no_routes_and_explicit_fallback_can_start",
+            "host::lifecycle::last_detach_then_reattach_preserves_scrollback_and_shell_memory",
+            "host::lifecycle::multi_attach_fans_out_and_shared_input_reaches_one_shell",
+            "host::lifecycle::native_size_preserves_placeholder_then_reconciles_minimum_and_detach",
+            "host::lifecycle::natural_exit_reports_code_and_leaves_maps_until_explicit_close",
+            "host::lifecycle::repeated_attach_is_idempotent_and_reopen_starts_a_fresh_shell",
+            "host::lifecycle::scrollback_then_live_output_has_no_gap_or_duplicate"
+          ],
+          "timeout_seconds": 360
+        }
+      ]
+    },
+    {
+      "id": "video-decode",
+      "cargo_args": [
+        "-p",
+        "allmystuff-video",
+        "--no-default-features",
+        "--features",
+        "decode",
+        "--lib"
+      ],
+      "suites": [
+        {
+          "id": "video-software-decode",
+          "source": "crates/allmystuff-video/src/lib.rs",
+          "filter": "video_decode::tests::",
+          "tests": [
+            "video_decode::tests::changing_local_decoder_preference_replaces_the_route_worker",
+            "video_decode::tests::decodes_what_the_encoder_produces",
+            "video_decode::tests::disconnected_decoder_route_restarts_on_next_feed",
+            "video_decode::tests::fresh_decoder_started_on_delta_requests_key",
+            "video_decode::tests::h264_route_rebuilds_across_resolution_change",
+            "video_decode::tests::local_decoder_preference_is_strict_and_defaults_to_automatic",
+            "video_decode::tests::sniff_routes_h264_hevc_and_av1_obu"
+          ],
+          "timeout_seconds": 180
+        }
+      ]
+    },
+    {
+      "id": "node-storage",
+      "cargo_args": [
+        "--manifest-path",
+        "node/Cargo.toml",
+        "--no-default-features",
+        "--lib"
+      ],
+      "suites": [
+        {
+          "id": "node-storage-persistence",
+          "source": "node/src/lib.rs",
+          "filter": "storage_plan::",
+          "tests": [
+            "storage_plan::compatibility_tests::absent_file_loads_exact_defaults_without_creating_state",
+            "storage_plan::compatibility_tests::absent_persistence_path_is_successful_memory_operation",
+            "storage_plan::compatibility_tests::changed_merge_save_failure_restores_the_entire_state_and_can_retry",
+            "storage_plan::compatibility_tests::each_setter_save_failure_restores_records_but_consumes_the_clock",
+            "storage_plan::compatibility_tests::empty_explicit_path_reports_exact_error_for_each_setter_and_rolls_back_merge",
+            "storage_plan::compatibility_tests::file_as_parent_reports_directory_context_and_retains_setter_counter",
+            "storage_plan::compatibility_tests::legacy_document_loads_without_rewriting_then_saves_current_shape",
+            "storage_plan::compatibility_tests::load_sanitizes_before_ordered_caps_without_rewriting_or_pruning_counters",
+            "storage_plan::compatibility_tests::malformed_and_schema_invalid_files_are_quarantined_byte_for_byte",
+            "storage_plan::compatibility_tests::non_utf8_read_failure_defaults_without_quarantining",
+            "storage_plan::compatibility_tests::rename_failure_cleans_temporary_file_and_preserves_destination",
+            "storage_plan::compatibility_tests::single_write_preserves_exact_pretty_document_bytes",
+            "storage_plan::compatibility_tests::successful_writes_round_trip_replace_atomically_and_leave_no_temp",
+            "storage_plan::compatibility_tests::unchanged_merge_does_not_attempt_a_write",
+            "storage_plan::compatibility_tests::validation_before_and_after_stamping_preserves_errors_and_retry_counters",
+            "storage_plan::tests::allocation_identity_cannot_collide_on_colons",
+            "storage_plan::tests::device_role_is_durable_cleanly_serialized_and_backward_compatible",
+            "storage_plan::tests::legacy_replica_policy_migrates_to_one_copy_count",
+            "storage_plan::tests::manager_can_relay_records_and_older_patch_is_ignored",
+            "storage_plan::tests::member_cannot_edit_another_device_or_policy",
+            "storage_plan::tests::policy_and_allocations_are_separate_bounded_records",
+            "storage_plan::tests::replica_and_reserve_bounds_prevent_nonsensical_policy"
+          ],
+          "timeout_seconds": 180
+        }
+      ]
+    }
+  ],
+  "checks": [
+    {
+      "id": "video-macos-host",
+      "cargo_args": [
+        "-p",
+        "allmystuff-video",
+        "--no-default-features",
+        "--features",
+        "host",
+        "--lib"
+      ]
+    },
+    {
+      "id": "node-macos-host",
+      "cargo_args": [
+        "--manifest-path",
+        "node/Cargo.toml",
+        "--lib"
+      ]
+    }
+  ]
+}
