@@ -276,6 +276,8 @@ class Runner:
                    "binary": str(executable), "binary_sha256": digest(executable)}
         self.report["suites"].append(receipt)
         arguments = [suite["filter"]] if suite["filter"] else []
+        if suite.get("exact", False):
+            arguments.append("--exact")
         listed = self.run(suite["id"] + "-list", [str(executable), *arguments, "--list", "--format", "terse"],
                           60, cwd=self.root / "cwd")
         text = (self.artifacts / listed["stdout"]).read_text(encoding="utf-8", errors="replace")
@@ -329,6 +331,7 @@ class Runner:
             shutil.copyfile(HERE / "modular-macos-suites.json", self.artifacts / "selected-suites.json")
             self.report["expected_executions"] = sum(len(suite["tests"]) for group in config["groups"] for suite in group["suites"])
             self.report["audited_base"] = config["audited_base"]
+            self.report["audited_audio"] = config["audited_audio"]
             self.save()
             for group in config["groups"]:
                 self.group(group)
@@ -357,7 +360,7 @@ class Runner:
             summary = os.environ.get("GITHUB_STEP_SUMMARY")
             if summary:
                 with open(summary, "a", encoding="utf-8") as stream:
-                    stream.write(f"\nMac {self.args.label}: {self.report['passed_executions']}/{self.report.get('expected_executions', 239)} selected executions passed. "
+                    stream.write(f"\nMac {self.args.label}: {self.report['passed_executions']}/{self.report.get('expected_executions', 'inventory not loaded')} selected executions passed. "
                                  f"Overall: {'PASS' if self.report['passed'] else 'FAIL'}. Full commands, counts, identities and logs are in the artifact.\n")
         return 0 if self.report["passed"] else 1
 

@@ -502,6 +502,275 @@
           "timeout_seconds": 180
         }
       ]
+    },
+    {
+      "id": "audio-default",
+      "cargo_args": [
+        "-p",
+        "allmystuff-audio",
+        "--no-default-features",
+        "--lib",
+        "--test",
+        "pcm_compatibility",
+        "--test",
+        "contract_compatibility"
+      ],
+      "suites": [
+        {
+          "id": "audio-default-pcm-unit",
+          "source": "crates/allmystuff-audio/src/lib.rs",
+          "filter": "pcm::tests::",
+          "tests": [
+            "pcm::tests::downmix_stereo_to_mono_averages",
+            "pcm::tests::resample_upsamples_length",
+            "pcm::tests::sample_conversions_round_trip_near_unity",
+            "pcm::tests::playback_ring_trims_back_to_the_target_depth"
+          ],
+          "timeout_seconds": 180
+        },
+        {
+          "id": "audio-default-pcm-vectors",
+          "source": "crates/allmystuff-audio/tests/pcm_compatibility.rs",
+          "filter": "",
+          "tests": [
+            "capture_conversion_matches_independent_float_bit_literals",
+            "playback_conversion_preserves_the_different_denominator",
+            "downmix_preserves_zero_channels_partial_groups_and_signed_truncation",
+            "downmix_accepts_the_full_channel_bound_without_narrow_accumulation",
+            "resampler_matches_independent_literal_vectors",
+            "fractional_resampling_remains_independent_for_each_capture_buffer",
+            "resampler_matches_frozen_helpers_across_rates_lengths_and_extrema",
+            "playback_ring_preserves_strict_threshold_tail_and_low_rate_literals",
+            "repeated_bursts_preserve_hysteresis_and_report_the_pretrim_depth"
+          ],
+          "timeout_seconds": 180
+        },
+        {
+          "id": "audio-default-public",
+          "source": "crates/allmystuff-audio/tests/contract_compatibility.rs",
+          "filter": "",
+          "tests": [
+            "clock_frame_duration_and_capture_variants_keep_the_original_values"
+          ],
+          "timeout_seconds": 180
+        }
+      ]
+    },
+    {
+      "id": "audio-codec",
+      "cargo_args": [
+        "-p",
+        "allmystuff-audio",
+        "--no-default-features",
+        "--features",
+        "codec",
+        "--lib",
+        "--test",
+        "pcm_compatibility",
+        "--test",
+        "contract_compatibility"
+      ],
+      "suites": [
+        {
+          "id": "audio-codec-pcm-unit",
+          "source": "crates/allmystuff-audio/src/lib.rs",
+          "filter": "pcm::tests::",
+          "tests": [
+            "pcm::tests::downmix_stereo_to_mono_averages",
+            "pcm::tests::resample_upsamples_length",
+            "pcm::tests::sample_conversions_round_trip_near_unity",
+            "pcm::tests::playback_ring_trims_back_to_the_target_depth"
+          ],
+          "timeout_seconds": 180
+        },
+        {
+          "id": "audio-codec-codec-unit",
+          "source": "crates/allmystuff-audio/src/lib.rs",
+          "filter": "codec::tests::",
+          "tests": [
+            "codec::tests::opus_stream_frames_and_survives_a_roundtrip"
+          ],
+          "timeout_seconds": 180
+        },
+        {
+          "id": "audio-codec-codec-compatibility",
+          "source": "crates/allmystuff-audio/src/lib.rs",
+          "filter": "codec::compatibility::",
+          "tests": [
+            "codec::compatibility::arbitrary_capture_cadence_matches_frozen_packet_counts_and_remainders",
+            "codec::compatibility::zero_capture_rate_matches_the_existing_48khz_passthrough",
+            "codec::compatibility::mixed_rate_pushes_keep_original_state_and_stateless_resampling",
+            "codec::compatibility::synchronous_emit_panic_keeps_original_input_and_advanced_codec_state",
+            "codec::compatibility::decoder_keeps_state_over_multiple_original_packet_frames",
+            "codec::compatibility::empty_packets_preserve_plc_before_between_and_after_valid_frames",
+            "codec::compatibility::malformed_packet_errors_preserve_next_valid_decoder_behavior",
+            "codec::compatibility::short_output_errors_preserve_caller_buffer_and_later_decoder_state"
+          ],
+          "timeout_seconds": 180
+        },
+        {
+          "id": "audio-codec-pcm-vectors",
+          "source": "crates/allmystuff-audio/tests/pcm_compatibility.rs",
+          "filter": "",
+          "tests": [
+            "capture_conversion_matches_independent_float_bit_literals",
+            "playback_conversion_preserves_the_different_denominator",
+            "downmix_preserves_zero_channels_partial_groups_and_signed_truncation",
+            "downmix_accepts_the_full_channel_bound_without_narrow_accumulation",
+            "resampler_matches_independent_literal_vectors",
+            "fractional_resampling_remains_independent_for_each_capture_buffer",
+            "resampler_matches_frozen_helpers_across_rates_lengths_and_extrema",
+            "playback_ring_preserves_strict_threshold_tail_and_low_rate_literals",
+            "repeated_bursts_preserve_hysteresis_and_report_the_pretrim_depth"
+          ],
+          "timeout_seconds": 180
+        },
+        {
+          "id": "audio-codec-public",
+          "source": "crates/allmystuff-audio/tests/contract_compatibility.rs",
+          "filter": "",
+          "tests": [
+            "clock_frame_duration_and_capture_variants_keep_the_original_values",
+            "codec_contracts::disabled_encoder_refusal_keeps_the_original_text",
+            "codec_contracts::explicitly_disabled_encoder_push_remains_inert",
+            "codec_contracts::disabled_capture_drops_its_callback_without_invocation_or_resource_state",
+            "codec_contracts::explicit_disabled_bridge_stays_inert_even_with_io_feature_unification",
+            "codec_contracts::disabled_logs_keep_the_original_messages_levels_and_node_target",
+            "codec_contracts::frame_reexport_retains_the_canonical_session_type",
+            "codec_contracts::frame_json_matches_independent_little_endian_and_field_order_literals",
+            "codec_contracts::frame_decode_retains_odd_byte_discard_and_zero_channel_shape",
+            "codec_contracts::frame_requires_original_fields_and_rejects_wrong_pcm_representation",
+            "codec_contracts::untagged_and_nonstring_media_tags_keep_audio_demux_behavior"
+          ],
+          "timeout_seconds": 180
+        }
+      ]
+    },
+    {
+      "id": "audio-io",
+      "cargo_args": [
+        "-p",
+        "allmystuff-audio",
+        "--no-default-features",
+        "--features",
+        "audio-io",
+        "--lib",
+        "--test",
+        "pcm_compatibility",
+        "--test",
+        "contract_compatibility"
+      ],
+      "suites": [
+        {
+          "id": "audio-io-pcm-unit",
+          "source": "crates/allmystuff-audio/src/lib.rs",
+          "filter": "pcm::tests::",
+          "tests": [
+            "pcm::tests::downmix_stereo_to_mono_averages",
+            "pcm::tests::resample_upsamples_length",
+            "pcm::tests::sample_conversions_round_trip_near_unity",
+            "pcm::tests::playback_ring_trims_back_to_the_target_depth"
+          ],
+          "timeout_seconds": 180
+        },
+        {
+          "id": "audio-io-codec-unit",
+          "source": "crates/allmystuff-audio/src/lib.rs",
+          "filter": "codec::tests::",
+          "tests": [
+            "codec::tests::opus_stream_frames_and_survives_a_roundtrip"
+          ],
+          "timeout_seconds": 180
+        },
+        {
+          "id": "audio-io-codec-compatibility",
+          "source": "crates/allmystuff-audio/src/lib.rs",
+          "filter": "codec::compatibility::",
+          "tests": [
+            "codec::compatibility::arbitrary_capture_cadence_matches_frozen_packet_counts_and_remainders",
+            "codec::compatibility::zero_capture_rate_matches_the_existing_48khz_passthrough",
+            "codec::compatibility::mixed_rate_pushes_keep_original_state_and_stateless_resampling",
+            "codec::compatibility::synchronous_emit_panic_keeps_original_input_and_advanced_codec_state",
+            "codec::compatibility::decoder_keeps_state_over_multiple_original_packet_frames",
+            "codec::compatibility::empty_packets_preserve_plc_before_between_and_after_valid_frames",
+            "codec::compatibility::malformed_packet_errors_preserve_next_valid_decoder_behavior",
+            "codec::compatibility::short_output_errors_preserve_caller_buffer_and_later_decoder_state"
+          ],
+          "timeout_seconds": 180
+        },
+        {
+          "id": "audio-io-io-compatibility",
+          "source": "crates/allmystuff-audio/src/lib.rs",
+          "filter": "io::compatibility::",
+          "tests": [
+            "io::compatibility::feed_missing_or_unbacked_routes_preserves_maps_and_does_nothing",
+            "io::compatibility::feed_uses_argument_route_and_counts_empty_frames_before_processing",
+            "io::compatibility::feed_observes_device_rate_changes_and_original_downmix_resample_order",
+            "io::compatibility::feed_keeps_strict_trim_threshold_and_can_trim_on_empty_input",
+            "io::compatibility::duplicate_start_guards_keep_seeded_capture_and_playback_resources",
+            "io::compatibility::running_is_map_presence_even_without_a_live_worker",
+            "io::compatibility::stop_removes_both_maps_then_joins_capture_before_playback_off_lock",
+            "io::compatibility::stop_all_preserves_capture_then_playback_joins_under_their_map_locks",
+            "io::compatibility::route_drop_sets_stop_and_ignores_the_joined_workers_panic",
+            "io::compatibility::level_window_saturates_the_signed_minimum_and_resets_only_window_fields",
+            "io::compatibility::level_window_counts_empty_buffers_and_reports_silence_without_marking_warning",
+            "io::compatibility::output_callback_pops_once_per_frame_including_partial_interleaved_tail",
+            "io::compatibility::output_callback_preserves_float_unsigned_and_underrun_silence_values",
+            "io::compatibility::output_callback_preserves_zero_channel_panic_even_for_empty_output",
+            "io::compatibility::metered_capture_forwards_exact_samples_rates_and_empty_buffers",
+            "io::compatibility::metered_capture_releases_statistics_lock_before_user_callback",
+            "io::compatibility::statistics_policy_is_lazy_at_the_original_emission_points",
+            "io::compatibility::static_statistics_policy_does_not_add_owned_send_sync_or_default_bounds"
+          ],
+          "timeout_seconds": 180
+        },
+        {
+          "id": "audio-io-level-stats",
+          "source": "crates/allmystuff-audio/src/lib.rs",
+          "filter": "io::tests::level_stats_flag_a_pure_silence_window",
+          "tests": [
+            "io::tests::level_stats_flag_a_pure_silence_window"
+          ],
+          "timeout_seconds": 180,
+          "exact": true
+        },
+        {
+          "id": "audio-io-pcm-vectors",
+          "source": "crates/allmystuff-audio/tests/pcm_compatibility.rs",
+          "filter": "",
+          "tests": [
+            "capture_conversion_matches_independent_float_bit_literals",
+            "playback_conversion_preserves_the_different_denominator",
+            "downmix_preserves_zero_channels_partial_groups_and_signed_truncation",
+            "downmix_accepts_the_full_channel_bound_without_narrow_accumulation",
+            "resampler_matches_independent_literal_vectors",
+            "fractional_resampling_remains_independent_for_each_capture_buffer",
+            "resampler_matches_frozen_helpers_across_rates_lengths_and_extrema",
+            "playback_ring_preserves_strict_threshold_tail_and_low_rate_literals",
+            "repeated_bursts_preserve_hysteresis_and_report_the_pretrim_depth"
+          ],
+          "timeout_seconds": 180
+        },
+        {
+          "id": "audio-io-public",
+          "source": "crates/allmystuff-audio/tests/contract_compatibility.rs",
+          "filter": "",
+          "tests": [
+            "clock_frame_duration_and_capture_variants_keep_the_original_values",
+            "codec_contracts::disabled_encoder_refusal_keeps_the_original_text",
+            "codec_contracts::explicitly_disabled_encoder_push_remains_inert",
+            "codec_contracts::disabled_capture_drops_its_callback_without_invocation_or_resource_state",
+            "codec_contracts::explicit_disabled_bridge_stays_inert_even_with_io_feature_unification",
+            "codec_contracts::disabled_logs_keep_the_original_messages_levels_and_node_target",
+            "codec_contracts::frame_reexport_retains_the_canonical_session_type",
+            "codec_contracts::frame_json_matches_independent_little_endian_and_field_order_literals",
+            "codec_contracts::frame_decode_retains_odd_byte_discard_and_zero_channel_shape",
+            "codec_contracts::frame_requires_original_fields_and_rejects_wrong_pcm_representation",
+            "codec_contracts::untagged_and_nonstring_media_tags_keep_audio_demux_behavior"
+          ],
+          "timeout_seconds": 180
+        }
+      ]
     }
   ],
   "checks": [
@@ -524,5 +793,11 @@
         "--lib"
       ]
     }
-  ]
+  ],
+  "audited_audio": {
+    "assembly_commit": "2da6801ad90c24880cce09a3efe82d7ca9144dfa",
+    "production_commit": "c1bce0fee51843cc73df2299f3ae9236112cc1ea",
+    "fixtures_commit": "3c5ced3301d09ebab99c8ecae5b132960856e5a9",
+    "excluded_device_test": "io::tests::capture_and_playback_for_one_route_coexist"
+  }
 }

@@ -10,13 +10,16 @@ and [Apple Silicon](https://github.com/actions/runner-images/blob/main/images/ma
 image inventories. The job records actual versions; image updates do not imply
 a tested or fixed toolchain version.
 
-The initial audited source is `e6340b31daa6d9c2058c4ee345564d3e0c0ecebf`.
+The initial cumulative source is `e6340b31daa6d9c2058c4ee345564d3e0c0ecebf`;
+the audio fixture assembly was audited at
+`2da6801ad90c24880cce09a3efe82d7ca9144dfa`.
 `modular-macos-suites.json` lists every selected Rust test name, target source,
 feature configuration and timeout. Cargo only builds the named packages/targets;
 each resulting test binary is enumerated before its matching filter runs. A
 missing, added, ignored or failing case prevents a green result. The initial
-inventory contains **239 executions per architecture**, including the deliberate
-17-case viewer-contract repetition with the host feature enabled.
+inventory contains **338 executions per architecture**: the original 239 plus
+99 audio executions across three feature configurations. This includes deliberate
+repetition of viewer and audio definitions to check feature combinations.
 
 | Selection | Executions |
 | --- | ---: |
@@ -35,6 +38,9 @@ inventory contains **239 executions per architecture**, including the deliberate
 | Unix terminal lifecycle (9 PTY) | 9 |
 | Software video decode | 7 |
 | Node storage (7 memory, 15 private persistence fixtures) | 22 |
+| Audio default: PCM and public contract | 14 |
+| Audio codec: PCM, Opus and explicit disabled contract | 33 |
+| Audio I/O compiled: the above plus device-free I/O and LevelStats | 52 |
 
 The final two gates use `cargo check --locked --lib` for `allmystuff-video` with
 `host`, and the node with its default host features. They compile Mac capture,
@@ -45,9 +51,20 @@ In particular, video encoder-ladder tests and the retained audio test
 `capture_and_playback_for_one_route_coexist` are excluded. The optional adapter
 cases `node_control::tests::` (17 on Mac), `persist::tests::` (2), inventory
 `model_identity` (1), and control-client cases (13) are outside this initial
-inventory. Audio extraction tests require a separately reviewed inventory
-addition after that package is integrated; this script does not discover and
-run future test targets automatically.
+inventory. This script does not discover and run future test targets automatically.
+
+Audio's default and `codec` builds run the named PCM/public targets and narrow
+unit/codec filters. The `audio-io` build repeats those contracts, including the
+explicit disabled bridge, then selects only `io::compatibility::` (18 cases) and
+the exact `io::tests::level_stats_flag_a_pure_silence_window` case. Both discovery
+and execution use `--exact` for that single retained case. No whole I/O module
+or whole audio test binary is executed. I/O fixtures seed private maps, use
+bounded fake workers and call callback bodies without opening a device; duplicate
+start tests assert populated maps before the native-start entry points can return
+early. The 99 audio executions cover 52 distinct safe definitions, including six
+retained tests. Paired Opus tests compare independent instances of the same linked
+native library, without assuming universal packet bytes across library versions.
+These checks make no device quality, capture/playback or TCC permission claim.
 
 ## Environment, bounds and evidence
 
