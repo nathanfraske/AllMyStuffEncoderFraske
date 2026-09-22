@@ -833,3 +833,7 @@ mod tests {
         assert!(!bridge.is_running("r"));
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/support/io_compatibility.rs"]
+mod compatibility;

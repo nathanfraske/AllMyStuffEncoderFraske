@@ -104,3 +104,7 @@ mod tests {
         assert_eq!(n, OPUS_FRAME_SAMPLES, "one packet = one 20 ms frame");
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/support/codec_compatibility.rs"]
+mod compatibility;
