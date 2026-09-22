@@ -34,5 +34,8 @@ fn observed_fill<T>(
     fill!(ring, channels, data, conv);
 }
 
+// Compile the same observations against both sets of private model types.
+// A re-export would make both sides exercise the same implementation.
+#[allow(clippy::duplicate_mod)]
 #[path = "io_harness.rs"]
 pub(super) mod harness;
