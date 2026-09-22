@@ -6,6 +6,10 @@ There are no new consumer presets or profiles in this change. The optional
 host and application registration model remain future work; these small
 extractions preserve the existing calculations and caller behavior.
 
+The [modularization master list](MODULARIZATION-MASTER-LIST.md) maps the
+extracted packages, remaining application boundaries, proposed optimizations,
+dependency reductions, platform evidence and MyOwnMesh transition work.
+
 **Experimental RISC-V checkpoint.** The cumulative changes also carry a
 two-line correction to the pinned OpenH264 wrapper's RISC-V target recognition.
 The full no-default Serve binary linked for RISC-V musl; 684 root/node tests
@@ -19,6 +23,7 @@ artifact identities.
 
 | Library | Current contents | Direct dependencies |
 | --- | --- | --- |
+| [allmystuff-audio](../crates/allmystuff-audio/README.md) | PCM conversion, downmix, resampling and buffering; optional Opus state and capture/playback bridge. | Default: standard library only; `codec` adds `opus`, the session model and `tracing`; `audio-io` adds `cpal`, `parking_lot` and Linux `libloading`. |
 | [allmystuff-terminal](../crates/allmystuff-terminal/README.md) | Viewer queues and optional shared PTY sessions, scrollback, resize and lifecycle. | Default: byte queues, `serde`, `tokio`; `host` adds `dirs`, `parking_lot`, `tracing` and existing `xpty` under its `portable-pty` alias. |
 | [allmystuff-storage](../crates/allmystuff-storage/README.md) | Fleet storage-plan records, validation, ordered transitions and digest, with caller-supplied persistence. | `serde` and `serde_json`; `parking_lot` is test-only. |
 | [allmystuff-video](../crates/allmystuff-video/README.md) | Encoded-video rules, receive/handoff policy, optional decode workers and capture/encode backends. | Default: existing timing/metadata/pacing libraries and `tracing`; native dependencies are feature-gated. |
@@ -30,8 +35,8 @@ artifact identities.
 | [allmystuff-video-metadata](../crates/allmystuff-video-metadata/src/lib.rs) | Annex-B offsets and AU identity marker insertion, inspection and removal. | `memchr` 2. |
 
 These packages do not depend on the node, GUI or a Mesh transport. Their default
-features exclude native codecs and capture backends; the unified video package
-adds those through explicit features described below. They inherit workspace
+features exclude native codecs and capture backends; the audio and video
+packages add those through explicit features described below. They inherit workspace
 version `0.2.121`, edition 2021 and declared
 minimum Rust `1.88.0`; a declared minimum is not a new toolchain qualification.
 The node modules are compatibility shims: the public
@@ -46,6 +51,7 @@ a consumer beside this repository, choose the dependency lines it needs:
 
 ```toml
 [dependencies]
+allmystuff-audio = { path = "../AllMyStuff/crates/allmystuff-audio" }
 allmystuff-terminal = { path = "../AllMyStuff/crates/allmystuff-terminal" }
 allmystuff-storage = { path = "../AllMyStuff/crates/allmystuff-storage" }
 allmystuff-video = { path = "../AllMyStuff/crates/allmystuff-video" }
@@ -71,6 +77,25 @@ encoded-video consumers can inspect or add the existing AU metadata without
 linking a capture, decoder or node runtime.
 These choices require no running AllMyStuff host. The extractions supply no
 application SDK, provider registry or identity-approval system.
+
+**Audio library.** `allmystuff-audio` has an empty default feature set and
+provides the existing PCM sample conversion, mono downmix, stateless linear
+resampling and bounded playback-ring helpers. `codec` adds the 48 kHz mono
+Opus encoder/decoder and explicit disabled-device API; `audio-io` includes
+`codec` and adds the existing CPAL capture/playback and platform loopback paths.
+`io::AudioBridge<S>` accepts a static statistics policy, allowing node to retain
+its shared lazy logging setting without a library dependency on video or node.
+
+Node always enables `codec` and forwards its existing `audio-io` feature.
+Its disabled shim selects the disabled API explicitly when another consumer
+enables I/O through feature unification. Node retains route authorization,
+decoder-map ownership, transport, codec negotiation and the existing bounded
+send queue. The canonical `AudioFrame` remains in `allmystuff-session`.
+Conversion asymmetry, per-buffer resampling, frame/remainder handling,
+buffer trimming and stop/join behavior retain their current semantics. The
+[audio extraction report](reviews/modular-foundation/audio-library-extraction.md)
+separates source comparisons from actual validation and device/platform limits;
+the [package README](../crates/allmystuff-audio/README.md) describes the API.
 
 **Unified video library.** `allmystuff-video` has an empty default feature set:
 metadata, timing, pacing, classification, the separate host/receive-only framing

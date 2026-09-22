@@ -1,6 +1,6 @@
 # Remaining modularization opportunities
 
-**Status update (2026-09-19).** The [local IPC client extraction](ipc-client-extraction.md)
+**Status update (2026-09-22).** The [local IPC client extraction](ipc-client-extraction.md)
 is complete. The encoded-video, receive-policy and decoder/backend boundaries
 now live in one `allmystuff-video` package; the [video extraction report](video-library-extraction.md)
 tracks its current validation and qualifications. Fleet storage-plan records,
@@ -10,6 +10,13 @@ records compatibility and validation evidence. Terminal viewer queues and the
 optional shared PTY host now live in `allmystuff-terminal`; node retains runtime
 and authority adapters. The [terminal extraction report](terminal-library-extraction.md)
 records compatibility, isolated native validation and remaining qualifications.
+Audio PCM helpers, optional Opus state and the optional capture/playback bridge
+now live in `allmystuff-audio`; node retains route/authority and transport
+ownership. The [audio extraction report](audio-library-extraction.md) records
+source comparisons and the current validation status. The
+[modularization master list](../../MODULARIZATION-MASTER-LIST.md) consolidates
+these boundaries, proposed optimizations, dependency reductions, platform
+evidence and the MyOwnMesh transition work.
 The ranking, proposals and source anchors below are preserved as a historical
 audit at the stated revision.
 
