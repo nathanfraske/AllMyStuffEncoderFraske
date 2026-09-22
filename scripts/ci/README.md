@@ -10,13 +10,24 @@ and [Apple Silicon](https://github.com/actions/runner-images/blob/main/images/ma
 image inventories. The job records actual versions; image updates do not imply
 a tested or fixed toolchain version.
 
+Native qualification on 2026-09-22 passed at
+`b86c9fb31baed34a2feeb55243a90120ec669088` in
+[run 35763211936](https://github.com/nathanfraske/AllMyStuffEncoderFraske/actions/runs/35763211936):
+both architectures passed all 338 executions/38 suites, both host compile gates,
+four unchanged lockfiles, tracked-tree checks and normal cleanup with private
+roots removed. See the [evidence report](../../docs/reviews/modular-foundation/macos-validation.md)
+for actual tool versions, static Opus linkage and complete audit boundaries.
+The earlier cancelled run `35760215630` retains its partial results and ARM
+removal failure; its cancellation origin remains unknown. The successful run
+did not exercise forced-cancellation recovery.
+
 The initial cumulative source is `e6340b31daa6d9c2058c4ee345564d3e0c0ecebf`;
 the audio fixture assembly was audited at
 `2da6801ad90c24880cce09a3efe82d7ca9144dfa`.
 `modular-macos-suites.json` lists every selected Rust test name, target source,
 feature configuration and timeout. Cargo only builds the named packages/targets;
 each resulting test binary is enumerated before its matching filter runs. A
-missing, added, ignored or failing case prevents a green result. The initial
+missing, added, ignored or failing case prevents a green result. The reviewed
 inventory contains **338 executions per architecture**: the original 239 plus
 99 audio executions across three feature configurations. This includes deliberate
 repetition of viewer and audio definitions to check feature combinations.
@@ -142,8 +153,11 @@ the process evidence and re-raised; directory removal is never retried. A forced
 can interrupt this machinery; the standard hosted job's fresh VM is the final
 boundary. This is a reviewed cleanup mechanism for the selected inherited-env
 fixtures, not a security sandbox or a promise about arbitrary child programs.
-Native Intel and arm64 runs must qualify the ABI, cancellation handoff and cleanup
-behavior; source review alone is not runtime evidence.
+Run `35763211936` qualified the ABI, selected tool environment visibility and
+normal cleanup on both native architectures. Both always-step receipts acquired
+the lifetime lease without signalling the supervisor. Interrupted launch,
+forced-cancellation handoff and TERM/KILL escalation remain unexercised; the
+successful normal run is not evidence for those paths.
 
 Relevant primary sources, frozen to Apple's Darwin 24 family where available:
 
