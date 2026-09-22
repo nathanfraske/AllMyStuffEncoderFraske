@@ -51,6 +51,15 @@ The seven original test bodies are retained across `pcm`, `codec` and `io`.
 `io::tests::capture_and_playback_for_one_route_coexist` opens real audio
 devices and must be excluded from device-free test runs. The private output
 callback macro is shared with test fixtures so its ring-draining behavior can
-be exercised without CPAL device access. Independent compatibility fixtures
-and central format, compile, lint and runtime qualification are being prepared;
-this source checkpoint makes no new device or platform validation claim.
+be exercised without CPAL device access.
+
+Windows x64 and macOS 15 on arm64 and x86_64 each passed the same 52 distinct
+hardware-free audio tests: 14 with default features, 33 with `codec` and 52 with
+`audio-io`, totaling 99 executions per platform. The tests compare independently
+stateful old/new codecs using the same linked native library; they do not define
+universal Opus packet goldens. Windows formatting and strict library lint checks
+also passed. The [extraction report](../../docs/reviews/modular-foundation/audio-library-extraction.md)
+records exact source commits, feature graphs, caller checks, native linkage and
+the cumulative Mac run. Real device capture/playback, loopback, permissions,
+live-fleet transport, GUI/mobile integration and Linux audio execution remain
+outside this runtime qualification.
