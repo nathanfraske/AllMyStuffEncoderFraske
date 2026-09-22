@@ -1,4 +1,6 @@
 //! Route fallback assembly is compared with its original private implementation.
+//! BOUND-01 deliberately rejects oversized initial/replacement fragments that
+//! the frozen implementation retained; those differences are asserted explicitly.
 //! This deliberately does not substitute for canonical-peer ingress policy.
 
 use std::collections::HashMap;
@@ -121,6 +123,32 @@ fn completed(timestamp: u32, key: bool, data: &[u8], chunks: usize) -> (Option<C
     )
 }
 
+fn current_step(
+    pending: &mut HashMap<String, PacedInboundAu>,
+    route: &str,
+    timestamp: u32,
+    key: bool,
+    data: Vec<u8>,
+) -> (Option<Complete>, bool) {
+    tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
+        let (complete, damaged) =
+            receive::accept_paced_fragment(pending, route, timestamp, key, data);
+        (
+            complete.map(|au| Complete {
+                timestamp: au.rtp_timestamp,
+                key: au.key,
+                data: au.data,
+                chunks: au.chunks,
+                timed: au.timing.is_some(),
+            }),
+            damaged,
+        )
+    })
+}
+
+// Independent contract value, not imported from the implementation under test.
+const ROUTE_BYTE_LIMIT: usize = 16 * 1024 * 1024;
+
 #[test]
 fn completion_waits_for_exact_marker_and_ors_fragment_keys() {
     let mut pair = Pair::default();
@@ -212,32 +240,231 @@ fn route_chunk_ceiling_is_inclusive_then_recovery_discards_overflow() {
 }
 
 #[test]
-fn route_byte_ceiling_and_existing_first_fragment_exception_are_preserved() {
-    const LIMIT: usize = 16 * 1024 * 1024;
+fn route_byte_ceiling_is_inclusive_for_first_and_replacement_fragments() {
+    for replaces_pending in [false, true] {
+        let mut pair = Pair::default();
+        if replaces_pending {
+            assert_eq!(pair.step("r", 1, true, vec![9]), (None, false));
+        }
+        assert_eq!(
+            pair.step("r", 2, false, vec![7; ROUTE_BYTE_LIMIT]),
+            (None, replaces_pending)
+        );
+        // Empty continuations still count, without making an exact-limit AU
+        // oversized. The replaced unit's key bit must not leak into this one.
+        assert_eq!(pair.step("r", 2, false, vec![]), (None, false));
+        let (complete, damaged) = pair.step("r", 2, true, marker(2));
+        assert!(!damaged);
+        let complete = complete.unwrap();
+        assert_eq!(complete.timestamp, 2);
+        assert!(!complete.key);
+        assert_eq!(complete.chunks, 2);
+        assert_eq!(complete.data.len(), ROUTE_BYTE_LIMIT);
+        assert!(complete.data.iter().all(|&byte| byte == 7));
+        assert!(pair.current.is_empty());
+    }
+}
+
+#[test]
+fn route_byte_ceiling_is_inclusive_across_continuations() {
     let mut pair = Pair::default();
-    assert_eq!(pair.step("exact", 1, false, vec![7; LIMIT]), (None, false));
-    assert_eq!(pair.step("exact", 1, false, vec![]), (None, false));
-    let (complete, damaged) = pair.step("exact", 1, false, marker(2));
-    assert!(!damaged);
-    let complete = complete.unwrap();
-    assert_eq!(complete.chunks, 2);
-    assert_eq!(complete.data.len(), LIMIT);
-    assert!(complete.data.iter().all(|&byte| byte == 7));
-    drop(complete);
-
-    assert_eq!(pair.step("append", 2, false, vec![8; LIMIT]), (None, false));
-    assert_eq!(pair.step("append", 2, false, vec![9]), (None, true));
-    assert_eq!(pair.step("append", 2, false, marker(1)), (None, true));
-
-    // The original first insertion is not checked against the byte ceiling.
     assert_eq!(
-        pair.step("first", 3, true, vec![6; LIMIT + 1]),
+        pair.step("r", 1, false, vec![7; ROUTE_BYTE_LIMIT - 1]),
         (None, false)
     );
-    let (complete, damaged) = pair.step("first", 3, false, marker(1));
+    assert_eq!(pair.step("r", 1, true, vec![8]), (None, false));
+    let (complete, damaged) = pair.step("r", 1, false, marker(2));
     assert!(!damaged);
     let complete = complete.unwrap();
-    assert_eq!(complete.data.len(), LIMIT + 1);
+    assert_eq!(complete.timestamp, 1);
+    assert!(complete.key);
+    assert_eq!(complete.chunks, 2);
+    assert_eq!(complete.data.len(), ROUTE_BYTE_LIMIT);
+    assert!(complete.data[..ROUTE_BYTE_LIMIT - 1]
+        .iter()
+        .all(|&byte| byte == 7));
+    assert_eq!(complete.data[ROUTE_BYTE_LIMIT - 1], 8);
+    assert!(pair.current.is_empty());
+}
+
+#[test]
+fn continuation_byte_overflow_clears_pending_and_recovers_after_rejected_closers() {
+    // Cover a sum that exceeds the limit by one although each fragment fits,
+    // and a small pending unit followed by an individually oversized fragment.
+    // Both same-timestamp rejections agree with the frozen append behavior.
+    for (initial_len, continuation_len) in [(ROUTE_BYTE_LIMIT - 1, 2), (1, ROUTE_BYTE_LIMIT + 1)] {
+        let mut pair = Pair::default();
+        assert_eq!(
+            pair.step("r", 1, false, vec![7; initial_len]),
+            (None, false)
+        );
+        assert_eq!(
+            pair.step("r", 1, true, vec![8; continuation_len]),
+            (None, true)
+        );
+        assert!(pair.current.is_empty());
+        for count in [1, 2] {
+            assert_eq!(pair.step("r", 1, false, marker(count)), (None, true));
+            assert!(pair.current.is_empty());
+        }
+        assert_eq!(pair.step("r", 2, false, vec![4, 5]), (None, false));
+        assert_eq!(
+            pair.step("r", 2, true, marker(1)),
+            completed(2, false, &[4, 5], 1)
+        );
+    }
+}
+
+#[test]
+fn oversized_first_fragment_is_rejected_instead_of_the_historical_exception() {
+    let mut pair = Pair::default();
+    // Intentional BOUND-01 divergence: the original admitted a single large
+    // first fragment and could deliver it when its one-fragment marker arrived.
+    assert_eq!(
+        pair.original
+            .accept("r", 3, true, vec![6; ROUTE_BYTE_LIMIT + 1]),
+        (None, false)
+    );
+    assert_eq!(
+        current_step(
+            &mut pair.current,
+            "r",
+            3,
+            true,
+            vec![6; ROUTE_BYTE_LIMIT + 1],
+        ),
+        (None, true)
+    );
+    assert_eq!(pair.original.keys(), ["r".to_string()]);
+    assert!(pair.current.is_empty());
+    assert_eq!(
+        current_step(&mut pair.current, "r", 3, false, marker(1)),
+        (None, true)
+    );
+    let (complete, damaged) = pair.original.accept("r", 3, false, marker(1));
+    assert!(!damaged);
+    let complete = complete.unwrap();
+    assert_eq!(complete.timestamp, 3);
+    assert_eq!(complete.data.len(), ROUTE_BYTE_LIMIT + 1);
+    assert!(complete.data.iter().all(|&byte| byte == 6));
     assert!(complete.key);
     assert_eq!(complete.chunks, 1);
+    drop(complete);
+    // Closing the frozen oversized AU restores comparable empty state.
+    assert_eq!(pair.step("r", 3, false, marker(1)), (None, true));
+    assert_eq!(pair.step("r", 4, false, vec![1, 2]), (None, false));
+    assert_eq!(
+        pair.step("r", 4, true, marker(1)),
+        completed(4, false, &[1, 2], 1)
+    );
+}
+
+#[test]
+fn oversized_replacement_clears_the_route_instead_of_retaining_a_new_train() {
+    // Exercise closers for both the rejected replacement and the displaced AU.
+    for closing_timestamp in [0, u32::MAX] {
+        let mut pair = Pair::default();
+        assert_eq!(pair.step("r", u32::MAX, true, vec![9]), (None, false));
+        let old = pair
+            .original
+            .accept("r", 0, false, vec![6; ROUTE_BYTE_LIMIT + 1]);
+        let current = current_step(
+            &mut pair.current,
+            "r",
+            0,
+            false,
+            vec![6; ROUTE_BYTE_LIMIT + 1],
+        );
+        // Both signal displaced-unit damage, but only the historical version
+        // retains the oversized replacement. Compare that difference directly.
+        assert_eq!(old, (None, true));
+        assert_eq!(current, (None, true));
+        assert_eq!(pair.original.keys(), ["r".to_string()]);
+        assert!(pair.current.is_empty());
+        assert_eq!(
+            current_step(
+                &mut pair.current,
+                "r",
+                closing_timestamp,
+                true,
+                marker(1),
+            ),
+            (None, true)
+        );
+        let old = pair.original.accept("r", closing_timestamp, true, marker(1));
+        if closing_timestamp == 0 {
+            let (complete, damaged) = old;
+            assert!(!damaged);
+            let complete = complete.unwrap();
+            assert_eq!(complete.timestamp, 0);
+            assert!(!complete.key);
+            assert_eq!(complete.chunks, 1);
+            assert_eq!(complete.data.len(), ROUTE_BYTE_LIMIT + 1);
+            assert!(complete.data.iter().all(|&byte| byte == 6));
+        } else {
+            assert_eq!(old, (None, true));
+        }
+        assert_eq!(pair.step("r", 0, false, marker(1)), (None, true));
+        assert_eq!(pair.step("r", 1, false, vec![2, 3]), (None, false));
+        assert_eq!(
+            pair.step("r", 1, true, marker(1)),
+            completed(1, false, &[2, 3], 1)
+        );
+    }
+}
+
+#[test]
+fn rejected_oversized_route_leaves_other_routes_live_and_allows_later_recovery() {
+    for replaces_pending in [false, true] {
+        let mut current = HashMap::new();
+        assert_eq!(
+            current_step(&mut current, "peer", 90, false, vec![4]),
+            (None, false)
+        );
+        if replaces_pending {
+            assert_eq!(
+                current_step(&mut current, "peer-abc12", 1, true, vec![9]),
+                (None, false)
+            );
+        }
+        assert_eq!(
+            current_step(
+                &mut current,
+                "peer-abc12",
+                2,
+                true,
+                vec![6; ROUTE_BYTE_LIMIT + 1],
+            ),
+            (None, true)
+        );
+        assert_eq!(current.len(), 1);
+        assert!(current.contains_key("peer"));
+        assert!(!current.contains_key("peer-abc12"));
+        // The other route progresses before any marker/recovery on the bad
+        // route. Similar route strings must not acquire peer canonicalization.
+        assert_eq!(
+            current_step(&mut current, "peer", 90, true, vec![5]),
+            (None, false)
+        );
+        assert_eq!(
+            current_step(&mut current, "peer", 90, false, marker(2)),
+            completed(90, true, &[4, 5], 2)
+        );
+        for stamp in [1, 2] {
+            assert_eq!(
+                current_step(&mut current, "peer-abc12", stamp, false, marker(1)),
+                (None, true)
+            );
+            assert!(current.is_empty());
+        }
+        assert_eq!(
+            current_step(&mut current, "peer-abc12", 3, false, vec![1]),
+            (None, false)
+        );
+        assert_eq!(
+            current_step(&mut current, "peer-abc12", 3, true, marker(1)),
+            completed(3, false, &[1], 1)
+        );
+        assert!(current.is_empty());
+    }
 }

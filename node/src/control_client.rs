@@ -829,6 +829,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oversized_paced_au_does_not_stop_audio_or_other_video_lanes() {
+        // BOUND-01 intentionally rejects an oversized first/replacement
+        // fragment that the historical assembler admitted. Keep the IPC body
+        // below its separate limit, so this exercises assembly rejection.
+        for replaces_pending in [false, true] {
+            let mut wire = Vec::new();
+            let mut append = |kind, stream, key, ts, data: &[u8]| {
+                let body = allmystuff_protocol::control::encode_inbound_frame(
+                    kind, key, stream, ts, "peer", data,
+                );
+                assert!(body.len() < MAX_MEDIA_FRAME_BYTES);
+                wire.extend_from_slice(&(body.len() as u32).to_le_bytes());
+                wire.extend_from_slice(&body);
+            };
+            if replaces_pending {
+                append(MEDIA_KIND_VIDEO, 0, true, 10, &[9]);
+            }
+            append(MEDIA_KIND_VIDEO, 0, true, 11, &vec![7; 16 * 1024 * 1024 + 1]);
+            append(MEDIA_KIND_AUDIO, 0, false, 100, &[1]);
+
+            // Another stream on the same peer progresses before either
+            // rejected-unit closer arrives. Its fragments still form one AU.
+            append(MEDIA_KIND_VIDEO, 1, false, 40, &[4]);
+            append(MEDIA_KIND_VIDEO, 1, true, 40, &[5]);
+            let close_two = crate::video::paced_au_marker(2);
+            append(MEDIA_KIND_VIDEO, 1, false, 40, &close_two);
+            let close = crate::video::paced_au_marker(1);
+            for stale in [10, 11, 11] {
+                append(MEDIA_KIND_VIDEO, 0, false, stale, &close);
+            }
+
+            let delta = [0, 0, 0, 1, 0x41, 12];
+            let key = [0, 0, 0, 1, 0x65, 13];
+            let after_key = [0, 0, 0, 1, 0x41, 14];
+            append(MEDIA_KIND_VIDEO, 0, false, 12, &delta);
+            append(MEDIA_KIND_VIDEO, 0, false, 12, &close);
+            append(MEDIA_KIND_AUDIO, 0, false, 101, &[2]);
+            append(MEDIA_KIND_VIDEO, 0, true, 13, &key);
+            append(MEDIA_KIND_VIDEO, 0, false, 13, &close);
+            append(MEDIA_KIND_VIDEO, 0, false, 14, &after_key);
+            append(MEDIA_KIND_VIDEO, 0, false, 14, &close);
+            append(MEDIA_KIND_AUDIO, 0, false, 102, &[3]);
+
+            let (tx, mut rx) = mpsc::channel(MEDIA_VIDEO_QUEUE_CAPACITY);
+            let (audio_tx, mut audio_rx) = mpsc::channel(MEDIA_AUDIO_QUEUE_CAPACITY);
+            // Leave both consumers idle. The expected four video events fit
+            // the existing queue, and the final audio arrives while it is full.
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                ControlClient::read_media_source(
+                    std::io::Cursor::new(wire),
+                    tx,
+                    audio_tx,
+                    Arc::new(|_, _| Some(true)),
+                ),
+            )
+            .await
+            .expect("oversized video must not stop the shared media pipe");
+            assert_eq!(rx.len(), MEDIA_VIDEO_QUEUE_CAPACITY);
+            assert_eq!(audio_rx.len(), 3);
+
+            let expected = |kind, stream, key, rtp_timestamp, data: &[u8]| InboundFrame {
+                kind,
+                key,
+                stream,
+                rtp_timestamp,
+                from: "peer".to_string(),
+                data: data.to_vec(),
+            };
+            for event in [
+                InboundVideoEvent::Discontinuity {
+                    from: "peer".to_string(),
+                    stream: 0,
+                    reason: "paced AU exceeded assembly bounds",
+                    entry: None,
+                },
+                InboundVideoEvent::Frame(expected(MEDIA_KIND_VIDEO, 1, true, 40, &[4, 5])),
+                InboundVideoEvent::Frame(expected(MEDIA_KIND_VIDEO, 0, true, 13, &key)),
+                InboundVideoEvent::Frame(expected(MEDIA_KIND_VIDEO, 0, false, 14, &after_key)),
+            ] {
+                assert_eq!(
+                    rx.try_recv().unwrap(),
+                    event,
+                    "replacement={replaces_pending}"
+                );
+            }
+            assert!(matches!(
+                rx.try_recv(),
+                Err(mpsc::error::TryRecvError::Disconnected)
+            ));
+            for (stamp, data) in [(100, 1), (101, 2), (102, 3)] {
+                assert_eq!(
+                    audio_rx.try_recv().unwrap(),
+                    expected(MEDIA_KIND_AUDIO, 0, false, stamp, &[data]),
+                    "replacement={replaces_pending}",
+                );
+            }
+            assert!(matches!(
+                audio_rx.try_recv(),
+                Err(mpsc::error::TryRecvError::Disconnected)
+            ));
+        }
+    }
+
+    #[tokio::test]
     async fn stalled_video_consumer_does_not_block_audio_or_grow_the_queue() {
         let mut wire = Vec::new();
         for ts in 1..=12u32 {
