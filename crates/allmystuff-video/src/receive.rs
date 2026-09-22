@@ -98,6 +98,13 @@ pub fn accept_paced_fragment(
         );
     }
 
+    // First and replacement fragments obey the same ceiling as continuations.
+    // Drop an old unit too, so a later marker cannot complete stale data.
+    if data.len() > MAX_PACED_AU_BYTES {
+        pending.remove(route_id);
+        return (None, true);
+    }
+
     let mut damaged = false;
     match pending.get_mut(route_id) {
         Some(au) if au.rtp_timestamp == rtp_timestamp => {
