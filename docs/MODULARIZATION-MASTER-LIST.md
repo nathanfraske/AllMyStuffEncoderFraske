@@ -1,15 +1,39 @@
 # Modularization, optimization and MyOwnMesh master list
 
-Source inventory: `e6340b31daa6d9c2058c4ee345564d3e0c0ecebf`, reviewed on
+Original source inventory: `e6340b31daa6d9c2058c4ee345564d3e0c0ecebf`, reviewed on
 2026-09-22. The completed storage, terminal and Unix-terminal work is included
-in that revision. Audio extraction and cumulative macOS CI are separate,
-pending additions described below. This document changes no behavior, feature
-default, dependency pin, authority check or platform support claim.
+in that revision. Audio extraction and cumulative macOS CI were pending at
+that checkpoint; their later evidence is recorded below. This document changes
+no behavior, feature default, dependency pin or authority check.
 
 This is the index for the audited work and remaining opportunities. The linked
 reports retain exact commits, commands, failures and platform qualifications.
-Historical reports use older file locations; the symbol anchors here refer to
-the inventory revision unless explicitly marked as an audio candidate.
+Historical reports use older file locations; optimization and migration symbol
+anchors still refer to the original inventory unless explicitly marked otherwise.
+
+**Current evidence, 2026-09-22:** native macOS
+[run 35763211936](https://github.com/nathanfraske/AllMyStuffEncoderFraske/actions/runs/35763211936)
+passed all 38 selected suites / 338 executions on each of Intel and ARM64 at
+`b86c9fb31baed34a2feeb55243a90120ec669088`, including the extracted audio
+fixtures. Both host compile checks, four unchanged lock hashes, tracked-source
+checks and normal private-process/directory cleanup passed on each architecture.
+The [Mac evidence report](reviews/modular-foundation/macos-validation.md)
+records the exact selections, tools, native linkage and exclusions. This is
+676 selected executions, with deliberate repeats, not 676 distinct definitions.
+
+The [audio report](reviews/modular-foundation/audio-library-extraction.md)
+records focused Windows package results of 14 default, 33 codec and 52 I/O
+executions: 99 feature executions covering 52 distinct safe definitions. Local
+final formatting/lint evidence uses
+`ad5962d3db096e1ee42d3a1ebeae184c606cab7d`; its only difference from the Mac-tested
+revision is three comment/local-lint-allow lines in a test adapter. It is not a
+second Mac run. Local cleanup
+`1f653544-c931-4925-9ba2-77c4c066ddf1` also passed: 6,374 regenerable files totaling
+2,577,006,776 logical bytes (2.4000 GiB) were removed, with protected evidence,
+source, four locks and native Opus records verified unchanged. This is logical
+file size, not measured freed filesystem blocks. Neither validation result
+qualifies live audio/video devices, GUI/mobile products, MSRV or
+forced-cancellation recovery.
 
 **Priority/state convention:** P1 is a correctness, lifecycle or qualification
 gate; P2 is a useful bounded follow-up; P3 needs measurement before investment.
@@ -38,7 +62,7 @@ workspaces and lockfiles. Root tests do not validate the other three products.
 | MOD-08 Complete | [video](../crates/allmystuff-video/src/lib.rs): `codec`, `framing`, `receive`, `ingress`, `handoff`; optional output/decoder/capture/backends | [Mesh receive adapter](../node/src/mesh.rs), [daemon ingress adapter](../node/src/control_client.rs), [decode output adapter](../node/src/video_decode.rs), [handoff packet adapter](../node/src/video_handoff.rs). Default features empty; `decode` adds native receive, `host` includes decode/capture/encode, `hwenc` includes host/FFmpeg. Node always enables decode and retains its default host mapping. | [video extraction report](reviews/modular-foundation/video-library-extraction.md), [package](../crates/allmystuff-video/README.md) |
 | MOD-09 Complete | [storage plan](../crates/allmystuff-storage/src/plan.rs): records, prepared inputs, `PlanState`, validation, sanitization, transitions and digest | [StoragePlanStore](../node/src/storage_plan.rs) retains mutex, path/load/write and public record paths; [persist](../node/src/persist.rs) retains atomic writes. Serde/JSON core; synchronous persistence callback preserves consumed setter counters versus full merge rollback. Mesh retains sender/manager and local volume/capacity decisions. | [storage report](reviews/modular-foundation/storage-library-extraction.md), [package](../crates/allmystuff-storage/README.md) |
 | MOD-10 Complete | [terminal](../crates/allmystuff-terminal/src/lib.rs): viewer and optional `host::TerminalHost<S>`, `TaskSpawner` | [node host shim](../node/src/terminal.rs) supplies `NodeSpawner` at original spawn sites; [node viewer shim](../node/src/stubs/terminal.rs) explicitly selects viewer behavior. Empty defaults; host adds xpty `0.3.6` (portable-pty alias), dirs, locks and task/timer support. Consent, routing and IPC remain in node. | [terminal report](reviews/modular-foundation/terminal-library-extraction.md), [package](../crates/allmystuff-terminal/README.md) |
-| MOD-11 Active, source reviewed | Candidate `crates/allmystuff-audio/src/{pcm,codec,io,disabled}.rs`: PCM helpers, `OpusStream`, `OpusDecoder`, `AudioBridge<S>`, `StatsPolicy` | Baseline [audio](../node/src/audio.rs), [disabled audio](../node/src/stubs/audio.rs), [Mesh](../node/src/mesh.rs). Candidate empty defaults; `codec` adds Opus/session, `audio-io` adds CPAL/Linux Pulse bridge. Node keeps codec always; its audio-io forwards only the I/O feature. Node supplies lazy shared statistics policy and retains queues/routes/auth. | Candidate source receipt is recorded below; final fixture/compiler/runtime qualification remains pending. |
+| MOD-11 Complete focused extraction/validation | [audio](../crates/allmystuff-audio/src/lib.rs): [PCM helpers](../crates/allmystuff-audio/src/pcm.rs), [codec](../crates/allmystuff-audio/src/codec.rs) `OpusStream`/`OpusDecoder`, [I/O](../crates/allmystuff-audio/src/io.rs) `AudioBridge<S>`/`StatsPolicy`, [disabled implementation](../crates/allmystuff-audio/src/disabled.rs) | [audio shim](../node/src/audio.rs), [disabled shim](../node/src/stubs/audio.rs), [Mesh](../node/src/mesh.rs). Empty defaults; `codec` adds Opus/session, `audio-io` adds CPAL/Linux Pulse bridge. Node keeps codec always; its audio-io forwards only the I/O feature. Node supplies lazy shared statistics policy and retains queues/routes/auth. | [Audio extraction report](reviews/modular-foundation/audio-library-extraction.md), [package](../crates/allmystuff-audio/README.md), [Mac results](reviews/modular-foundation/macos-validation.md); device-opening retained case excluded. |
 
 Video's platform implementations now live under
 [`crates/allmystuff-video/src`](../crates/allmystuff-video/src): `video.rs`,
@@ -50,16 +74,16 @@ modules are compatibility paths or narrow policy adapters. In particular,
 the decoder output adapter preserves the local IPC envelope. No route or
 authorization ownership moved into these backends.
 
-The audio source candidate was committed as
+At the original source-review checkpoint, the audio candidate was committed as
 `c1bce0fee51843cc73df2299f3ae9236112cc1ea` and independently checked against
 `target/audio-extraction/source-ready.json` in C1's worktree: node audio shim
 `2909dc5d016284e81bed6f808a32ff746a6f2480`, disabled shim
 `da86d053fb04ceeea2d1c2c09f464580a56e065e`, Mesh
 `e56745af8f75818baebd722a1e6a249de82683d0`. Exactly three Mesh substitutions
 reverse to the entire original file: decoder type, constructor and the FEC
-argument moved inside the wrapper. This is source evidence, not an integrated
-or executed audio result. Final source/test inclusion and validation belong in
-the audio extraction report once delivered.
+argument moved inside the wrapper. That receipt establishes source equivalence;
+the later integrated fixture/compiler/runtime results are separately recorded
+in the audio report and current-evidence annotation above.
 
 Other existing packages and application boundaries must remain visible when
 planning removals; these are not all new extractions:
@@ -82,20 +106,31 @@ planning removals; these are not all new extractions:
 | ID / state | Source and recipe locations | Evidence and remaining boundary |
 | --- | --- | --- |
 | PORT-01 Complete bounded Windows preparation | [node feature gates](../node/src/lib.rs), [manifest](../node/Cargo.toml), `Mesh::advertised_capabilities`, [direct Serve help](../node/src/bin/serve.rs) | [Stage-one ledger](reviews/modular-foundation/stage-one-verification.md) records locked Windows feature/capability/help checks. Earlier dependency-review host leaks are historical findings corrected by that work; no claim of a fully media-free Serve. |
-| PORT-02 Complete focused Windows extractions | MOD-01 through MOD-10 and their reports | Existing reports distinguish library tests, node integration checks and actual native PTYs. Storage reports 52 focused cases; terminal reports 67 distinct Windows definitions across 84 executions. These are separate historical gates, not a new summed whole-product score. |
+| PORT-02 Complete focused Windows extraction gates | MOD-01 through MOD-11 and their reports | Existing reports distinguish library tests, node integration checks and actual native PTYs. Storage reports 52 focused cases; terminal reports 67 distinct Windows definitions across 84 executions. Audio adds 52 distinct safe definitions across 99 feature executions. These are separate gates, not a summed whole-product score. |
 | PORT-03 Complete Unix terminal qualification | [terminal host](../crates/allmystuff-terminal/src/host.rs), [lifecycle fixtures](../crates/allmystuff-terminal/tests/support/lifecycle.rs), terminal report's WSL section | Native WSL2 Ubuntu 24.04 passed retained 13 cases (11 PTY, 2 pure) and 9 lifecycle cases, with reviewed private home/tmp/target and PID-namespace cleanup. This does not qualify other Unix packages or macOS. |
 | PORT-04 Experimental, failure retained | [vendored OpenH264 wrapper](../vendor/openh264-sys2-0.9.6/build.rs), [vendor verification](../vendor/verify_openh264.py), [RISC-V scripts](../scripts/riscv), [experiment](reviews/portability/openh264-riscv64.md), [Serve plan](reviews/portability/serve-riscv64-test-plan.md) | Two target-recognition additions retain OpenH264 `0.9.3`/sys2 `0.9.6`. No-default riscv64gc-musl Serve linked; QEMU ran 684 historical root/node cases and degraded Serve lifecycle. Unoptimized standalone codec proof still aborts on a shift check; diagnostic relink failed. Real Mesh, target child/self-exec, doctests, board/device and performance remain unqualified. |
-| PORT-05 Active, source accepted only | Pending `.github/workflows/modular-macos.yml`, `scripts/ci/{modular_macos.py,macos_processes.py,modular-macos-suites.json,README.md}` | Explicit native Intel/ARM jobs select 239 executions each, plus video/node host compile-only. Includes 17 deliberate repeated terminal viewer definitions. First native ABI/visibility/process-cleanup and test results are pending. Hardware audio/video, GUI/mobile and optional omitted adapters are not counted. |
+| PORT-05 Complete bounded native Mac qualification | [workflow](../.github/workflows/modular-macos.yml), [runner](../scripts/ci/modular_macos.py), [process guard](../scripts/ci/macos_processes.py), [exact inventory](../scripts/ci/modular-macos-suites.json), [runner notes](../scripts/ci/README.md) | [Run report](reviews/modular-foundation/macos-validation.md): 338 executions / 38 suites per native Intel/ARM architecture, plus video/node host compile-only, at `b86c9fb`. Includes repeated terminal viewer and audio feature definitions; both routine cleanup receipts pass. Hardware audio/video, GUI/mobile, MSRV, omitted adapters and forced-cancellation recovery are not qualified. |
 | PORT-06 Proposed additional qualification | [platform review](reviews/modular-foundation/headless-platform-review.md), [release workflow](../.github/workflows/release.yml), [mobile docs](MOBILE.md) | A configured release target is not inspected runtime evidence. Native Linux/ARM, Android/iOS, Windows ARM, hardware capture/encode/decode, service operation and Rust 1.88 need their own exact configurations and authorized fixtures. Historical review claims must be read with later Windows/WSL/RISC-V evidence above. |
 
-The initial macOS candidate identities are workflow `fdf1259d`, process guard
+The initial macOS source checkpoint identities were workflow `fdf1259d`, process guard
 `ec23f2ae`, runner `ffbf32ae`, suite inventory `06686ae1`, README `a96b3f94`.
-They are accepted source, not pass evidence. The selected counts are: timing 5,
+Those identities are source evidence, not pass evidence. Its 239 selections were: timing 5,
 queues 4, pacing 10, update policy 6, model 7, metadata 5, IPC 16, storage core 28,
 video core 42, terminal viewer 17, terminal host public/channel 18/30, retained
 Unix terminal 13, lifecycle 9, software decode 7 and node storage 22.
 
-GitHub currently documents both native labels used by the candidate:
+The first [run 35760215630](https://github.com/nathanfraske/AllMyStuffEncoderFraske/actions/runs/35760215630)
+was canceled: Intel completed 217/239 selected executions and ARM completed
+239/239, but the overall jobs did not pass. Host compilation was interrupted;
+the still-running supervisor overlapped the always-cleanup step. ARM cleanup
+reported `ENOTEMPTY` in the private Cargo registry. The cancellation origin
+and exact ARM writer PID remain unknown. The subsequent runner correction
+serializes supervisor/cleanup ownership and stops further child launches;
+the successful 338-selection run adds 99 audio feature executions to the
+original inventory. Its normal cleanup exercised an uncontended lease with
+no termination signals, so it does not prove forced-cancellation recovery.
+
+GitHub documents both native labels used by the validated workflow:
 `macos-15-intel` and `macos-15` (ARM64). Each job receives a fresh hosted VM;
 that does not remove the need to identify and clean up test-owned PTY
 descendants before deleting their private directories.
@@ -548,14 +583,14 @@ are retained without duplicate work items:
 
 | ID / priority / state | Observed evidence and bounded action | Dependency, benefit, risk and validation |
 | --- | --- | --- |
-| TEST-01 / P1 / Active | Existing `audio::tests::capture_and_playback_for_one_route_coexist` calls real CPAL despite its CI comment. Retain it but exclude it from hardware-free filters; review MOD-11's exact fixture inventory before running. | CPAL `0.15.3` and Opus `0.3.1`. Benefit: honest device-free results. Risk: broad filters touching devices or counting an omitted case. Six other retained helper/codec/statistics cases are hardware-free; require exact lists/counts, paired persistent decoders, PCM/ring/callback tests and separate authorized device qualification. |
-| TEST-02 / P1 / Active | PORT-05's initial Mac selection omits `node_control::tests::` (17 Mac), `persist::tests::` (2), scanner `model_identity` (1), and `control_client::tests::` (13), plus pending extracted audio cases. Add only source-audited exact filters after the initial run. | Current app source; manager-owned native Mac execution. Benefit: adapter/platform evidence. Risk: broad node tests construct Mesh/stores or native backends. Require private home/state/tmp, positive expected counts, complete logs and descendant cleanup; source enumeration is not a pass. |
+| TEST-01 / P1 / Safe selection validated; device qualification pending | Original `audio::tests::capture_and_playback_for_one_route_coexist`, now `io::tests::capture_and_playback_for_one_route_coexist`, calls real CPAL despite its CI comment. It remains excluded. The six retained safe cases plus 46 new definitions pass in exact default/codec/I/O selections on Windows and both Mac architectures. | CPAL `0.15.3` and Opus `0.3.1`. Benefit: honest device-free results. Risk: broad filters touching devices or counting an omitted case. [Audio evidence](reviews/modular-foundation/audio-library-extraction.md) covers paired persistent decoders, PCM/ring/callback behavior; 99 feature executions are 52 definitions, not device, quality or universal libopus-byte qualification. |
+| TEST-02 / P1 / Proposed remaining Mac adapters | PORT-05 still omits `node_control::tests::` (17 Mac), `persist::tests::` (2), scanner `model_identity` (1), and `control_client::tests::` (13). Extracted audio is now included as 99 passed feature executions per architecture. Add remaining adapters only with source-audited exact filters. | Current app source; manager-owned native Mac execution. Benefit: adapter/platform evidence. Risk: broad node tests construct Mesh/stores or native backends. Require private home/state/tmp, positive expected counts, complete logs and descendant cleanup; enumeration of the omitted cases is not a pass. |
 | TEST-03 / P2 / Proposed | Broad [existing CI](../.github/workflows/ci.yml) uses moving OS labels and some unlocked/broad root/node/GUI commands. PORT-05 adds an explicit bounded Mac lane but does not replace every old job. | GitHub hosted image/toolchain identity. Benefit: reproducible, attributable platform results. Risk: broadening runtime claims or removing useful legacy coverage. Review each product's selected targets, lock hashes and hardware assumptions before reconciling workflows. |
 | TEST-04 / P2 / Proposed | GUI/mobile local-lock drift, separate workspaces, declared Rust 1.88, native features and build-script side effects remain independent qualification gaps. | FAT-03/06; desktop's existing `ALLMYSTUFF_SKIP_SIDECAR=1` only skips sidecar staging. Benefit: product-level evidence. Risk: treating root or host-library checks as GUI/mobile support. Require exact locked builds, target/feature graphs and authorized isolated runtime/device gates; no remote device qualification is claimed here. |
 | TEST-05 / P2 / Deferred experiment | PORT-04 retains an unresolved RISC-V unoptimized codec abort and failed diagnostic link. Do not count the other 684 passes as codec-proof success. | Frozen OpenH264/toolchain/proof identities in the experiment. Benefit: a diagnosed portability boundary. Risk: suppressing checks, changing optimization or blindly replaying a failed recipe. A separately resumed investigation must first identify the fault with a reviewed diagnostic build, then rerun the same proof and retain negative evidence. |
 | TEST-06 / P2 / Proposed capability work | [`nvdec::NvdecAv1`](../crates/allmystuff-video/src/nvdec.rs) and [`d3d11va::D3d11vaAv1`](../crates/allmystuff-video/src/d3d11va.rs) return not-implemented errors. Hardware availability cannot enable those stubs. | Current video backend interfaces, no Mesh prerequisite. Benefit: actual additional codec support. Risk: claiming support from a probe or compile result. Implement separately, then qualify real decode, frame shape, errors/fallback and device behavior; this is not dead-code cleanup. |
 
-Near-term ordering: finish the active audio and Mac validation gates; handle
+Near-term ordering: handle
 BOUND-01 as a separately reviewed correctness change; measure OPT-01/02/05
 before choosing performance work; design real-consumer feature/host-service
 seams before removing dependencies. MyOwnMesh migration begins with MESH-01/02
