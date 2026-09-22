@@ -1,0 +1,25 @@
+{
+  "source_commit": "e6340b31daa6d9c2058c4ee345564d3e0c0ecebf",
+  "source": "node/src/audio.rs",
+  "source_sha256": "5c73be7cffb0458b9a6ce5ecef59d20b3fc76a52cfea423d8f47d3bebf4a2b7c",
+  "ranges_inclusive": [
+    [
+      65,
+      69
+    ],
+    [
+      381,
+      397
+    ],
+    [
+      893,
+      930
+    ]
+  ],
+  "source_spans_sha256": "8a6c2f24aa9ac94bc9f6e8482d46fd98982a2e1b9ce5dfef25b9230c22a58682",
+  "prefix_bytes": 95,
+  "suffix_bytes": 489,
+  "file_sha256": "c452199a371a56a91faf86068add868fa9c8105ccddf19339e9c0602a3b30186",
+  "file_bytes": 2669,
+  "transformation": "None inside copied spans; VecDeque import and four observation adapters added outside. Formatting skipped only on frozen module inclusion."
+}

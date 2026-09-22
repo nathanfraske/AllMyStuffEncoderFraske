@@ -1,0 +1,18 @@
+{
+  "base": "e6340b31daa6d9c2058c4ee345564d3e0c0ecebf",
+  "source": "node/src/audio.rs",
+  "range": [
+    1,
+    930
+  ],
+  "range_sha256": "16a520cc551d6b431aedbccd4d02314c34606df0a671654e48f3d1fd77ef432e",
+  "substitutions": [
+    [
+      "crate::video::stats_to_info()",
+      "super::oracle_stats_to_info()"
+    ]
+  ],
+  "suffix": "\n\n// Test-only observation wrapper: copied original local macro, no device access.\nfn observed_fill<T>(ring: &Mutex<VecDeque<i16>>, channels: usize, data: &mut [T], conv: impl Fn(i16) -> T) {\n    macro_rules! fill {\n        ($data:expr, $conv:expr) => {{\n            let mut guard = ring.lock();\n            for frame in $data.chunks_mut(channels) {\n                let s = guard.pop_front().unwrap_or(0);\n                for slot in frame.iter_mut() {\n                    *slot = $conv(s);\n                }\n            }\n        }};\n    }\n    fill!(data, conv);\n}\n\n#[path = \"io_harness.rs\"]\npub(super) mod harness;\n",
+  "macro_copy_sha256": "0edfceb439e83cfe6d5518d2bf7952e9ea348b302aee3bcdcdb4f0b09d1b0d48",
+  "sha256": "aeaf9f0e5b7dfed8348d5474b39a8f8a5a434409db0f77380c14fbe7d3dd84b1"
+}

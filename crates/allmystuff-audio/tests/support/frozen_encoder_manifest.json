@@ -1,0 +1,20 @@
+{
+  "base": "e6340b31daa6d9c2058c4ee345564d3e0c0ecebf",
+  "source": "node/src/audio.rs",
+  "source_ranges": [
+    {
+      "first": 71,
+      "last": 129,
+      "sha256": "44c31547f7a368f64027875afac3b65d48779ae1ccaefa9fad1cc77207450bbd"
+    },
+    {
+      "first": 913,
+      "last": 930,
+      "sha256": "a35add5afd219e79a2b71ad2bcf574c04f18f877228c23ae14d0de4e2afe3abd"
+    }
+  ],
+  "substitutions": [],
+  "prefix_bytes": 82,
+  "suffix": "\n// Observation only: expose original retained input to the differential fixture.\npub(super) fn remaining(stream: &OpusStream) -> &[i16] {\n    &stream.buf\n}\n",
+  "sha256": "7bfbfb92f38d86b430c7ca7414db26d72d42b45d38e347b570ea308d101d26a7"
+}
