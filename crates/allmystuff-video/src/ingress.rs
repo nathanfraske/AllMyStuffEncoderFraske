@@ -198,6 +198,19 @@ impl<C> Freshness<C> {
             return self.forward(pending.frame, tx);
         }
 
+        if frame.data.len() > MAX_PACED_AU_BYTES {
+            // Bound the first fragment as well as continuations. A rejected
+            // replacement also invalidates the old train, so its late marker
+            // cannot release stale data.
+            self.paced.remove(&lane);
+            return self.note_discontinuity(
+                frame.from,
+                frame.stream,
+                "paced AU exceeded assembly bounds",
+                tx,
+            );
+        }
+
         let expired = self
             .paced
             .get(&lane)
