@@ -382,16 +382,12 @@ fn oversized_replacement_clears_the_route_instead_of_retaining_a_new_train() {
         assert_eq!(pair.original.keys(), ["r".to_string()]);
         assert!(pair.current.is_empty());
         assert_eq!(
-            current_step(
-                &mut pair.current,
-                "r",
-                closing_timestamp,
-                true,
-                marker(1),
-            ),
+            current_step(&mut pair.current, "r", closing_timestamp, true, marker(1),),
             (None, true)
         );
-        let old = pair.original.accept("r", closing_timestamp, true, marker(1));
+        let old = pair
+            .original
+            .accept("r", closing_timestamp, true, marker(1));
         if closing_timestamp == 0 {
             let (complete, damaged) = old;
             assert!(!damaged);

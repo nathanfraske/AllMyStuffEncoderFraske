@@ -846,7 +846,13 @@ mod tests {
             if replaces_pending {
                 append(MEDIA_KIND_VIDEO, 0, true, 10, &[9]);
             }
-            append(MEDIA_KIND_VIDEO, 0, true, 11, &vec![7; 16 * 1024 * 1024 + 1]);
+            append(
+                MEDIA_KIND_VIDEO,
+                0,
+                true,
+                11,
+                &vec![7; 16 * 1024 * 1024 + 1],
+            );
             append(MEDIA_KIND_AUDIO, 0, false, 100, &[1]);
 
             // Another stream on the same peer progresses before either
