@@ -30,6 +30,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "allmystuff-audio"
+version = "0.2.121"
+dependencies = [
+ "allmystuff-session",
+ "cpal",
+ "libloading",
+ "opus",
+ "parking_lot",
+ "tracing",
+]
+
+[[package]]
 name = "allmystuff-bridge"
 version = "0.2.121"
 dependencies = [
@@ -100,6 +112,7 @@ dependencies = [
 name = "allmystuff-node"
 version = "0.2.121"
 dependencies = [
+ "allmystuff-audio",
  "allmystuff-bridge",
  "allmystuff-byte-queues",
  "allmystuff-cec-consent",
@@ -117,7 +130,6 @@ dependencies = [
  "base64",
  "bytes",
  "clipboard-rs",
- "cpal",
  "dav-server",
  "dirs",
  "enigo",
@@ -129,9 +141,7 @@ dependencies = [
  "hyper-util",
  "interprocess",
  "libc",
- "libloading",
  "notify",
- "opus",
  "parking_lot",
  "plist",
  "reqwest",

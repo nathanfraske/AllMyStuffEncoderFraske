@@ -470,7 +470,7 @@ pub struct Mesh {
     local_claim_repairs: Mutex<HashMap<String, LocalClaimRepair>>,
     /// Per-route Opus decoders for inbound lane audio (stateful across
     /// frames; dropped with the route).
-    audio_decoders: Mutex<HashMap<String, opus::Decoder>>,
+    audio_decoders: Mutex<HashMap<String, crate::audio::OpusDecoder>>,
     /// Whether the local daemon speaks the audio track lane (`audio_*`
     /// ops, myownmesh ≥ 0.2.4) — the audio twin of `daemon_video`.
     /// While false, audio rides PCM frames over the media channel.
@@ -5664,7 +5664,7 @@ impl Mesh {
             let dec = match decoders.entry(route_id.clone()) {
                 std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
                 std::collections::hash_map::Entry::Vacant(v) => {
-                    match opus::Decoder::new(crate::audio::OPUS_RATE, opus::Channels::Mono) {
+                    match crate::audio::OpusDecoder::new() {
                         Ok(d) => v.insert(d),
                         Err(e) => {
                             tracing::warn!("opus decoder for {route_id} failed: {e}");
@@ -5673,7 +5673,7 @@ impl Mesh {
                     }
                 }
             };
-            match dec.decode(&data, &mut pcm, false) {
+            match dec.decode(&data, &mut pcm) {
                 Ok(n) => n,
                 Err(e) => {
                     // One bad frame costs 20 ms; the next stands alone.
