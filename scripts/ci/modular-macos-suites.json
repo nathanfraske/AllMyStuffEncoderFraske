@@ -248,7 +248,8 @@
           "filter": "",
           "tests": [
             "age_check_is_on_data_arrival_while_an_old_matching_marker_still_closes",
-            "byte_bound_applies_to_append_but_first_fragment_remains_unchecked",
+            "byte_bound_is_inclusive_for_cumulative_continuations",
+            "byte_bound_is_inclusive_for_initial_and_timestamp_replacement",
             "chunk_limit_is_inclusive_and_empty_fragments_still_count",
             "clean_entry_can_be_flagged_or_classified_and_is_carried_with_first_gap",
             "closure_is_observed_at_send_not_before_suppressed_delta_or_queued_marker",
@@ -257,6 +258,13 @@
             "identity_changes_recovery_mode_even_while_the_lane_is_fenced",
             "missing_or_mismatched_closing_markers_preserve_exact_gap_reasons",
             "only_five_ascii_alphanumeric_suffixes_canonicalize_and_streams_stay_separate",
+            "oversized_continuation_discards_pending_and_preserves_historical_feedback",
+            "oversized_initial_and_replacement_intentionally_diverge_from_frozen_behavior",
+            "oversized_rejection_preserves_remembered_gradual_recovery",
+            "oversized_rejection_requires_a_clean_reset_entry_before_paced_deltas_resume",
+            "oversized_rejection_with_closed_sink_drops_pending_and_returns_false",
+            "oversized_rejection_with_full_sink_preserves_the_first_gap_until_admission",
+            "oversized_replacement_only_discards_its_canonical_peer_and_lane",
             "paced_fragments_keep_first_envelope_or_key_and_close_as_one_queue_item",
             "replacement_survives_full_feedback_and_first_loss_reason_is_retained",
             "transport_gap_and_both_borrowed_discard_forms_remove_the_partial_lane"
@@ -269,10 +277,15 @@
           "filter": "",
           "tests": [
             "completion_waits_for_exact_marker_and_ors_fragment_keys",
+            "continuation_byte_overflow_clears_pending_and_recovers_after_rejected_closers",
             "marker_lookalike_is_payload_until_the_exact_closer",
             "missing_wrong_count_and_wrong_timestamp_markers_discard_pending",
             "new_timestamp_reports_damage_but_retains_new_train",
-            "route_byte_ceiling_and_existing_first_fragment_exception_are_preserved",
+            "oversized_first_fragment_is_rejected_instead_of_the_historical_exception",
+            "oversized_replacement_clears_the_route_instead_of_retaining_a_new_train",
+            "rejected_oversized_route_leaves_other_routes_live_and_allows_later_recovery",
+            "route_byte_ceiling_is_inclusive_across_continuations",
+            "route_byte_ceiling_is_inclusive_for_first_and_replacement_fragments",
             "route_chunk_ceiling_is_inclusive_then_recovery_discards_overflow",
             "route_keys_are_exact_and_empty_fragments_still_count"
           ],
@@ -500,6 +513,16 @@
             "storage_plan::tests::replica_and_reserve_bounds_prevent_nonsensical_policy"
           ],
           "timeout_seconds": 180
+        },
+        {
+          "id": "node-paced-oversize-caller",
+          "source": "node/src/lib.rs",
+          "filter": "control_client::tests::oversized_paced_au_does_not_stop_audio_or_other_video_lanes",
+          "tests": [
+            "control_client::tests::oversized_paced_au_does_not_stop_audio_or_other_video_lanes"
+          ],
+          "timeout_seconds": 120,
+          "exact": true
         }
       ]
     },

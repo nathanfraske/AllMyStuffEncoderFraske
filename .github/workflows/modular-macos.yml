@@ -2,7 +2,7 @@ name: Modular macOS validation
 
 on:
   push:
-    branches: [agent/1503a621-audio-macos]
+    branches: [agent/1503a621-audio-macos, agent/1503a621-bound01]
   workflow_dispatch:
 
 permissions:
