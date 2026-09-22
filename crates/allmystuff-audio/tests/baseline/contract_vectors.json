@@ -1,0 +1,86 @@
+{
+  "opus_rate": 48000,
+  "opus_frame_samples": 960,
+  "opus_frame_us": 20000,
+  "opus_bitrate": 96000,
+  "opus_packet_capacity": 4000,
+  "decode_pcm_capacity": 5760,
+  "decode_fec": false,
+  "decoded_frame_seq": 0,
+  "stub_encoder_error": "audio capture is not built into this node (no `host` feature)",
+  "capture_source_debug": [
+    "Mic",
+    "System"
+  ],
+  "target_depth_ms": 80,
+  "max_depth_ms": 200,
+  "default_device_rate": 48000,
+  "stats_window_seconds": 5,
+  "worker_sleep_ms": 100,
+  "error_literals": [
+    "no default output device to capture",
+    "no default input device",
+    "no default output device",
+    "libpulse-simple isn't available",
+    "route id contains a NUL"
+  ],
+  "opus_sequences": [
+    {
+      "push_samples": [
+        959,
+        0,
+        1,
+        1921,
+        959
+      ],
+      "rate": 48000,
+      "emitted_per_push": [
+        0,
+        0,
+        1,
+        2,
+        1
+      ],
+      "remaining_per_push": [
+        959,
+        959,
+        0,
+        1,
+        0
+      ]
+    },
+    {
+      "push_samples": [
+        720,
+        720,
+        720
+      ],
+      "rate": 24000,
+      "emitted_per_push": [
+        1,
+        2,
+        1
+      ],
+      "remaining_per_push": [
+        480,
+        0,
+        480
+      ]
+    }
+  ],
+  "lifecycle": [
+    "Separate capture and playback maps permit one route in both",
+    "Duplicate start returns before thread creation, with check and insert using separate locks",
+    "Removed/displaced RouteAudio joins outside start/stop map guards",
+    "stop removes both records before dropping capture then playback",
+    "stop_all clears and drops capture records under capture lock, then playback under playback lock",
+    "RouteAudio Drop sets stop SeqCst before joining; thread panic result ignored",
+    "feed missing route is no-op; fed increments before downmix even for empty input",
+    "feed uses route_id argument, not frame.route or seq",
+    "metered forwards exact input/rate after releasing stats lock",
+    "encoder emit runs before offset advance/drain; panic retains buffered input",
+    "failed encode still consumes one canonical frame and continues"
+  ],
+  "excluded_hardware_test": "audio::tests::capture_and_playback_for_one_route_coexist",
+  "qualification": "Original source contract; no runtime pass claim. Hardware/device failures and native callbacks require separately scoped qualification."
+}

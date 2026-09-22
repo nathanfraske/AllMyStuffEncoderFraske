@@ -1,0 +1,215 @@
+# The GUI's Rust crate lives outside the main Cargo workspace so a
+# `cargo build --workspace` / `cargo test --workspace` at the repo root
+# stays fast and webview-free (no Tauri compile). An empty `[workspace]`
+# table makes this crate its own single-member workspace root — the same
+# split MyOwnMesh uses for its GUI.
+[workspace]
+
+[patch.crates-io]
+# Experimental same-version OpenH264 build patch; see vendor provenance.
+openh264-sys2 = { path = "../../vendor/openh264-sys2-0.9.6" }
+
+[package]
+name = "allmystuff-gui"
+version = "0.2.121"
+description = "AllMyStuff GUI — Tauri shell: scans this machine and talks to the myownmesh daemon over its control socket."
+authors = ["Chris Paul"]
+license = "MIT"
+edition = "2021"
+rust-version = "1.88.0"
+
+[[bin]]
+name = "allmystuff-gui"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# `tray-icon` powers the notification-area / menu-bar icon and its menu — the
+# home AllMyStuff keeps while "Always On" hides its window to the tray.
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-shell = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-clipboard-manager = "2"
+# "Start with computer" — registers a per-user login item (Windows Run key /
+# macOS LaunchAgent / Linux ~/.config/autostart), no admin needed.
+tauri-plugin-autostart = "2"
+# Single-instance guard — a second launch of AllMyStuff (double-click, login
+# item, `open` again) hands off to the already-running process and exits,
+# instead of standing up a rival app with its own node + daemon. The handoff
+# fires a callback here that reveals the existing window. Must be the first
+# plugin registered (see `main`).
+tauri-plugin-single-instance = "2"
+
+# The headless mesh **node engine** — every media plane (screen / camera /
+# audio / input / terminal / files / clipboard / sites), the route handshake,
+# presence, ownership, and the daemon spawner. It used to live right here in
+# `src/`; it was lifted into its own crate so `allmystuff serve` can run it
+# with no webview. The GUI is now a thin Tauri shell over it that supplies a
+# Tauri-backed `UiSink` for front-end events. All the heavy native deps
+# (cpal / xcap / openh264 / nokhwa / opus / enigo / portable-pty /
+# clipboard-rs / interprocess / pipewire / … ) come transitively through it,
+# which is why they're no longer listed here.
+allmystuff-node = { path = "../../node" }
+
+# Async runtime — Tauri commands run on it; `setup` spawns the daemon
+# bring-up + session start on it.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "io-util", "net", "process"] }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+trash = "5"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+parking_lot = "0.12"
+notify = "8.2"
+# Resolves the user's home for the persisted "Always On" window preference
+# (window_behavior.rs), mirroring the node's networks store.
+dirs = "5"
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# AllMyStuff's own library crates — the scanner, the graph model, the wire
+# types, the hardware→capability bridge, the session types, and the updater.
+# `main.rs` uses these directly (e.g. `scan_self`, the update commands); the
+# rest of the engine reaches them through `allmystuff-node`.
+allmystuff-inventory = { path = "../../crates/allmystuff-inventory" }
+allmystuff-graph = { path = "../../crates/allmystuff-graph" }
+allmystuff-protocol = { path = "../../crates/allmystuff-protocol" }
+allmystuff-bridge = { path = "../../crates/allmystuff-bridge" }
+allmystuff-session = { path = "../../crates/allmystuff-session" }
+allmystuff-updater = { path = "../../crates/allmystuff-updater" }
+# Install/manage the OS background service in-process — the same crate the CLI
+# uses, so the "Always On" tab needs no separate `allmystuff` binary to find.
+allmystuff-service = { path = "../../crates/allmystuff-service" }
+
+# PR_SET_PDEATHSIG for the daemon lifetime tie (see
+# daemon_spawn::tie_daemon_lifetime) — the kernel SIGKILLs the daemon
+# when a crashed or force-killed app can no longer clean up after itself.
+# libloading dlopens libpulse-simple at runtime for system-audio capture
+# (the monitor of the default sink) — dlopen rather than a link-time
+# dependency so the binary still runs on a box without a pulse server.
+# zbus drives the ScreenCast portal with restore tokens
+# (wayland_capture.rs) and the ScreenSaver keep-awake inhibitor
+# (wake.rs); pipewire consumes the portal's stream. All four crates are
+# already in the resolved tree (Tauri's Linux stack; xcap links the same
+# pipewire), so this adds features, not second compiles.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+libloading = "0.8"
+zbus = "5"
+pipewire = "0.9"
+# DPMS ForceLevel(On) — the X11/XWayland "light the panel now" call
+# (wake::force_display_on). Same xcb the tree already builds for xcap;
+# the dpms feature just generates one more extension module.
+xcb = { version = "1", features = ["dpms"] }
+
+# IOKit power assertions (NoDisplaySleep) while hosting a screen stream —
+# wake.rs. core-foundation is already in the resolved tree via Tauri.
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10"
+libc = "0.2"
+
+# In-house DXGI Output Duplication for screen capture, and the
+# virtual-desktop absolute mouse move (enigo's Abs can only reach the
+# primary monitor). Same version the resolved tree already carries via
+# Tauri, so this adds features, not a second compile of the crate. See
+# `win_capture.rs` for why xcap's recorder can't be used here.
+# windows-sys backs the daemon lifetime tie (a job object with
+# kill-on-close — daemon_spawn::tie_daemon_lifetime), same story: the
+# version the tree already resolves.
+[target.'cfg(windows)'.dependencies]
+clipboard-win = "5.4"
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_Storage_FileSystem",
+    "Win32_UI_Controls",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+    # Per-window taskbar identity (set_taskbar_identity): the shell property
+    # store + the hand-built VT_LPWSTR PROPVARIANT for the AppUserModelID string.
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+] }
+png = "0.18"
+windows-sys = { version = "0.60", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_JobObjects",
+    "Win32_System_Power",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_Storage_FileSystem",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true
+
+# The media plane touches every screen pixel every frame; the crates doing
+# that work get speed while the rest of the app keeps optimizing for size —
+# and dev builds get the same treatment so `just dev` streams at a usable
+# rate instead of running the pixel loops unoptimized.
+[profile.release.package.jpeg-encoder]
+opt-level = 3
+[profile.release.package.openh264]
+opt-level = 3
+[profile.release.package.openh264-sys2]
+opt-level = 3
+[profile.release.package.xcap]
+opt-level = 3
+[profile.release.package.image]
+opt-level = 3
+[profile.release.package.allmystuff-pixels]
+opt-level = 3
+# Camera frames pass through nokhwa's pixel-format conversion (YUYV→RGBA
+# in Rust, MJPEG via mozjpeg) every tick — same treatment as the rest of
+# the media plane.
+[profile.release.package.nokhwa]
+opt-level = 3
+[profile.release.package.nokhwa-core]
+opt-level = 3
+[profile.release.package.mozjpeg]
+opt-level = 3
+
+[profile.dev.package.jpeg-encoder]
+opt-level = 3
+[profile.dev.package.openh264]
+opt-level = 3
+[profile.dev.package.openh264-sys2]
+opt-level = 3
+[profile.dev.package.xcap]
+opt-level = 3
+[profile.dev.package.image]
+opt-level = 3
+[profile.dev.package.allmystuff-pixels]
+opt-level = 3
+[profile.dev.package.nokhwa]
+opt-level = 3
+[profile.dev.package.nokhwa-core]
+opt-level = 3
+[profile.dev.package.mozjpeg]
+opt-level = 3
+# The media plane's framing also leans on these every packet (JSON lines
+# on the control socket, base64 payloads) — worth optimizing in dev too.
+[profile.dev.package.serde_json]
+opt-level = 3
+[profile.dev.package.base64]
+opt-level = 3

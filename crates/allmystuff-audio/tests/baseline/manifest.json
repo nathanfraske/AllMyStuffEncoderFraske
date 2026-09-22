@@ -1,0 +1,417 @@
+{
+  "source_commit": "e6340b31daa6d9c2058c4ee345564d3e0c0ecebf",
+  "source_inputs": [
+    {
+      "path": "node/src/audio.rs",
+      "git_blob": "6c804a657fa92f6f51bf480fc206e02552984f93",
+      "sha256": "5c73be7cffb0458b9a6ce5ecef59d20b3fc76a52cfea423d8f47d3bebf4a2b7c",
+      "bytes": 39676,
+      "lines": 1024
+    },
+    {
+      "path": "node/src/stubs/audio.rs",
+      "git_blob": "e64cc884906422556d948bd9ade90d73a95e1581",
+      "sha256": "063081abbdc363dd6341091c15dfee90fe02178681d8fed57cb1ce7544f33419",
+      "bytes": 3056,
+      "lines": 84
+    },
+    {
+      "path": "node/src/lib.rs",
+      "git_blob": "fe2dedd68e3010e0c9df81a70a481b6e3d1ca872",
+      "sha256": "ba062aea717a927dd60fdf7039f900ea16ae5f773ae0f55e778c536cb3b76426",
+      "bytes": 12248,
+      "lines": 252
+    },
+    {
+      "path": "node/src/mesh.rs",
+      "git_blob": "7152bfc26d664871dec54d1d1cc1fbab79cf06ef",
+      "sha256": "ba29eb2da4c9ef50df541809bf7ef80a9cd56c7715db734764faa8b16db9a884",
+      "bytes": 1098847,
+      "lines": 24364
+    },
+    {
+      "path": "node/src/node_control.rs",
+      "git_blob": "80d50edd03c2a791749e906526fe78e3e9a2e09d",
+      "sha256": "535f6f67a1cbbd814d4b60df1a31bcc882972416949bcac6072475e454c2cd26",
+      "bytes": 124891,
+      "lines": 2966
+    },
+    {
+      "path": "node/src/video.rs",
+      "git_blob": "4a59017aeb8fddebc5fb0da8e5b87384e58a6adc",
+      "sha256": "b10229837ff4b81aad79287e5d20b5cc8960b9e9044ceb29210b8ac3d336e494",
+      "bytes": 578,
+      "lines": 23
+    },
+    {
+      "path": "node/src/stubs/video.rs",
+      "git_blob": "ea6d50271eacb0c6b9d0fb321d2c23e744038bfa",
+      "sha256": "59c1f80d2da9febc6998a1ade3885b8ec548a06d6a2a374e968f6ee12c73dfea",
+      "bytes": 113,
+      "lines": 3
+    },
+    {
+      "path": "crates/allmystuff-video/src/video.rs",
+      "git_blob": "b4889f949a8765fe111746822670e3728d6e4275",
+      "sha256": "6870bd649ecefe05e5aa41ed1e3db8d558007e9496d2b767096ad5b7a1e36d1f",
+      "bytes": 301189,
+      "lines": 7206
+    },
+    {
+      "path": "crates/allmystuff-video/src/stubs/video.rs",
+      "git_blob": "ea65bfbe9e1829f139516b8bec0c59ebdae14f5f",
+      "sha256": "0d055cdd487348230c8b8f966a58bc6e0fbd405d7ea813927f4bb7c105fb7ac3",
+      "bytes": 10819,
+      "lines": 316
+    },
+    {
+      "path": "crates/allmystuff-session/src/audio.rs",
+      "git_blob": "34ecf1047498c643df2ad58e4fa2697619ec2403",
+      "sha256": "0708abf83365098ac7957ecbd12bd545aabd1cc7e430a3bb8c303579a9499837",
+      "bytes": 2889,
+      "lines": 91
+    },
+    {
+      "path": "crates/allmystuff-session/src/lib.rs",
+      "git_blob": "fa4580862cd9405a58c7dc25a2f72347f643acc7",
+      "sha256": "7739edaa2e59174023a26ec75f6d390c17203e1d3faf418739ed7039052baf89",
+      "bytes": 55457,
+      "lines": 1446
+    },
+    {
+      "path": "crates/allmystuff-session/src/media.rs",
+      "git_blob": "82bb5ec7076dd7924ea3c6b7f34025c4fa9883d7",
+      "sha256": "3cf9ee90a7119cee9b99d0ae8cb19833a4aaa6611b9fbf50c9906fc59b9c607c",
+      "bytes": 62955,
+      "lines": 1708
+    },
+    {
+      "path": "crates/allmystuff-session/Cargo.toml",
+      "git_blob": "723f6427bd0bd7aa4396cf16cbc0a3e93dabcd11",
+      "sha256": "898a7c83f119c992674f706c43c5c0cb7ae69471cd5f0244f8fcfd12508a0c3f",
+      "bytes": 579,
+      "lines": 19
+    },
+    {
+      "path": "crates/allmystuff-protocol/src/app.rs",
+      "git_blob": "f5a52a29e93f48b4fa37c44c57924e4083aba7d0",
+      "sha256": "2b1338b79c8139ef09534f00d10549df67eda5181bceb6982c431d2a3bd18a71",
+      "bytes": 118738,
+      "lines": 2526
+    },
+    {
+      "path": "Cargo.toml",
+      "git_blob": "dfb4379f9442014462cd40b3cf313ac4ac2439a5",
+      "sha256": "6f7b0c771005d600d22c6a49b04073038749bd9da1f360f96a8821dc061fd58b",
+      "bytes": 6314,
+      "lines": 172
+    },
+    {
+      "path": "node/Cargo.toml",
+      "git_blob": "98317b175fd6cc21deb23d70de054d31477d662f",
+      "sha256": "c4bba8efe9dec98cfd562ef3191767e61d6acf4ea7672ebeca76e26e3b559e02",
+      "bytes": 14342,
+      "lines": 318
+    },
+    {
+      "path": "gui/src-tauri/Cargo.toml",
+      "git_blob": "fb15a6f45a8aa9baa3b69090b80a122cb5d06d18",
+      "sha256": "b1a351753c42f07a82cfa66d3df76ac0a489a71411d286ceb3fedf94a6a49262",
+      "bytes": 8619,
+      "lines": 215
+    },
+    {
+      "path": "gui/mobile/Cargo.toml",
+      "git_blob": "dc6ef4d5b1273c801c613f32b0293a5d8647b591",
+      "sha256": "1f02db633993c5c79b510937155b151df6f18114de8ee425cbbced801e3df1a2",
+      "bytes": 5723,
+      "lines": 117
+    },
+    {
+      "path": "Cargo.lock",
+      "git_blob": "97df194f107524fb58a923d0236d7d31646ab6d3",
+      "sha256": "2cf4755914394b297393f4deec9c03bdb1c67da0bd99d3b71f20ff3a75f47c92",
+      "bytes": 123813,
+      "lines": 5051
+    },
+    {
+      "path": "node/Cargo.lock",
+      "git_blob": "5ae4c66eb1809d8b334b5ffd038ec7a888f66f58",
+      "sha256": "335155e7f90910c5b9210ef33b1439d3340aba743264fc39dcb4f52f5a70a535",
+      "bytes": 151272,
+      "lines": 6140
+    },
+    {
+      "path": "gui/src-tauri/Cargo.lock",
+      "git_blob": "0c1e7a25c139d9275e8b2f4235447e7667274d63",
+      "sha256": "9713831d45facdd445c9f5c917cdede515ec8b1e347c9604944af8c0a7f1af3a",
+      "bytes": 207987,
+      "lines": 8638
+    },
+    {
+      "path": "gui/mobile/Cargo.lock",
+      "git_blob": "00cc0902a676e74b16231b3cc47130fefcf57176",
+      "sha256": "b28c584273f2de8dc3c57baf938dfc6e96a5db03c0decc1347ec606744c24d5a",
+      "bytes": 188506,
+      "lines": 7930
+    }
+  ],
+  "snapshots": [
+    {
+      "path": "audio.rs",
+      "sha256": "5c73be7cffb0458b9a6ce5ecef59d20b3fc76a52cfea423d8f47d3bebf4a2b7c",
+      "bytes": 39676,
+      "source": "node/src/audio.rs",
+      "line_ranges_inclusive": [
+        [
+          1,
+          1024
+        ]
+      ]
+    },
+    {
+      "path": "audio_stub.rs",
+      "sha256": "063081abbdc363dd6341091c15dfee90fe02178681d8fed57cb1ce7544f33419",
+      "bytes": 3056,
+      "source": "node/src/stubs/audio.rs",
+      "line_ranges_inclusive": [
+        [
+          1,
+          84
+        ]
+      ]
+    },
+    {
+      "path": "session_audio.rs",
+      "sha256": "0708abf83365098ac7957ecbd12bd545aabd1cc7e430a3bb8c303579a9499837",
+      "bytes": 2889,
+      "source": "crates/allmystuff-session/src/audio.rs",
+      "line_ranges_inclusive": [
+        [
+          1,
+          91
+        ]
+      ]
+    },
+    {
+      "path": "node_audio_gate.rs",
+      "sha256": "1d57e4cc496c2bc0c9f9cfbecdf497517bae4bfb4c63e64da86c43996538e83c",
+      "bytes": 1207,
+      "source": "node/src/lib.rs",
+      "line_ranges_inclusive": [
+        [
+          33,
+          54
+        ]
+      ]
+    },
+    {
+      "path": "video_stats_real.rs",
+      "sha256": "b7907e1f8f645985d1331567681d7aca347b952da4f8ec0073a59bb31db01400",
+      "bytes": 488,
+      "source": "crates/allmystuff-video/src/video.rs",
+      "line_ranges_inclusive": [
+        [
+          581,
+          590
+        ]
+      ]
+    },
+    {
+      "path": "video_stats_stub.rs",
+      "sha256": "501aabf9f0e386f91703d511f08e568d140da8b580871c9b135d3a3e29733ef0",
+      "bytes": 198,
+      "source": "crates/allmystuff-video/src/stubs/video.rs",
+      "line_ranges_inclusive": [
+        [
+          47,
+          51
+        ]
+      ]
+    },
+    {
+      "path": "mesh_audio.rs",
+      "sha256": "00dfce0a67da130e8e4c458852a20a346206465c1800edd45a51919b36c8ccf9",
+      "bytes": 21793,
+      "source": "node/src/mesh.rs",
+      "line_ranges_inclusive": [
+        [
+          553,
+          564
+        ],
+        [
+          1932,
+          1936
+        ],
+        [
+          2097,
+          2149
+        ],
+        [
+          2747,
+          2789
+        ],
+        [
+          5099,
+          5104
+        ],
+        [
+          5625,
+          5688
+        ],
+        [
+          7769,
+          7784
+        ],
+        [
+          9608,
+          9620
+        ],
+        [
+          12955,
+          13078
+        ],
+        [
+          13443,
+          13502
+        ],
+        [
+          13518,
+          13528
+        ],
+        [
+          13597,
+          13608
+        ],
+        [
+          13688,
+          13693
+        ],
+        [
+          17125,
+          17140
+        ],
+        [
+          20663,
+          20673
+        ]
+      ]
+    },
+    {
+      "path": "mesh_audio_test_inventory.rs",
+      "sha256": "301cda15da18a22cb02e6e1da8b0bf148d0babf89b50a2000e518d5fda9ac4b1",
+      "bytes": 1916,
+      "source": "node/src/mesh.rs",
+      "line_ranges_inclusive": [
+        [
+          21714,
+          21744
+        ],
+        [
+          24109,
+          24122
+        ]
+      ]
+    },
+    {
+      "path": "session_media_audio.rs",
+      "sha256": "3a4824c0c853461a1e915c47a7ee5f3ab30fe7420bf85c491df631482cc13981",
+      "bytes": 2266,
+      "source": "crates/allmystuff-session/src/media.rs",
+      "line_ranges_inclusive": [
+        [
+          706,
+          764
+        ]
+      ]
+    },
+    {
+      "path": "protocol_audio_offer.rs",
+      "sha256": "4c5a50f7abe9593a2be81fcedbd077f3340a60ec8c84668ec8587233f9fff4e0",
+      "bytes": 1633,
+      "source": "crates/allmystuff-protocol/src/app.rs",
+      "line_ranges_inclusive": [
+        [
+          1051,
+          1078
+        ]
+      ]
+    },
+    {
+      "path": "workspace.Cargo.toml.txt",
+      "sha256": "6f7b0c771005d600d22c6a49b04073038749bd9da1f360f96a8821dc061fd58b",
+      "bytes": 6314,
+      "source": "Cargo.toml",
+      "line_ranges_inclusive": [
+        [
+          1,
+          172
+        ]
+      ]
+    },
+    {
+      "path": "node.Cargo.toml.txt",
+      "sha256": "c4bba8efe9dec98cfd562ef3191767e61d6acf4ea7672ebeca76e26e3b559e02",
+      "bytes": 14342,
+      "source": "node/Cargo.toml",
+      "line_ranges_inclusive": [
+        [
+          1,
+          318
+        ]
+      ]
+    },
+    {
+      "path": "desktop.Cargo.toml.txt",
+      "sha256": "b1a351753c42f07a82cfa66d3df76ac0a489a71411d286ceb3fedf94a6a49262",
+      "bytes": 8619,
+      "source": "gui/src-tauri/Cargo.toml",
+      "line_ranges_inclusive": [
+        [
+          1,
+          215
+        ]
+      ]
+    },
+    {
+      "path": "mobile.Cargo.toml.txt",
+      "sha256": "1f02db633993c5c79b510937155b151df6f18114de8ee425cbbced801e3df1a2",
+      "bytes": 5723,
+      "source": "gui/mobile/Cargo.toml",
+      "line_ranges_inclusive": [
+        [
+          1,
+          117
+        ]
+      ]
+    }
+  ],
+  "literal_vectors": [
+    {
+      "path": "sample_vectors.json",
+      "sha256": "c220f838d66ed383d7c525ac0d87831a2b7d095fc29990eaa3f6e648c64f378e",
+      "bytes": 2805
+    },
+    {
+      "path": "resample_vectors.json",
+      "sha256": "01cac92200890c857f874a960eba2c927201021f27f96a9e4cd6f5671490ceb8",
+      "bytes": 1980
+    },
+    {
+      "path": "buffer_vectors.json",
+      "sha256": "00299be8b6273209c2851f6e6dd73e07e6a54a23a4d17f1aee47aeeeec3d8188",
+      "bytes": 1830
+    },
+    {
+      "path": "wire_vectors.json",
+      "sha256": "0df542926c130ecf197c2c362d87b1db278cc214c21de8fd318e35c80b88220e",
+      "bytes": 1819
+    },
+    {
+      "path": "contract_vectors.json",
+      "sha256": "dd346e208a7721ce8e664b2c4e224bae2dc17a9e371d6259e3c5c01117cdc77d",
+      "bytes": 2418
+    }
+  ],
+  "qualification": "Original Git source and independent data-only literals frozen before reading extracted implementation; no worker Rust/formatter/compiler/test/audio-device execution."
+}

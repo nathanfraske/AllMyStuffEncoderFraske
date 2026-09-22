@@ -1,0 +1,78 @@
+{
+  "serialized_frames": [
+    {
+      "frame": {
+        "route": "route:a→b",
+        "seq": 7,
+        "sample_rate": 48000,
+        "channels": 2,
+        "pcm": [
+          0,
+          1,
+          -1,
+          32767,
+          -32768,
+          100
+        ]
+      },
+      "json": "{\"route\":\"route:a→b\",\"seq\":7,\"sample_rate\":48000,\"channels\":2,\"pcm\":\"AAABAP///38AgGQA\"}",
+      "pcm_little_endian_hex": "00000100ffffff7f00806400",
+      "frame_count": 3
+    },
+    {
+      "frame": {
+        "route": "",
+        "seq": 0,
+        "sample_rate": 0,
+        "channels": 0,
+        "pcm": []
+      },
+      "json": "{\"route\":\"\",\"seq\":0,\"sample_rate\":0,\"channels\":0,\"pcm\":\"\"}",
+      "pcm_little_endian_hex": "",
+      "frame_count": 0
+    },
+    {
+      "frame": {
+        "route": "r\u0000é",
+        "seq": 18446744073709551615,
+        "sample_rate": 4294967295,
+        "channels": 65535,
+        "pcm": [
+          -32768
+        ]
+      },
+      "json": "{\"route\":\"r\\u0000é\",\"seq\":18446744073709551615,\"sample_rate\":4294967295,\"channels\":65535,\"pcm\":\"AIA=\"}",
+      "pcm_little_endian_hex": "0080",
+      "frame_count": 0
+    }
+  ],
+  "odd_byte_inputs": [
+    {
+      "base64": "AQ==",
+      "expected_pcm": []
+    },
+    {
+      "base64": "AQAC",
+      "expected_pcm": [
+        1
+      ]
+    },
+    {
+      "base64": "//8A",
+      "expected_pcm": [
+        -1
+      ]
+    }
+  ],
+  "required_fields": [
+    "route",
+    "seq",
+    "sample_rate",
+    "channels",
+    "pcm"
+  ],
+  "unknown_fields": "ignored",
+  "pcm_wire_type": "standard padded base64 string",
+  "demux": "missing or non-string t attempts AudioFrame; unknown string t rejects",
+  "qualification": "Independent JSON/base64/little-endian literal computation only; no Rust serde execution."
+}

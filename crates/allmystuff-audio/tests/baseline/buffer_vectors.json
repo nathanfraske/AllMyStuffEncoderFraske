@@ -1,0 +1,126 @@
+[
+  {
+    "name": "at_max_no_trim",
+    "rate": 48000,
+    "initial_range": [
+      0,
+      9600
+    ],
+    "append": [],
+    "held_ms": null,
+    "len": 9600,
+    "first": 0,
+    "last": 9599
+  },
+  {
+    "name": "one_over_max",
+    "rate": 48000,
+    "initial_range": [
+      0,
+      9600
+    ],
+    "append": [
+      12345
+    ],
+    "held_ms": 200,
+    "len": 3840,
+    "first": 5761,
+    "last": 12345
+  },
+  {
+    "name": "already_over_max_empty_append",
+    "rate": 48000,
+    "initial_range": [
+      0,
+      9601
+    ],
+    "append": [],
+    "held_ms": 200,
+    "len": 3840,
+    "first": 5761,
+    "last": 9600
+  },
+  {
+    "name": "integer_ms_44100",
+    "rate": 44100,
+    "initial_range": [
+      0,
+      8800
+    ],
+    "append": [
+      42
+    ],
+    "held_ms": 200,
+    "len": 3520,
+    "first": 5281,
+    "last": 42
+  },
+  {
+    "name": "low_rate_one_preserved",
+    "rate": 999,
+    "initial": [
+      8
+    ],
+    "append": [],
+    "held_ms": null,
+    "len": 1,
+    "first": 8,
+    "last": 8
+  },
+  {
+    "name": "low_rate_two_discarded",
+    "rate": 999,
+    "initial": [
+      8
+    ],
+    "append": [
+      9
+    ],
+    "held_ms": 2,
+    "len": 0,
+    "first": null,
+    "last": null
+  },
+  {
+    "name": "zero_rate_two_discarded",
+    "rate": 0,
+    "initial": [
+      8
+    ],
+    "append": [
+      9
+    ],
+    "held_ms": 2,
+    "len": 0,
+    "first": null,
+    "last": null
+  },
+  {
+    "name": "one_khz_threshold",
+    "rate": 1000,
+    "initial_range": [
+      0,
+      200
+    ],
+    "append": [
+      42
+    ],
+    "held_ms": 201,
+    "len": 80,
+    "first": 121,
+    "last": 42
+  },
+  {
+    "name": "one_burst_keeps_tail",
+    "rate": 48000,
+    "initial_range": [
+      -10000,
+      20000
+    ],
+    "append": [],
+    "held_ms": 416,
+    "len": 3840,
+    "first": 6160,
+    "last": 9999
+  }
+]

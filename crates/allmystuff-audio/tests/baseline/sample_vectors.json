@@ -1,0 +1,188 @@
+{
+  "f32_to_i16": [
+    {
+      "bits": "ff800000",
+      "expected": -32767
+    },
+    {
+      "bits": "c0000000",
+      "expected": -32767
+    },
+    {
+      "bits": "bf800000",
+      "expected": -32767
+    },
+    {
+      "bits": "bf400000",
+      "expected": -24575
+    },
+    {
+      "bits": "bf000000",
+      "expected": -16383
+    },
+    {
+      "bits": "be800000",
+      "expected": -8191
+    },
+    {
+      "bits": "80000000",
+      "expected": 0
+    },
+    {
+      "bits": "00000000",
+      "expected": 0
+    },
+    {
+      "bits": "3e800000",
+      "expected": 8191
+    },
+    {
+      "bits": "3f000000",
+      "expected": 16383
+    },
+    {
+      "bits": "3f400000",
+      "expected": 24575
+    },
+    {
+      "bits": "3f800000",
+      "expected": 32767
+    },
+    {
+      "bits": "40000000",
+      "expected": 32767
+    },
+    {
+      "bits": "7f800000",
+      "expected": 32767
+    },
+    {
+      "bits": "7fc00000",
+      "expected": 0
+    }
+  ],
+  "i16_to_f32": [
+    {
+      "sample": -32768,
+      "expected_bits": "bf800000"
+    },
+    {
+      "sample": -32767,
+      "expected_bits": "bf7ffe00"
+    },
+    {
+      "sample": -16384,
+      "expected_bits": "bf000000"
+    },
+    {
+      "sample": -1,
+      "expected_bits": "b8000000"
+    },
+    {
+      "sample": 0,
+      "expected_bits": "00000000"
+    },
+    {
+      "sample": 1,
+      "expected_bits": "38000000"
+    },
+    {
+      "sample": 16384,
+      "expected_bits": "3f000000"
+    },
+    {
+      "sample": 32767,
+      "expected_bits": "3f7ffe00"
+    }
+  ],
+  "downmix": [
+    {
+      "channels": 0,
+      "input": [
+        3,
+        -3,
+        32767,
+        -32768
+      ],
+      "expected": [
+        3,
+        -3,
+        32767,
+        -32768
+      ]
+    },
+    {
+      "channels": 1,
+      "input": [
+        5,
+        -5
+      ],
+      "expected": [
+        5,
+        -5
+      ]
+    },
+    {
+      "channels": 2,
+      "input": [],
+      "expected": []
+    },
+    {
+      "channels": 2,
+      "input": [
+        10,
+        20,
+        30,
+        40
+      ],
+      "expected": [
+        15,
+        35
+      ]
+    },
+    {
+      "channels": 2,
+      "input": [
+        1,
+        0,
+        -1,
+        0,
+        32767,
+        -32768,
+        7
+      ],
+      "expected": [
+        0,
+        0,
+        0,
+        7
+      ]
+    },
+    {
+      "channels": 3,
+      "input": [
+        300,
+        -100,
+        -200,
+        5,
+        -2
+      ],
+      "expected": [
+        0,
+        1
+      ]
+    },
+    {
+      "channels": 65535,
+      "input": [
+        -32768,
+        32767,
+        -32768
+      ],
+      "expected": [
+        -10923
+      ]
+    }
+  ],
+  "qualification": "Independent literals from the original arithmetic; no Rust or native execution. Float values are IEEE754 binary32 bit patterns."
+}

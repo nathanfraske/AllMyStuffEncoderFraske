@@ -1,0 +1,318 @@
+# The headless mesh node. This is the engine that the desktop GUI's Tauri
+# backend used to *be*: presence + the route handshake + every media plane
+# (screen / camera / audio / input / terminal / files / clipboard / sites).
+# It was lifted out of `gui/src-tauri` so it can run with no webview at all
+# — `allmystuff serve` on a headless box — while the GUI links the very same
+# code and supplies a Tauri-backed [`UiSink`] for its front-end events.
+#
+# Keep the application in its own workspace. Pixels remains a member now
+# that the shared video library owns its path dependency.
+[workspace]
+members = ["pixels"]
+
+[patch.crates-io]
+# Experimental RISC-V target recognition; codec sources and version are unchanged.
+# Dependency-workspace patches are not inherited by the GUI workspaces.
+openh264-sys2 = { path = "../vendor/openh264-sys2-0.9.6" }
+
+[package]
+name = "allmystuff-node"
+version = "0.2.121"
+description = "AllMyStuff headless mesh node — runs this machine on the mesh (presence + screen/camera/audio/input/terminal/files routes) with no GUI."
+authors = ["Chris Paul"]
+license = "MIT"
+edition = "2021"
+rust-version = "1.88.0"
+
+# The engine, linked by both the GUI and the serve binary.
+[lib]
+name = "allmystuff_node"
+path = "src/lib.rs"
+
+# The headless daemon: `allmystuff serve` runs this. Supervises a `myownmesh
+# serve` daemon, advertises this machine, and serves its capabilities.
+[[bin]]
+name = "allmystuff-serve"
+path = "src/bin/serve.rs"
+
+# Hardware video encode runs behind one frame-send-tested step-down ladder
+# (`video::make_h264_codec`) that falls to software openh264 when no hardware
+# encoder produces frames. On Windows the ladder uses Media Foundation (the
+# GPU's own H.264 MFT — NVENC/QSV/AMF — via the `windows` crate we already link
+# for DXGI capture, so no extra toolchain). The `hwenc` feature below adds the
+# FFmpeg vendor encoders for Linux/macOS hosts that opt in.
+[features]
+# FFmpeg-backed hardware encode (Linux `h264_nvenc`/`h264_vaapi`/`h264_qsv`,
+# macOS `h264_videotoolbox`), OFF by default. Requires FFmpeg dev libs +
+# pkg-config at build time (Linux: `apt install` the libav* -dev packages;
+# macOS: `brew install ffmpeg pkgconf`). It is intentionally NOT on `just
+# dev`/`just serve`: a plain build, a viewer-only box, or a Windows host
+# (which uses Media Foundation) shouldn't have to install FFmpeg at all.
+# Linux/macOS hosts that want vendor HW encode build `--features hwenc`.
+#
+# The pinned `ffmpeg-next` major must match the FFmpeg the build/runtime machine
+# carries — bump it alongside a platform's bundled FFmpeg (the encode code
+# itself is version-agnostic). At runtime the ladder still falls back to
+# openh264 when no hardware encoder produces frames.
+default = ["host"]
+hwenc = ["host", "allmystuff-video/hwenc"]
+
+# Field-test instrumentation the fork added: the periodic telemetry line
+# (telemetry.rs — CPU/GPU-engine/VRAM every second). Diagnostic/prototype
+# builds opt into that sampler with `--features field-telemetry`; ordinary dev
+# and release builds stay silent by default. Verbose file logging remains a
+# separate, runtime-only opt-in through the app setting or
+# `ALLMYSTUFF_CWD_LOG=1`. The environment dials always win, and `=0` silences
+# either diagnostic path.
+field-telemetry = []
+
+# The capture/inject planes — everything that touches THIS machine's screen,
+# camera, microphone, speakers, keyboard, PTYs, and OS clipboard. ON by
+# default: every desktop/server build wants them. The one build that turns
+# them off is iOS (the GUI links the engine `--no-default-features` there):
+# the app sandbox has none of these to give — no fork/exec for a PTY, no
+# screen grab, no input injection — so each plane module swaps for a same-API
+# stub (see `src/stubs/`) and the node becomes a pure *viewer* node. The
+# viewer planes (H.264/opus decode, the terminal output queues) are NOT here
+# — they stay in every build; watching other machines is the whole point of
+# a capture-less node.
+host = [
+    "allmystuff-video/host",
+    "audio-io",
+    "allmystuff-terminal/host",
+    "dep:xcap",
+    "dep:enigo",
+    "dep:clipboard-rs",
+    # Windows capture, injection, and hardware codec backends. The Windows
+    # dependency itself stays available for non-capture node services.
+    "windows/Win32_Graphics_Direct3D",
+    "windows/Win32_Graphics_Direct3D11",
+    "windows/Win32_Graphics_Dxgi",
+    "windows/Win32_Graphics_Dxgi_Common",
+    "windows/Win32_Graphics_Gdi",
+    "windows/Win32_UI_Input_KeyboardAndMouse",
+    "windows/Win32_Media_MediaFoundation",
+    "windows/Win32_Media_KernelStreaming",
+]
+
+# The audio plane alone — split out of `host` because it's the one capture
+# plane iOS *can* run: cpal has a CoreAudio backend there, so a capture-less
+# phone build adds `audio-io` and gets real playback of inbound streams (and
+# a working mic source) while every other plane stays stubbed. `host`
+# includes it, so desktop builds are unchanged. libloading rides along for
+# the Linux PulseAudio system-audio loopback (target-gated to Linux).
+audio-io = ["dep:cpal", "dep:libloading"]
+
+[dependencies]
+allmystuff-terminal = { path = "../crates/allmystuff-terminal" }
+allmystuff-storage = { path = "../crates/allmystuff-storage" }
+allmystuff-video = { path = "../crates/allmystuff-video", features = ["decode"] }
+# Async runtime — control-socket client + the media-plane tasks. "process"
+# backs the daemon self-update the spawner runs when the installed myownmesh
+# is older than the pin; "signal" handles SIGINT/SIGTERM for a clean serve
+# shutdown.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "io-util", "fs", "net", "process", "signal"] }
+
+# Local IPC: same crate the daemon uses, so control-socket address
+# resolution stays identical across both ends of the wire.
+interprocess = { version = "2", features = ["tokio"] }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+notify = "8.2"
+dirs = "5"
+parking_lot = "0.12"
+rusqlite = { version = "0.32", features = ["bundled"] }
+sha2 = "0.10"
+bytes = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "stream", "rustls-tls"] }
+futures-util = "0.3"
+fs2 = "0.4"
+tokio-tungstenite = "0.30"
+dav-server = { version = "0.11", default-features = false, features = ["localfs"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+
+# System RNG for minting a fleet's shared key (the owned-roster grouping
+# secret).
+getrandom = "0.2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# AllMyStuff's own crates — the scanner, the graph model, the wire types,
+# the hardware→capability bridge, the session state machine, and the
+# self-updater. Pulled by path from the sibling library workspace.
+allmystuff-byte-queues = { path = "../crates/allmystuff-byte-queues" }
+allmystuff-inventory = { path = "../crates/allmystuff-inventory" }
+allmystuff-graph = { path = "../crates/allmystuff-graph" }
+allmystuff-protocol = { path = "../crates/allmystuff-protocol" }
+allmystuff-node-client = { path = "../crates/allmystuff-node-client" }
+allmystuff-bridge = { path = "../crates/allmystuff-bridge" }
+allmystuff-session = { path = "../crates/allmystuff-session" }
+allmystuff-updater = { path = "../crates/allmystuff-updater" }
+# CEC Support: the wire contract (Support-ID derivation, Silent-mesh constants,
+# the connect/approve messages) and the customer's per-technician consent store
+# (Approve Once / 3 hours / Forever, with per-frame enforcement + revoke).
+allmystuff-cec-protocol = { path = "../crates/allmystuff-cec-protocol" }
+allmystuff-cec-consent = { path = "../crates/allmystuff-cec-consent" }
+
+# Cross-platform audio capture + playback for the media plane — CoreAudio
+# on macOS, WASAPI on Windows, ALSA on Linux.
+cpal = { version = "0.15", optional = true }
+# Screen capture (PipeWire / AVFoundation; the in-house DXGI path on
+# Windows lives in win_capture.rs).
+xcap = { version = "0.9", optional = true }
+# Keyboard/mouse injection for inbound input/terminal control routes.
+enigo = { version = "0.6", optional = true }
+# Opus encode/decode for the mesh's audio track lane (libopus, built from
+# source). PCM-over-channel stays the fallback.
+opus = "0.3"
+# Access units ride the daemon control socket as base64.
+base64 = "0.22"
+# Verifying a recorded PID is actually a `myownmesh` process before we
+# signal it — the self-heal gate that lets us replace *our* orphaned
+# daemon without ever touching one we didn't start (and guards PID reuse).
+sysinfo = "0.38"
+# Cross-platform *rich* clipboard — text, image, and file lists — for the
+# clipboard plane. The clipboard-manager bits the GUI used are a webview
+# concern and stay in the GUI; this is the OS-clipboard side the node owns.
+clipboard-rs = { version = "0.3.5", optional = true }
+
+# `libc::kill` for graceful daemon/node teardown (SIGTERM-then-SIGKILL) and
+# for SIGTERM-ing an orphaned daemon we're replacing — needed on every unix,
+# macOS included (it has no PR_SET_PDEATHSIG, so this is its only lever).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# PR_SET_PDEATHSIG for the daemon lifetime tie (daemon_spawn). libloading
+# dlopens libpulse-simple at runtime for system-audio capture. Video capture
+# and keep-awake dependencies are supplied by allmystuff-video/host.
+[target.'cfg(target_os = "linux")'.dependencies]
+libloading = { version = "0.8", optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# `diskutil info -plist` is the stable machine-readable bridge from a mounted
+# USB volume (`/Volumes/Windows`) to its whole raw disk (`/dev/rdiskN`).
+plist = "1"
+
+# Windows services shared by capture and capture-less nodes. The `host`
+# feature adds capture/input/hardware-codec APIs; storage, process control,
+# telemetry, and the software viewer's OS performance helpers stay here.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Foundation",
+    "Storage",
+    "Storage_Provider",
+    "Storage_Search",
+    "Win32_Foundation",
+    # PDH — the vendor-neutral WDDM counters behind the telemetry line
+    # (per-engine GPU utilization + VRAM: same counters on NVIDIA/AMD/
+    # Intel, which is what makes the field logs comparable across boxes).
+    "Win32_System_Performance",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+    # COM also backs the Fleetfiles storage provider without `host`.
+    "Win32_System_Com",
+    "Win32_System_Variant",
+    "Win32_System_Ole",
+    # Runtime loading is also used by the software viewer's OS performance
+    # helpers, so it remains available without the host/NVENC backends.
+    "Win32_System_LibraryLoader",
+] }
+windows-sys = { version = "0.60", features = [
+    "Win32_Foundation",
+    # timeBeginPeriod/timeEndPeriod — the stream's 1 ms timer-resolution
+    # guard (os_perf.rs); without it the pacing sleeps quantize at ~15.6 ms.
+    "Win32_Media",
+    "Win32_NetworkManagement_WNet",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_JobObjects",
+    "Win32_System_Power",
+    # GetSystemCpuSetInformation + SYSTEM_CPU_SET_INFORMATION — the hybrid
+    # P/E-core detection behind the media threads' CPU-set preference
+    # (os_perf.rs).
+    "Win32_System_SystemInformation",
+    # QueryPerformanceCounter/Frequency — mapping DXGI's QPC LastPresentTime
+    # onto the monotonic clock for the M1 capture-age span (win_capture.rs).
+    "Win32_System_Performance",
+    # ProcessIdToSessionId validates that CEC Support only reuses an
+    # interactive-session media/input node and never starts one in Session 0;
+    # WTSGetActiveConsoleSessionId (win_privilege) names the session a human is
+    # actually sitting at, which is where a privileged session must be hosted.
+    "Win32_System_RemoteDesktop",
+    # OpenInputDesktop/SetThreadDesktop/GetUserObjectInformationW — the desktop
+    # following in win_privilege that lets capture and input track the UAC
+    # secure desktop instead of freezing and going deaf on it.
+    "Win32_System_StationsAndDesktops",
+    # JOBOBJECT_EXTENDED_LIMIT_INFORMATION (daemon_spawn's kill-on-close job)
+    # embeds IO_COUNTERS, which windows-sys gates behind Threading. The GUI
+    # workspace got this feature via unification from another dep; the node
+    # workspace has to ask for it explicitly.
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+    # Monitor topology for the telemetry line (EnumDisplayDevices/
+    # EnumDisplaySettings — the multi-monitor field-test picture).
+    "Win32_Graphics_Gdi",
+] }
+# The Service Control Manager glue so `allmystuff-serve --service` runs as a
+# real Windows service: the control dispatcher + status/stop handler the SCM
+# requires (a plain console binary would be killed for not answering it). The
+# CLI's `allmystuff service install` registers it with `sc.exe`.
+windows-service = "0.7"
+widestring = "1"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true
+
+# The media plane touches every screen pixel every frame; the crates doing
+# that work get speed while the rest stays optimized for size — and dev
+# builds get the same treatment so a source-run streams at a usable rate.
+[profile.release.package.jpeg-encoder]
+opt-level = 3
+[profile.release.package.openh264]
+opt-level = 3
+[profile.release.package.openh264-sys2]
+opt-level = 3
+[profile.release.package.xcap]
+opt-level = 3
+[profile.release.package.image]
+opt-level = 3
+[profile.release.package.allmystuff-pixels]
+opt-level = 3
+[profile.release.package.nokhwa]
+opt-level = 3
+[profile.release.package.nokhwa-core]
+opt-level = 3
+[profile.release.package.mozjpeg]
+opt-level = 3
+
+[profile.dev.package.jpeg-encoder]
+opt-level = 3
+[profile.dev.package.openh264]
+opt-level = 3
+[profile.dev.package.openh264-sys2]
+opt-level = 3
+[profile.dev.package.xcap]
+opt-level = 3
+[profile.dev.package.image]
+opt-level = 3
+[profile.dev.package.allmystuff-pixels]
+opt-level = 3
+[profile.dev.package.nokhwa]
+opt-level = 3
+[profile.dev.package.nokhwa-core]
+opt-level = 3
+[profile.dev.package.mozjpeg]
+opt-level = 3
+[profile.dev.package.serde_json]
+opt-level = 3
+[profile.dev.package.base64]
+opt-level = 3
