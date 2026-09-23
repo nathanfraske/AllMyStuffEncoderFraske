@@ -387,6 +387,24 @@ retains negative controls, the first shared-target failure and qualified
 artifact-reuse diagnosis, and the Windows build-path failure/short-target fix.
 No latency, crash-resilience or performance benefit is claimed.
 
+### BOUND-02 — Dynamic paced-video resource budgets
+
+**Pending / Operator-requested follow-up.** Replace the hardcoded per-AU
+16 MiB admission limits in
+[`Freshness::forward_paced`](../crates/allmystuff-video/src/ingress.rs) and
+[`accept_paced_fragment`](../crates/allmystuff-video/src/receive.rs) with dynamic
+resource budgets responsive to available resources and memory pressure. Account
+for aggregate retained data across peers, lanes and routes, fair admission and
+prompt release. Preserve explicit completion, discontinuity/recovery and
+audio/other-lane progress under pressure.
+
+Related: [OPT-06 queue and admission budgets](#opt-06--queue-and-admission-budgets).
+Exact accounting, pressure signals, allocation policy and thresholds remain
+pending. Validate changing budgets/pressure, concurrent streams, valid units
+larger than 16 MiB when budget allows, and refusal/recovery when the budget is
+exhausted. This records future work; completed BOUND-01 and its historical
+evidence remain unchanged. No implementation or performance result is claimed.
+
 ### LIFE-01 — Terminal generations and descendant ownership
 
 **P1 / Proposed lifecycle work.** Evidence:
