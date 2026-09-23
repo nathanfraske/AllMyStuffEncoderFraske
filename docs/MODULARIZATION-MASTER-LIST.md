@@ -361,22 +361,31 @@ Windows/Unix configurations; do not silently install an assembler for a comparis
 
 ## Correctness and lifecycle follow-ups
 
-### BOUND-01 — Existing first-fragment AU limit gap
+### BOUND-01 — Paced-video first and replacement fragment limit
 
-**P1 / Proposed behavior fix.** Current anchor:
-[`Freshness::forward_paced`](../crates/allmystuff-video/src/ingress.rs), called
-through [`InboundVideoFreshness`](../node/src/control_client.rs). Continuations
-check `MAX_PACED_AU_BYTES` (16 MiB), but initial/replacement fragments enter
-pending state without the same check. The outer media frame ceiling is a
-different 64 MiB limit. This is a source-proven retention gap, not a demonstrated
-exploit or a claim about aggregate memory. [Original review](reviews/modular-foundation/myownmesh-followups.md#1-apply-the-existing-paced-au-limit-to-the-first-fragment).
+**P1 / Completed and validated.**
+[`Freshness::forward_paced`](../crates/allmystuff-video/src/ingress.rs) and
+[`accept_paced_fragment`](../crates/allmystuff-video/src/receive.rs) now apply
+the same inclusive 16 MiB payload ceiling to initial/replacement fragments as
+to continuations. Rejection clears the affected pending unit, preventing a
+later marker from emitting stale data, and retains each path's existing
+discontinuity/recovery handling. Other peer/lanes and routes remain independent.
+The [BOUND-01 evidence note](reviews/modular-foundation/paced-video-byte-bound.md)
+records the explicit old/new behavior difference, source reviews and actual
+execution results; the [original review](reviews/modular-foundation/myownmesh-followups.md#1-apply-the-existing-paced-au-limit-to-the-first-fragment)
+and frozen extraction oracles remain historical evidence.
 
-Dependency: current application assembler; no Mesh upgrade needed. Bounded
-action: apply the same ceiling at insertion/replacement while preserving
-ordered discontinuity/recovery. Benefit: enforce the intended per-AU bound.
-Risk: recovery/order changes. Test exactly-limit/plus-one initial, replacement,
-continuation and matching-marker cases, queue pressure and independent audio/
-lane progress. Extraction deliberately did not repair this behavior.
+This corrects a per-AU retention gap; it does not cap aggregate memory or alter
+unpaced forwarding, the separate 64 MiB media IPC frame limit, dependency pins,
+feature defaults or application/Mesh authorization. No Mesh upgrade is needed.
+The regression inventory covers exact-limit/plus-one payloads, stale markers,
+Reset/Gradual recovery, sink pressure/closure and lane/route isolation. Windows
+passed 206 executions covering 140 distinct test names, scoped formatting and
+strict workspace/node Clippy. Native Mac passed 352 executions/39 suites per
+architecture at `c75e7aa`; host gates there are compile-only. The evidence note
+retains negative controls, the first shared-target failure and qualified
+artifact-reuse diagnosis, and the Windows build-path failure/short-target fix.
+No latency, crash-resilience or performance benefit is claimed.
 
 ### LIFE-01 — Terminal generations and descendant ownership
 
@@ -590,8 +599,7 @@ are retained without duplicate work items:
 | TEST-05 / P2 / Deferred experiment | PORT-04 retains an unresolved RISC-V unoptimized codec abort and failed diagnostic link. Do not count the other 684 passes as codec-proof success. | Frozen OpenH264/toolchain/proof identities in the experiment. Benefit: a diagnosed portability boundary. Risk: suppressing checks, changing optimization or blindly replaying a failed recipe. A separately resumed investigation must first identify the fault with a reviewed diagnostic build, then rerun the same proof and retain negative evidence. |
 | TEST-06 / P2 / Proposed capability work | [`nvdec::NvdecAv1`](../crates/allmystuff-video/src/nvdec.rs) and [`d3d11va::D3d11vaAv1`](../crates/allmystuff-video/src/d3d11va.rs) return not-implemented errors. Hardware availability cannot enable those stubs. | Current video backend interfaces, no Mesh prerequisite. Benefit: actual additional codec support. Risk: claiming support from a probe or compile result. Implement separately, then qualify real decode, frame shape, errors/fallback and device behavior; this is not dead-code cleanup. |
 
-Near-term ordering: handle
-BOUND-01 as a separately reviewed correctness change; measure OPT-01/02/05
+Near-term ordering: BOUND-01 is complete with its evidence linked above; measure OPT-01/02/05
 before choosing performance work; design real-consumer feature/host-service
 seams before removing dependencies. MyOwnMesh migration begins with MESH-01/02
 against a reviewed target contract and ends with deletion, rather than starting

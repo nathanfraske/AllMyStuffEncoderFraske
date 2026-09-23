@@ -1,7 +1,8 @@
 # Cumulative macOS validation
 
-`modular-macos.yml` runs on the task branch `agent/1503a621-audio-macos` and by
-manual dispatch. It selects standard `macos-15-intel` (native x86_64) and
+`modular-macos.yml` runs on task branches `agent/1503a621-audio-macos` and
+`agent/1503a621-bound01`, and by manual dispatch. It selects standard
+`macos-15-intel` (native x86_64) and
 `macos-15` (native arm64) jobs, independently, without fail-fast cancellation.
 The labels and preinstalled tools were checked against GitHub's
 [runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)
@@ -27,10 +28,18 @@ the audio fixture assembly was audited at
 `modular-macos-suites.json` lists every selected Rust test name, target source,
 feature configuration and timeout. Cargo only builds the named packages/targets;
 each resulting test binary is enumerated before its matching filter runs. A
-missing, added, ignored or failing case prevents a green result. The reviewed
-inventory contains **338 executions per architecture**: the original 239 plus
-99 audio executions across three feature configurations. This includes deliberate
-repetition of viewer and audio definitions to check feature combinations.
+missing, added, ignored or failing case prevents a green result. The current
+reviewed inventory contains **352 executions across 39 suites per architecture**:
+the previously tested 338, plus 13 net additional video regression definitions
+and one exact BOUND-01 node caller case. The historical run above remains a
+338-execution result. The current inventory passed on both architectures at
+`c75e7aa1fb2435a0d45ec2c250d1a6c70edd81c9` in
+[run 35797280354](https://github.com/nathanfraske/AllMyStuffEncoderFraske/actions/runs/35797280354),
+with both host compile gates, unchanged locks/source and normal cleanup of the
+private roots. The [BOUND-01 note](../../docs/reviews/modular-foundation/paced-video-byte-bound.md)
+records exact versions, results and limitations. The inventory includes
+deliberate repetition of viewer and audio definitions to check feature
+combinations; this successful run does not qualify forced cancellation.
 
 | Selection | Executions |
 | --- | ---: |
@@ -42,13 +51,14 @@ repetition of viewer and audio definitions to check feature combinations.
 | Video metadata | 5 |
 | IPC client (private sockets and in-memory framing) | 16 |
 | Storage plan core | 28 |
-| Video core, handoff, ingress and receive | 42 |
+| Video core, handoff, ingress and receive | 55 |
 | Terminal viewer contract | 17 |
 | Terminal host public/channel contracts | 18 + 30 |
 | Retained Unix terminal module (11 PTY, 2 pure) | 13 |
 | Unix terminal lifecycle (9 PTY) | 9 |
 | Software video decode | 7 |
 | Node storage (7 memory, 15 private persistence fixtures) | 22 |
+| Node BOUND-01 paced-video/audio progress caller (exact selection) | 1 |
 | Audio default: PCM and public contract | 14 |
 | Audio codec: PCM, Opus and explicit disabled contract | 33 |
 | Audio I/O compiled: the above plus device-free I/O and LevelStats | 52 |
@@ -60,9 +70,14 @@ Mesh construction, scanner invocation, live daemon endpoint, updater test,
 microphone, speaker, camera, screen recording or hardware encoder is executed.
 In particular, video encoder-ladder tests and the retained audio test
 `capture_and_playback_for_one_route_coexist` are excluded. The optional adapter
-cases `node_control::tests::` (17 on Mac), `persist::tests::` (2), inventory
-`model_identity` (1), and control-client cases (13) are outside this initial
-inventory. This script does not discover and run future test targets automatically.
+cases `node_control::tests::` (17 on Mac), `persist::tests::` (2) and inventory
+`model_identity` (1) remain outside the current inventory. Of the 14
+control-client definitions, only
+`control_client::tests::oversized_paced_au_does_not_stop_audio_or_other_video_lanes`
+is selected, with `--exact`, using the existing no-default-feature node-storage
+test binary. It feeds an in-memory media pipe and checks independent audio/video
+progress; the other 13 control-client cases remain unselected. This script does
+not discover and run future test targets automatically.
 
 Audio's default and `codec` builds run the named PCM/public targets and narrow
 unit/codec filters. The `audio-io` build repeats those contracts, including the
