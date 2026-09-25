@@ -1,0 +1,51 @@
+name: Fleet local Linux package qualification
+run-name: Local Linux packages at b15aa1a
+'on':
+  workflow_dispatch: null
+permissions:
+  contents: read
+concurrency:
+  group: fleet-linux-package-qualification
+  cancel-in-progress: false
+jobs:
+  linux:
+    if: github.repository == 'nathanfraske/AllMyStuffEncoderFraske' && github.ref == 'refs/heads/main'
+    runs-on:
+    - self-hosted
+    - Linux
+    - X64
+    - test-fleet
+    - linux-docker-x64
+    timeout-minutes: 180
+    steps:
+    - name: Fetch the qualified fleet tools through the existing source broker
+      shell: bash
+      run: |
+        python3 /opt/test-fleet/actions-runner/fleet-source.py nathanfraske/test-fleet 621590ef9bae9d211d90f9f13f13cb69b4ca0500 fleet
+        python3 - <<'PY'
+        import hashlib
+        from pathlib import Path
+        expected = {'controller/qualify_allmystuff_linux.py': 'f298282280cab9a32d5c461117476e74e47e35f9de583d05d030ca522faef460', 'controller/qualify_allmystuff_linux.sh': '97823135b39b9804514e5e2330496d1dde9c0ee4a1e5ba0595d8839663ab0cf1', 'controller/images/allmystuff-linux/Dockerfile': 'f7e6239669a1cbc959050566245ad2d73a50a5a2e0704778554ad7ca9d57f5d5', 'controller/images/allmystuff-linux/release-deps.sh': '399fa3892e440270adfe2566f5852fda6ab2ed9420e19d53a70f5a2521c210ef', 'controller/build_linux.py': 'f1f849f1d845f949959c45d31affd574607b9fd73093e27bb8964dd94ab74a8d', 'controller/resource_budget.py': 'a5134a21e8fa7eb039f752fd51975696bade8608dafce2a4cc06b75baf9f6135'}
+        for name, digest in expected.items():
+            assert hashlib.sha256((Path('fleet') / name).read_bytes()).hexdigest() == digest, name
+        print('Qualified fleet tool hashes verified')
+        PY
+    - uses: actions/checkout@v4
+      with:
+        ref: b15aa1a277894999a8f01134843c06e892de084b
+        path: source
+        persist-credentials: false
+    - uses: pnpm/action-setup@v4
+      with:
+        package_json_file: source/gui/package.json
+    - uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+    - name: Build in the reviewed Ubuntu 22.04 image with persistent caches
+      shell: bash
+      run: python3 fleet/controller/qualify_allmystuff_linux.py source
+    - uses: actions/upload-artifact@v4
+      with:
+        name: allmystuff-native-linux-x64-b15aa1a
+        path: allmystuff-linux/*
+        if-no-files-found: error
