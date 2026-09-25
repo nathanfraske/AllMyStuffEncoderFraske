@@ -1,0 +1,131 @@
+# Qualified controller commands: nathanfraske/test-fleet@072b60d.
+# Manual native-runner canary; no tag, release publication or signing access.
+name: Fleet local Windows package qualification
+run-name: Local Windows packages at b15aa1a
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: fleet-windows-package-qualification
+  cancel-in-progress: false
+jobs:
+  windows:
+    if: github.repository == 'nathanfraske/AllMyStuffEncoderFraske' && github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, Windows, X64, test-fleet, windows-native-x64]
+    timeout-minutes: 180
+    env:
+      CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+      ALLMYSTUFF_REQUIRE_PINNED_MESH: '1'
+    steps:
+      - name: Prepare the qualified Windows toolchain
+        shell: powershell
+        run: '& C:\actions-runner\fleet\release-v1\setup_windows_release.ps1'
+      - uses: actions/checkout@v4
+        with:
+          ref: b15aa1a277894999a8f01134843c06e892de084b
+          path: source
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: source/gui/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Build qualified packages and required pinned sidecars
+        shell: pwsh
+        run: |
+          $Source='./source'
+          $ErrorActionPreference='Stop'
+          if($env:COMPUTERNAME -ne 'LAB-WIN-01'){throw 'Expected disposable Windows guest'}
+          $volume=Get-Volume -DriveLetter D
+          if($volume.FileSystemLabel -ne 'TestFleetCache' -or $volume.SizeRemaining -lt 8GB){throw 'Expected cache volume with at least 8 GiB build headroom'}
+          if($env:CARGO_TARGET_DIR){throw 'Unexpected inherited target directory'}
+          $root=(Resolve-Path -LiteralPath $Source).Path
+          $workspace=(Resolve-Path -LiteralPath $env:GITHUB_WORKSPACE).Path.TrimEnd('\')+'\'
+          if(-not $root.StartsWith($workspace,[StringComparison]::OrdinalIgnoreCase)){throw 'Source must be inside this job workspace'}
+          Set-Location -LiteralPath $root
+          if((git rev-parse HEAD) -ne 'b15aa1a277894999a8f01134843c06e892de084b' -or $LASTEXITCODE -ne 0){throw 'Source commit mismatch'}
+          if((Get-Content -LiteralPath .myownmesh-rev -Raw).Trim() -ne 'v0.3.21'){throw 'Pinned Mesh release changed'}
+          if($env:ALLMYSTUFF_REQUIRE_PINNED_MESH -ne '1' -or $env:ALLMYSTUFF_SKIP_SIDECAR){throw 'Required pinned sidecar must remain enabled'}
+
+          # The reviewed VS layout includes CMake; it is not on a service account's PATH.
+          $vswhere='C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe'
+          $cmakeRoot=@(& $vswhere -products Microsoft.VisualStudio.Product.BuildTools -requires Microsoft.VisualStudio.Component.VC.CMake.Project -property installationPath)
+          if($LASTEXITCODE -ne 0 -or $cmakeRoot.Count -ne 1 -or $cmakeRoot[0] -ne 'C:\TestFleetBuildTools'){throw 'Reviewed VS CMake component is not registered'}
+          $cmake=Join-Path $cmakeRoot[0] 'Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe'
+          if(-not(Test-Path -LiteralPath $cmake -PathType Leaf)){throw 'Registered CMake executable missing'}
+          $env:CMAKE=$cmake
+          $env:Path=(Split-Path -Parent $cmake)+';'+$env:Path
+          & $cmake --version
+          if($LASTEXITCODE -ne 0){throw 'Registered CMake runtime failed'}
+
+          $module=([uri]'C:\actions-runner\fleet\release-v1\resources_job.mjs').AbsoluteUri
+          $values=& node --input-type=module -e "import {currentBudget,jobEnvironment} from '$module';const b=currentBudget();for(const [k,v] of Object.entries(jobEnvironment(b)))console.log(k+'='+v)"
+          if($LASTEXITCODE -ne 0){throw 'Resource allocation failed'}
+          foreach($line in $values){$pair=$line -split '=',2;[Environment]::SetEnvironmentVariable($pair[0],$pair[1],'Process')}
+          Write-Output ('Compiler workers: '+$env:CARGO_BUILD_JOBS)
+          $cache='D:\TestFleetCache\release-targets\allmystuff'
+          # MSBuild tracking fails through junctions on this guest. Compile via direct
+          # paths; keep source-layout aliases for the original sidecar/artifact lookup.
+          # New native cache names avoid failed CMake state containing the old alias path.
+          $rootTarget=Join-Path $cache 'root'
+          $nodeTarget=Join-Path $cache 'node-native-v2'
+          $guiTarget=Join-Path $cache 'gui-native-v2'
+          foreach($entry in @(@{relative='target';name='root'},@{relative='node\target';name='node-native-v2'},@{relative='gui\src-tauri\target';name='gui-native-v2'})) {
+           $link=Join-Path $root $entry.relative
+           if(Test-Path -LiteralPath $link){throw 'Unexpected target in fresh checkout'}
+           $target=Join-Path $cache $entry.name
+           if(Test-Path -LiteralPath $target){if((Get-Item -LiteralPath $target).Attributes -band [IO.FileAttributes]::ReparsePoint){throw 'Cache target is a reparse point'}}
+           New-Item -ItemType Directory -Path $target -Force|Out-Null
+           New-Item -ItemType Junction -Path $link -Target $target|Out-Null
+          }
+
+          bash ./scripts/sync-pinned-locks.sh --check
+          if($LASTEXITCODE -ne 0){throw 'Committed suite pins do not match'}
+          pnpm --dir gui install --frozen-lockfile --store-dir D:\TestFleetCache\user\pnpm
+          if($LASTEXITCODE -ne 0){throw 'Frozen GUI dependency install failed'}
+          foreach($name in @('allmystuff','amst')) {
+           cargo build --release --bin $name --target x86_64-pc-windows-msvc --target-dir $rootTarget
+           if($LASTEXITCODE -ne 0){throw ('Portable build failed: '+$name)}
+          }
+          cargo build --release --manifest-path node/Cargo.toml --bin allmystuff-serve --target x86_64-pc-windows-msvc --target-dir $nodeTarget
+          if($LASTEXITCODE -ne 0){throw 'Node build failed'}
+          $config=Join-Path $env:RUNNER_TEMP 'fleet-allmystuff-config.json'
+          [IO.File]::WriteAllText($config,'{"bundle":{"useLocalToolsDir":true}}',[Text.UTF8Encoding]::new($false))
+          # Direct CLI selection avoids tauri-action discovering the separate mobile app.
+          $env:CARGO_TARGET_DIR=$guiTarget
+          try {
+           pnpm --dir gui exec tauri build --target x86_64-pc-windows-msvc --bundles nsis --config $config
+           if($LASTEXITCODE -ne 0){throw 'Desktop NSIS build failed'}
+          } finally {$env:CARGO_TARGET_DIR=$null}
+
+          $output=Join-Path $env:GITHUB_WORKSPACE 'allmystuff-artifacts'
+          if(Test-Path -LiteralPath $output){throw 'Unexpected prior qualification artifacts'}
+          New-Item -ItemType Directory -Path $output|Out-Null
+          $portable=@(
+           @{name='allmystuff';path='target\x86_64-pc-windows-msvc\release\allmystuff.exe'},
+           @{name='amst';path='target\x86_64-pc-windows-msvc\release\amst.exe'},
+           @{name='allmystuff-serve';path='node\target\x86_64-pc-windows-msvc\release\allmystuff-serve.exe'},
+           @{name='allmystuff-gui';path='gui\src-tauri\target\x86_64-pc-windows-msvc\release\allmystuff-gui.exe'}
+          )
+          foreach($item in $portable) {
+           $binary=Join-Path $root $item.path
+           if(-not(Test-Path -LiteralPath $binary -PathType Leaf)){throw ('Missing release output: '+$item.name)}
+           $archive=Join-Path $output ($item.name+'-windows-x86_64.zip')
+           Compress-Archive -LiteralPath $binary -DestinationPath $archive
+           $sum=(Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+           [IO.File]::WriteAllText($archive+'.sha256',$sum+'  '+[IO.Path]::GetFileName($archive)+"`n",[Text.UTF8Encoding]::new($false))
+          }
+          $installers=@(Get-ChildItem -Path (Join-Path $root 'gui\src-tauri\target\x86_64-pc-windows-msvc\release\bundle\nsis\*.exe') -File)
+          if($installers.Count -ne 1){throw 'Expected exactly one NSIS installer'}
+          Copy-Item -LiteralPath $installers[0].FullName -Destination $output
+          Get-ChildItem -LiteralPath $output -File|Get-FileHash -Algorithm SHA256|Select-Object Path,Hash|ConvertTo-Json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: allmystuff-native-windows-x64-b15aa1a
+          path: allmystuff-artifacts/*
+          if-no-files-found: error
