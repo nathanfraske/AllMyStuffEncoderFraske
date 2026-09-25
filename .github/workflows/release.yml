@@ -34,7 +34,7 @@ jobs:
           # NSIS is the supported Windows installer: its install/uninstall
           # hooks provision the privileged interactive host. Do not also ship
           # an MSI that silently omits that required setup.
-          - { name: windows-x86_64, os: windows-latest,   target: x86_64-pc-windows-msvc, bundle_args: "--bundles nsis" }
+          # Windows runs in the qualified local windows-bundles job below.
     runs-on: ${{ matrix.platform.os }}
     # The Opus bundled by `audiopus_sys` (via the node engine + GUI `opus` dep)
     # declares a pre-3.5 `cmake_minimum_required` that CMake 4.x rejects; this
@@ -377,6 +377,177 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --clobber
 
+  windows-bundles:
+    name: Build (windows-x86_64)
+    runs-on:
+    - self-hosted
+    - Windows
+    - X64
+    - test-fleet
+    - windows-native-x64
+    timeout-minutes: 180
+    env:
+      CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+      ALLMYSTUFF_RELEASE_PUBKEY: ${{ vars.ALLMYSTUFF_RELEASE_PUBKEY }}
+      ALLMYSTUFF_REQUIRE_PINNED_MESH: '1'
+    steps:
+    - name: Prepare the qualified Windows toolchain
+      shell: powershell
+      run: '& C:\actions-runner\fleet\release-v1\setup_windows_release.ps1'
+    - uses: actions/checkout@v4
+      with:
+        ref: ${{ inputs.tag || github.ref }}
+        path: source
+        persist-credentials: 'false'
+    - uses: pnpm/action-setup@v4
+      with:
+        package_json_file: source/gui/package.json
+    - uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: x86_64-pc-windows-msvc
+    - name: Verify tag matches manifest versions
+      shell: bash
+      run: |
+        set -e
+        TAG="${{ inputs.tag || github.ref_name }}"
+        EXPECTED="${TAG#v}"
+        fail() { echo "::error::$*"; exit 1; }
+        got_workspace=$(awk '
+          /^\[workspace\.package\]/ {in_pkg=1; next}
+          /^\[/ {in_pkg=0}
+          in_pkg && /^version =/ {gsub(/[ "]/, "", $0); split($0, a, "="); print a[2]; exit}
+        ' Cargo.toml)
+        got_gui_cargo=$(awk -F\" '/^version = / {print $2; exit}' gui/src-tauri/Cargo.toml)
+        got_gui_pkg=$(node -e "console.log(require('./gui/package.json').version)")
+        [[ "$got_workspace" == "$EXPECTED" ]] || fail "Cargo.toml [workspace.package].version is $got_workspace, expected $EXPECTED (tag $TAG). Run 'just release $EXPECTED' to bump."
+        [[ "$got_gui_cargo" == "$EXPECTED" ]] || fail "gui/src-tauri/Cargo.toml version is $got_gui_cargo, expected $EXPECTED (tag $TAG). Run 'just release $EXPECTED' to bump."
+        [[ "$got_gui_pkg"   == "$EXPECTED" ]] || fail "gui/package.json version is $got_gui_pkg, expected $EXPECTED (tag $TAG). Run 'just release $EXPECTED' to bump."
+        echo "Manifest versions match tag $TAG ($EXPECTED)."
+      working-directory: source
+    - name: Build Windows release packages and required pinned sidecars
+      shell: pwsh
+      run: |
+        $Source='./source'
+        $ErrorActionPreference='Stop'
+        if($env:COMPUTERNAME -ne 'LAB-WIN-01'){throw 'Expected disposable Windows guest'}
+        $volume=Get-Volume -DriveLetter D
+        if($volume.FileSystemLabel -ne 'TestFleetCache' -or $volume.SizeRemaining -lt 8GB){throw 'Expected cache volume with at least 8 GiB build headroom'}
+        if($env:CARGO_TARGET_DIR){throw 'Unexpected inherited target directory'}
+        $root=(Resolve-Path -LiteralPath $Source).Path
+        $workspace=(Resolve-Path -LiteralPath $env:GITHUB_WORKSPACE).Path.TrimEnd('\')+'\'
+        if(-not $root.StartsWith($workspace,[StringComparison]::OrdinalIgnoreCase)){throw 'Source must be inside this job workspace'}
+        Set-Location -LiteralPath $root
+        if($env:ALLMYSTUFF_REQUIRE_PINNED_MESH -ne '1' -or $env:ALLMYSTUFF_SKIP_SIDECAR){throw 'Required pinned sidecar must remain enabled'}
+
+        # The reviewed VS layout includes CMake; it is not on a service account's PATH.
+        $vswhere='C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe'
+        $cmakeRoot=@(& $vswhere -products Microsoft.VisualStudio.Product.BuildTools -requires Microsoft.VisualStudio.Component.VC.CMake.Project -property installationPath)
+        if($LASTEXITCODE -ne 0 -or $cmakeRoot.Count -ne 1 -or $cmakeRoot[0] -ne 'C:\TestFleetBuildTools'){throw 'Reviewed VS CMake component is not registered'}
+        $cmake=Join-Path $cmakeRoot[0] 'Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe'
+        if(-not(Test-Path -LiteralPath $cmake -PathType Leaf)){throw 'Registered CMake executable missing'}
+        $env:CMAKE=$cmake
+        $env:Path=(Split-Path -Parent $cmake)+';'+$env:Path
+        & $cmake --version
+        if($LASTEXITCODE -ne 0){throw 'Registered CMake runtime failed'}
+
+        $module=([uri]'C:\actions-runner\fleet\release-v1\resources_job.mjs').AbsoluteUri
+        $values=& node --input-type=module -e "import {currentBudget,jobEnvironment} from '$module';const b=currentBudget();for(const [k,v] of Object.entries(jobEnvironment(b)))console.log(k+'='+v)"
+        if($LASTEXITCODE -ne 0){throw 'Resource allocation failed'}
+        foreach($line in $values){$pair=$line -split '=',2;[Environment]::SetEnvironmentVariable($pair[0],$pair[1],'Process')}
+        Write-Output ('Compiler workers: '+$env:CARGO_BUILD_JOBS)
+        $cache='D:\TestFleetCache\release-targets\allmystuff'
+        # MSBuild tracking fails through junctions on this guest. Compile via direct
+        # paths; keep source-layout aliases for the original sidecar/artifact lookup.
+        # New native cache names avoid failed CMake state containing the old alias path.
+        $rootTarget=Join-Path $cache 'root'
+        $nodeTarget=Join-Path $cache 'node-native-v2'
+        $guiTarget=Join-Path $cache 'gui-native-v2'
+        foreach($entry in @(@{relative='target';name='root'},@{relative='node\target';name='node-native-v2'},@{relative='gui\src-tauri\target';name='gui-native-v2'})) {
+         $link=Join-Path $root $entry.relative
+         if(Test-Path -LiteralPath $link){throw 'Unexpected target in fresh checkout'}
+         $target=Join-Path $cache $entry.name
+         if(Test-Path -LiteralPath $target){if((Get-Item -LiteralPath $target).Attributes -band [IO.FileAttributes]::ReparsePoint){throw 'Cache target is a reparse point'}}
+         New-Item -ItemType Directory -Path $target -Force|Out-Null
+         New-Item -ItemType Junction -Path $link -Target $target|Out-Null
+        }
+
+        bash ./scripts/sync-pinned-locks.sh --check
+        if($LASTEXITCODE -ne 0){throw 'Committed suite pins do not match'}
+        pnpm --dir gui install --frozen-lockfile --store-dir D:\TestFleetCache\user\pnpm
+        if($LASTEXITCODE -ne 0){throw 'Frozen GUI dependency install failed'}
+        foreach($name in @('allmystuff','amst')) {
+         cargo build --release --bin $name --target x86_64-pc-windows-msvc --target-dir $rootTarget
+         if($LASTEXITCODE -ne 0){throw ('Portable build failed: '+$name)}
+        }
+        cargo build --release --manifest-path node/Cargo.toml --bin allmystuff-serve --target x86_64-pc-windows-msvc --target-dir $nodeTarget
+        if($LASTEXITCODE -ne 0){throw 'Node build failed'}
+        $config=Join-Path $env:RUNNER_TEMP 'fleet-allmystuff-config.json'
+        [IO.File]::WriteAllText($config,'{"bundle":{"useLocalToolsDir":true}}',[Text.UTF8Encoding]::new($false))
+        # Direct CLI selection avoids tauri-action discovering the separate mobile app.
+        $env:CARGO_TARGET_DIR=$guiTarget
+        try {
+         pnpm --dir gui exec tauri build --target x86_64-pc-windows-msvc --bundles nsis --config $config
+         if($LASTEXITCODE -ne 0){throw 'Desktop NSIS build failed'}
+        } finally {$env:CARGO_TARGET_DIR=$null}
+
+        $output=Join-Path $env:GITHUB_WORKSPACE 'allmystuff-artifacts'
+        if(Test-Path -LiteralPath $output){throw 'Unexpected prior qualification artifacts'}
+        New-Item -ItemType Directory -Path $output|Out-Null
+        $portable=@(
+         @{name='allmystuff';path='target\x86_64-pc-windows-msvc\release\allmystuff.exe'},
+         @{name='amst';path='target\x86_64-pc-windows-msvc\release\amst.exe'},
+         @{name='allmystuff-serve';path='node\target\x86_64-pc-windows-msvc\release\allmystuff-serve.exe'},
+         @{name='allmystuff-gui';path='gui\src-tauri\target\x86_64-pc-windows-msvc\release\allmystuff-gui.exe'}
+        )
+        foreach($item in $portable) {
+         $binary=Join-Path $root $item.path
+         if(-not(Test-Path -LiteralPath $binary -PathType Leaf)){throw ('Missing release output: '+$item.name)}
+         $archive=Join-Path $output ($item.name+'-windows-x86_64.zip')
+         Compress-Archive -LiteralPath $binary -DestinationPath $archive
+         $sum=(Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+         [IO.File]::WriteAllText($archive+'.sha256',$sum+'  '+[IO.Path]::GetFileName($archive)+"`n",[Text.UTF8Encoding]::new($false))
+        }
+        $version=(Get-Content -LiteralPath 'gui/package.json' -Raw|ConvertFrom-Json).version
+        $installer=Join-Path $guiTarget ('x86_64-pc-windows-msvc\release\bundle\nsis\AllMyStuff_'+$version+'_x64-setup.exe')
+        if(-not(Test-Path -LiteralPath $installer -PathType Leaf)){throw 'Expected current-version NSIS installer'}
+        Copy-Item -LiteralPath $installer -Destination $output
+        Get-ChildItem -LiteralPath $output -File|Get-FileHash -Algorithm SHA256|Select-Object Path,Hash|ConvertTo-Json
+    - uses: actions/upload-artifact@v4
+      with:
+        name: allmystuff-windows-x64-${{ github.run_id }}-${{ github.run_attempt }}
+        path: allmystuff-artifacts/*
+        if-no-files-found: error
+    - name: Publish Windows installer and portable archives
+      uses: softprops/action-gh-release@v2
+      if: github.event_name == 'push'
+      with:
+        tag_name: ${{ inputs.tag || github.ref_name }}
+        name: ${{ inputs.tag || github.ref_name }}
+        draft: false
+        prerelease: false
+        fail_on_unmatched_files: true
+        files: |
+          allmystuff-artifacts/AllMyStuff_*_x64-setup.exe
+          allmystuff-artifacts/allmystuff-*.zip*
+          allmystuff-artifacts/amst-*.zip*
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    - name: Upload Windows artifacts to the existing release
+      if: github.event_name == 'workflow_dispatch'
+      shell: pwsh
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        TAG: ${{ inputs.tag }}
+      run: |
+        $ErrorActionPreference='Stop'
+        $assets=@(Get-ChildItem -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'allmystuff-artifacts') -File|ForEach-Object FullName)
+        if($assets.Count -ne 9){throw 'Expected four portable ZIPs with checksums and one NSIS installer'}
+        & gh release upload $env:TAG @assets --repo $env:GITHUB_REPOSITORY --clobber
+        if($LASTEXITCODE -ne 0){throw 'Existing-release asset upload failed'}
+
   # Detached Ed25519 (minisign) signatures over the portable archives, so the
   # self-updater can prove provenance, not just integrity. Runs once after all
   # platform bundles upload, and is a NO-OP until the maintainer configures the
@@ -385,7 +556,7 @@ jobs:
   # still releases exactly as before.
   sign:
     name: Sign release artifacts (minisign)
-    needs: bundles
+    needs: [bundles, windows-bundles]
     runs-on: ubuntu-22.04
     permissions:
       contents: write
