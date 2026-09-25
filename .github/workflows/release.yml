@@ -27,7 +27,7 @@ jobs:
           # Building on 24.04 links against glibc 2.39 and breaks anything
           # older with "GLIBC_2.39 not found". Matches MyOwnMesh /
           # MyOwnLLM so users get the same portability promise across apps.
-          - { name: linux-x86_64,   os: ubuntu-22.04,     target: x86_64-unknown-linux-gnu, bundle_args: "" }
+          # Linux x64 runs in the qualified local linux-bundles job below.
           - { name: linux-aarch64,  os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu, bundle_args: "" }
           - { name: macos-aarch64,  os: macos-14,         target: aarch64-apple-darwin, bundle_args: "" }
           - { name: macos-x86_64,   os: macos-14,         target: x86_64-apple-darwin, bundle_args: "" }
@@ -548,6 +548,99 @@ jobs:
         & gh release upload $env:TAG @assets --repo $env:GITHUB_REPOSITORY --clobber
         if($LASTEXITCODE -ne 0){throw 'Existing-release asset upload failed'}
 
+  linux-bundles:
+    name: Build (linux-x86_64)
+    runs-on:
+    - self-hosted
+    - Linux
+    - X64
+    - test-fleet
+    - linux-docker-x64
+    timeout-minutes: 180
+    env:
+      CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+      ALLMYSTUFF_RELEASE_PUBKEY: ${{ vars.ALLMYSTUFF_RELEASE_PUBKEY }}
+      ALLMYSTUFF_REQUIRE_PINNED_MESH: '1'
+    steps:
+    - name: Fetch the reviewed release tools through the existing source broker
+      shell: bash
+      run: |
+        python3 /opt/test-fleet/actions-runner/fleet-source.py nathanfraske/test-fleet e57459c6a743584c288331dc3bb7107104c1cdb9 fleet
+        python3 - <<'PY'
+        import hashlib
+        from pathlib import Path
+        expected = {'controller/release_allmystuff_linux.py': '7b107319ed2b568feb27dca2645d8e50ef0e7eacaada4398baf011ef77744b27', 'controller/release_allmystuff_linux.sh': '2eb176efa27e63106c7a5ec8f4826bbd8620e600638e9af4266ea623ca03b63d', 'controller/images/allmystuff-linux/Dockerfile': 'f7e6239669a1cbc959050566245ad2d73a50a5a2e0704778554ad7ca9d57f5d5', 'controller/images/allmystuff-linux/release-deps.sh': '399fa3892e440270adfe2566f5852fda6ab2ed9420e19d53a70f5a2521c210ef', 'controller/build_linux.py': 'f1f849f1d845f949959c45d31affd574607b9fd73093e27bb8964dd94ab74a8d', 'controller/resource_budget.py': 'a5134a21e8fa7eb039f752fd51975696bade8608dafce2a4cc06b75baf9f6135', 'controller/upload_allmystuff_linux.cjs': '0114506be1287beeb11e45233a1ef6b15ec58316fdce27a13a20a14c05eb00c3'}
+        for name, digest in expected.items():
+            assert hashlib.sha256((Path('fleet') / name).read_bytes()).hexdigest() == digest, name
+        print('Reviewed release tool hashes verified')
+        PY
+    - uses: actions/checkout@v4
+      with:
+        ref: ${{ inputs.tag || github.ref }}
+        path: source
+        persist-credentials: false
+      id: source
+    - uses: pnpm/action-setup@v4
+      with:
+        package_json_file: source/gui/package.json
+    - uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+    - name: Verify tag matches manifest versions
+      shell: bash
+      run: |
+        set -e
+        TAG="${{ inputs.tag || github.ref_name }}"
+        EXPECTED="${TAG#v}"
+        fail() { echo "::error::$*"; exit 1; }
+        got_workspace=$(awk '
+          /^\[workspace\.package\]/ {in_pkg=1; next}
+          /^\[/ {in_pkg=0}
+          in_pkg && /^version =/ {gsub(/[ "]/, "", $0); split($0, a, "="); print a[2]; exit}
+        ' Cargo.toml)
+        got_gui_cargo=$(awk -F\" '/^version = / {print $2; exit}' gui/src-tauri/Cargo.toml)
+        got_gui_pkg=$(node -e "console.log(require('./gui/package.json').version)")
+        [[ "$got_workspace" == "$EXPECTED" ]] || fail "Cargo.toml [workspace.package].version is $got_workspace, expected $EXPECTED (tag $TAG). Run 'just release $EXPECTED' to bump."
+        [[ "$got_gui_cargo" == "$EXPECTED" ]] || fail "gui/src-tauri/Cargo.toml version is $got_gui_cargo, expected $EXPECTED (tag $TAG). Run 'just release $EXPECTED' to bump."
+        [[ "$got_gui_pkg"   == "$EXPECTED" ]] || fail "gui/package.json version is $got_gui_pkg, expected $EXPECTED (tag $TAG). Run 'just release $EXPECTED' to bump."
+        echo "Manifest versions match tag $TAG ($EXPECTED)."
+      working-directory: source
+    - name: Build Linux release packages and required pinned sidecars
+      shell: bash
+      run: python3 fleet/controller/release_allmystuff_linux.py source
+      env:
+        FLEET_SOURCE_SHA: ${{ steps.source.outputs.commit }}
+    - uses: actions/upload-artifact@v4
+      with:
+        name: allmystuff-linux-x64-${{ github.run_id }}-${{ github.run_attempt }}
+        path: allmystuff-linux/*
+        if-no-files-found: error
+    - name: Publish Linux bundles and portable archives
+      uses: softprops/action-gh-release@v2
+      if: github.event_name == 'push'
+      with:
+        tag_name: ${{ inputs.tag || github.ref_name }}
+        name: ${{ inputs.tag || github.ref_name }}
+        draft: false
+        prerelease: false
+        fail_on_unmatched_files: true
+        files: |
+          allmystuff-linux/AllMyStuff_*_amd64.deb
+          allmystuff-linux/AllMyStuff_*_amd64.AppImage
+          allmystuff-linux/AllMyStuff-*.x86_64.rpm
+          allmystuff-linux/allmystuff-*.tar.gz*
+          allmystuff-linux/amst-*.tar.gz*
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    - name: Upload Linux assets to the existing release
+      uses: actions/github-script@v7
+      if: github.event_name == 'workflow_dispatch'
+      env:
+        TAG: ${{ inputs.tag }}
+      with:
+        retries: 0
+        script: return await require('./fleet/controller/upload_allmystuff_linux.cjs')({github, context}, process.env.GITHUB_WORKSPACE, process.env.TAG);
+
   # Detached Ed25519 (minisign) signatures over the portable archives, so the
   # self-updater can prove provenance, not just integrity. Runs once after all
   # platform bundles upload, and is a NO-OP until the maintainer configures the
@@ -556,7 +649,7 @@ jobs:
   # still releases exactly as before.
   sign:
     name: Sign release artifacts (minisign)
-    needs: [bundles, windows-bundles]
+    needs: [bundles, windows-bundles, linux-bundles]
     runs-on: ubuntu-22.04
     permissions:
       contents: write
