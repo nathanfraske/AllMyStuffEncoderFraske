@@ -570,6 +570,7 @@ fn dropping_full_receiver_closes_owned_event_socket() {
     let (_, diagnostics) = run(async {
         let endpoint = Endpoint::new();
         let listener = endpoint.bind();
+        let (events_written_tx, events_written_rx) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
             let mut socket = accept_events(
                 &listener,
@@ -580,6 +581,7 @@ fn dropping_full_receiver_closes_owned_event_socket() {
             for value in [1, 2, 3] {
                 write_json(socket.get_mut(), &json!({"kind":"channel_inbound","network":"fixture-network","from":"fixture-peer","channel":"fixture-channel","payload":value})).await;
             }
+            events_written_tx.send(()).unwrap();
             assert_eof(&mut socket).await;
         });
         let (tx, rx) = mpsc::channel(1);
@@ -588,11 +590,21 @@ fn dropping_full_receiver_closes_owned_event_socket() {
             .subscribe_events_for_contract(EventContract::CandidateV1Db7818e, tx)
             .await
             .unwrap();
+        let registration = session.registration();
+        // Finish all fake-daemon writes before receiver teardown. The separate
+        // queue check proves pressure without racing the remaining socket writes.
+        events_written_rx.await.unwrap();
         while rx.len() != 1 {
             tokio::task::yield_now().await;
         }
+        assert!(registration.is_active());
         drop(rx);
         server.await.unwrap();
+        assert!(!registration.is_active());
+        assert!(client
+            .subscribe_channel(&registration, "fixture-network", "fixture-channel")
+            .await
+            .is_err());
         drop(session);
     });
     assert_secret_safe(&diagnostics);
