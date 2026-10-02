@@ -6,8 +6,9 @@
 //! `myownmesh` (pinned in `.myownmesh-rev`), found on `$PATH` or via the
 //! `MYOWNMESH_BIN` override. A binary that's fallen behind the pin is
 //! asked to update itself (`myownmesh update`, the same thing the
-//! installer invokes) before we start it, so the mesh comes up with the
-//! features this app was built against.
+//! installer invokes) before we start it. The resulting binary and live
+//! Status must satisfy the explicit contract in `mesh_contract`; a newer
+//! version number alone never authorizes a product protocol cutover.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -15,7 +16,11 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 
-use crate::control_client::{ControlClient, Request};
+use crate::control_client::ControlClient;
+use crate::mesh_contract::{
+    assess_binary_version, parse_binary_version_output, ContractReadiness, ContractRefusal,
+    EndpointProbe, SUPPORTED_DAEMON_VERSION,
+};
 
 /// The old CEC support area and its corrected replacement deliberately share
 /// a well-known network id. Legacy clients therefore announce `Open/0` while
@@ -340,9 +345,11 @@ fn tie_daemon_lifetime(_child: &Child) {
     // kernel-level equivalent.
 }
 
-/// True when a daemon is already answering on the control socket.
+/// Compatibility wrapper for callers that only need endpoint occupancy.
+/// `false` means confirmed absence, not refusal, denial or an unreadable reply.
+/// Product operations must use the typed readiness check, not this boolean.
 pub async fn probe(client: &ControlClient) -> bool {
-    client.request(&Request::Status).await.is_ok()
+    !matches!(client.probe_contract().await, EndpointProbe::Absent)
 }
 
 /// `"v0.2.4"` / `"0.2.4"` / `"0.2.4-rc.1"` → `(0, 2, 4)`. Missing
@@ -371,15 +378,6 @@ pub(crate) fn fmt_ver((a, b, c): (u64, u64, u64)) -> String {
     format!("{a}.{b}.{c}")
 }
 
-/// The app's daemon pin, when it's a comparable version tag (`vX.Y.Z`).
-/// A sha pin can't be compared, so every version passes then — same
-/// rule as the installer's `mesh_min_version`.
-fn pinned_version() -> Option<(&'static str, (u64, u64, u64))> {
-    let pin = option_env!("MYOWNMESH_PIN")?;
-    let want = parse_semverish(pin.strip_prefix('v')?)?;
-    Some((pin, want))
-}
-
 /// The MyOwnMesh release pin compiled into this AllMyStuff node.
 pub fn daemon_pin() -> Option<&'static str> {
     option_env!("MYOWNMESH_PIN")
@@ -390,7 +388,7 @@ pub fn daemon_pin() -> Option<&'static str> {
 /// on-disk repair target and the live daemon through the node status RPC.
 pub async fn installed_daemon_version() -> anyhow::Result<Option<String>> {
     let (bin, _) = find_daemon_binary()?;
-    Ok(binary_version(&bin).await.map(fmt_ver))
+    Ok(binary_version(&bin).await)
 }
 
 /// Ask an installed MyOwnMesh binary to repair/update itself. Development
@@ -401,11 +399,16 @@ pub async fn repair_installed_daemon() -> anyhow::Result<Option<String>> {
         anyhow::bail!("this MyOwnMesh binary is a development build or explicit override; rebuild or replace it at its configured path")
     }
     let _ = run_daemon_update(&bin).await;
-    Ok(binary_version(&bin).await.map(fmt_ver))
+    let version = binary_version(&bin)
+        .await
+        .context("updated MyOwnMesh binary did not report its version")?;
+    assess_binary_version(&version)?;
+    Ok(Some(version))
 }
 
-/// `bin --version`, parsed. `None` when the binary won't answer.
-async fn binary_version(bin: &Path) -> Option<(u64, u64, u64)> {
+/// Preserve the real `bin --version` token, including any suffix. The loose
+/// numeric parser used by diagnostics cannot establish contract compatibility.
+async fn binary_version(bin: &Path) -> Option<String> {
     let mut cmd = tokio::process::Command::new(bin);
     cmd.arg("--version")
         .stdin(Stdio::null())
@@ -421,7 +424,7 @@ async fn binary_version(bin: &Path) -> Option<(u64, u64, u64)> {
     if !out.status.success() {
         return None;
     }
-    parse_version_output(&String::from_utf8_lossy(&out.stdout))
+    parse_binary_version_output(&String::from_utf8_lossy(&out.stdout)).map(str::to_owned)
 }
 
 /// `myownmesh update` downloads a release binary, so give it real time —
@@ -430,8 +433,8 @@ const DAEMON_UPDATE_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// Run `<bin> update` — the daemon's own self-updater, the same thing
 /// the installer invokes — and report whether the binary on disk now
-/// satisfies the pin. Its output is folded into our log; failure never
-/// propagates (an old daemon still beats no daemon).
+/// satisfies the supported contract. Its output is folded into our log;
+/// callers refuse an unconfirmed or unsupported result before launching it.
 async fn run_daemon_update(bin: &Path) -> bool {
     let mut cmd = tokio::process::Command::new(bin);
     cmd.arg("update")
@@ -444,7 +447,7 @@ async fn run_daemon_update(bin: &Path) -> bool {
     match tokio::time::timeout(DAEMON_UPDATE_TIMEOUT, cmd.output()).await {
         Err(_) => {
             tracing::warn!(
-                "myownmesh update didn't finish within {}s — continuing with what's on disk",
+                "myownmesh update didn't finish within {}s — rechecking the supported contract on disk",
                 DAEMON_UPDATE_TIMEOUT.as_secs()
             );
         }
@@ -461,82 +464,66 @@ async fn run_daemon_update(bin: &Path) -> bool {
             }
         }
     }
-    // The re-check is what decides — `update` may have been refused
-    // (package-manager install), failed, or landed exactly the pin.
-    match (pinned_version(), binary_version(bin).await) {
-        (Some((_, want)), Some(have)) => have >= want,
-        _ => false,
-    }
-}
-
-/// When the daemon binary we're about to start is older than the app's
-/// pin, update it first. A stale daemon is the #1 way "the app updated
-/// but a feature didn't appear" happens — it answers the socket fine,
-/// so everything *looks* up, but the newer media lanes (the video track
-/// lane screens ride, the Opus audio lane) simply don't exist in it.
-async fn ensure_daemon_current(bin: &Path) {
-    let Some((pin, want)) = pinned_version() else {
-        return;
-    };
-    match binary_version(bin).await {
-        None => tracing::warn!(
-            "couldn't read {}'s version to compare against the {pin} pin",
-            bin.display()
-        ),
-        Some(have) if have >= want => {}
-        Some(have) => {
-            tracing::info!(
-                "myownmesh at {} is v{} but this app pins {pin} — asking it to update itself (myownmesh update)…",
-                bin.display(),
-                fmt_ver(have)
-            );
-            if run_daemon_update(bin).await {
-                tracing::info!("myownmesh is current — starting the updated daemon");
-            } else {
-                tracing::warn!(
-                    "couldn't bring myownmesh up to {pin}; starting the old daemon — the newer mesh features (e.g. the video track lane that screens ride) stay unavailable. Update it by hand: myownmesh update"
-                );
-            }
-        }
-    }
-}
-
-/// Compare the answering daemon's version against the app's pin and log
-/// the verdict — loudly on mismatch. Returns `true` when the daemon is
-/// confirmed older than the pin. Only meaningful when the pin is a
-/// version tag (`vX.Y.Z`); a sha pin can't be compared.
-pub async fn log_daemon_version(client: &ControlClient) -> bool {
-    let Some((pin, want)) = pinned_version() else {
-        return false;
-    };
-    let running = client
-        .request(&Request::Status)
+    // `update` may be refused, fail, or install a newer incompatible protocol.
+    binary_version(bin)
         .await
-        .ok()
-        .and_then(|r| r.data)
-        .and_then(|d| d.get("version").and_then(|v| v.as_str()).map(String::from));
-    match running {
-        Some(v) => match parse_semverish(&v) {
-            Some(have) if have >= want => {
-                tracing::info!("myownmesh daemon v{v} (satisfies the {pin} pin)");
-                false
-            }
-            Some(_) => {
-                tracing::warn!(
-                    "myownmesh daemon is v{v} but this app pins {pin} — features the newer daemon carries (e.g. the video track lane) will be unavailable. If this is a dev setup, rebuild the sibling MyOwnMesh checkout (or remove its stale binary so build.rs fetches the pinned release) and restart the app."
-                );
-                true
-            }
-            None => {
-                tracing::warn!(
-                    "myownmesh daemon reported an unreadable version ({v}) against the {pin} pin"
-                );
-                false
-            }
-        },
-        None => {
-            tracing::warn!("couldn't read the daemon version to compare against the {pin} pin");
+        .is_some_and(|version| assess_binary_version(&version).is_ok())
+}
+
+/// Check every binary source before `serve`. Only an installed, older numeric
+/// release is eligible for the existing self-update path; development builds
+/// and explicit overrides are checked but never overwritten. Recheck the exact
+/// contract after updating rather than accepting arbitrary versions above pin.
+async fn ensure_daemon_current(bin: &Path, source: DaemonSource) -> Result<()> {
+    let version = binary_version(bin)
+        .await
+        .with_context(|| format!("couldn't read {}'s MyOwnMesh version", bin.display()))?;
+    let Err(reason) = assess_binary_version(&version) else {
+        return Ok(());
+    };
+    let pin_supports_current =
+        daemon_pin().is_some_and(|pin| assess_binary_version(pin).is_ok());
+    let older_release = matches!(reason, ContractRefusal::UnsupportedVersion(_))
+        && parse_semverish(&version)
+            .zip(parse_semverish(SUPPORTED_DAEMON_VERSION))
+            .is_some_and(|(have, supported)| have < supported);
+    if source == DaemonSource::Installed && pin_supports_current && older_release {
+        tracing::info!(
+            %version,
+            ?bin,
+            "installed MyOwnMesh is older than the supported contract; asking it to update"
+        );
+        if run_daemon_update(bin).await {
+            return Ok(());
+        }
+        let updated = binary_version(bin).await.context(
+            "MyOwnMesh update did not produce a binary with a readable supported version",
+        )?;
+        assess_binary_version(&updated)?;
+        return Ok(());
+    }
+    Err(reason.into())
+}
+
+/// Log protocol readiness. Returns `true` on refusal or unavailable evidence;
+/// this diagnostic never authorizes an update, restart or launch.
+pub async fn log_daemon_version(client: &ControlClient) -> bool {
+    match client.probe_contract().await {
+        EndpointProbe::Answered(ContractReadiness::ReadyLegacy(_)) => {
+            tracing::info!("MyOwnMesh v{SUPPORTED_DAEMON_VERSION} contract is ready");
             false
+        }
+        EndpointProbe::Answered(ContractReadiness::Refused(reason)) => {
+            tracing::warn!(%reason, "MyOwnMesh protocol refused");
+            true
+        }
+        EndpointProbe::Unavailable(reason) => {
+            tracing::warn!(%reason, "MyOwnMesh endpoint readiness unavailable");
+            true
+        }
+        EndpointProbe::Absent => {
+            tracing::warn!("MyOwnMesh endpoint is absent");
+            true
         }
     }
 }
@@ -685,29 +672,16 @@ fn sibling_myownmesh_path(profile: &str, exe: &str) -> Option<PathBuf> {
 /// shutdown is near-instant; this is slack for a wedged one mid-teardown.
 const ORPHAN_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Reuse the daemon already answering the socket *as today*: log its version
-/// against the pin and, when it's stale and ours-to-keep-current, refresh the
-/// binary on disk for the next start. Always returns `Ok(None)` — "a daemon is
-/// already running; step aside". Factored out so both reuse paths (foreign
-/// daemon, and an orphan we couldn't cleanly replace) share one body.
-async fn reuse_running_daemon(client: &ControlClient) -> Result<Option<DaemonChild>> {
-    if log_daemon_version(client).await {
-        // The running daemon is stale, but it isn't ours to restart (an
-        // externally-started daemon, or one we couldn't replace). Refresh the
-        // binary on disk so the *next* daemon start runs the pinned features.
-        if let Ok((bin, DaemonSource::Installed)) = find_daemon_binary() {
-            if run_daemon_update(&bin).await {
-                tracing::warn!(
-                    "updated myownmesh on disk, but the running daemon keeps the old version until it restarts — quit whatever started it (or reboot) and relaunch the app"
-                );
-            }
-        }
-    }
+/// Reuse only an endpoint already assessed as the supported contract. Its
+/// process and on-disk binary are not ours to repair merely because it answers.
+fn reuse_running_daemon() -> Result<Option<DaemonChild>> {
+    tracing::info!("reusing supported MyOwnMesh v{SUPPORTED_DAEMON_VERSION} daemon");
     Ok(None)
 }
 
 /// Spawn `myownmesh serve` and wait briefly for its socket. Returns
-/// `Ok(None)` when a daemon is already running (we reuse it).
+/// `Ok(None)` when a compatible daemon is already running (we reuse it).
+/// An occupied incompatible or unavailable endpoint is an error, never absence.
 ///
 /// **Self-heal**: when a daemon is already answering, we normally reuse it —
 /// *except* when it's an orphan we started in a previous run (the GUI
@@ -718,56 +692,73 @@ async fn reuse_running_daemon(client: &ControlClient) -> Result<Option<DaemonChi
 /// inherited. A daemon we *didn't* start (a user's own, the MyOwnMesh app's,
 /// a `MYOWNMESH_BIN`-pinned one) is never touched.
 pub async fn ensure_daemon_running(client: &ControlClient) -> Result<Option<DaemonChild>> {
-    if probe(client).await {
-        tracing::info!("existing myownmesh daemon found on the control socket");
-
-        // A user-pinned/managed binary (`MYOWNMESH_BIN`) is deliberately out
-        // of our hands — never restart whatever it points at.
-        if std::env::var_os("MYOWNMESH_BIN").is_some() {
-            return reuse_running_daemon(client).await;
+    match client.probe_contract().await {
+        EndpointProbe::Absent => {}
+        EndpointProbe::Answered(ContractReadiness::Refused(reason)) => {
+            return Err(anyhow!("existing MyOwnMesh endpoint refused: {reason}"));
         }
+        EndpointProbe::Unavailable(reason) => {
+            return Err(anyhow!("existing MyOwnMesh endpoint unavailable: {reason}"));
+        }
+        EndpointProbe::Answered(ContractReadiness::ReadyLegacy(_)) => {
+            tracing::info!("existing myownmesh daemon found on the control socket");
 
-        // Is the answering daemon the orphan we started earlier? Only if the
-        // pidfile names a live pid that is *actually* a myownmesh process
-        // (the sysinfo check guards pid reuse). Anything else — no pidfile, a
-        // dead pid, or a live pid that isn't myownmesh — is a daemon we
-        // didn't start, so we reuse it untouched.
-        let our_orphan = daemon_pidfile()
-            .as_deref()
-            .and_then(read_pidfile)
-            .filter(|&(pid, want_start)| pid_is_our_daemon(pid, want_start))
-            .map(|(pid, _)| pid);
-        let Some(pid) = our_orphan else {
-            return reuse_running_daemon(client).await;
-        };
+            // A user-pinned/managed binary (`MYOWNMESH_BIN`) is deliberately out
+            // of our hands — never restart whatever it points at.
+            if std::env::var_os("MYOWNMESH_BIN").is_some() {
+                return reuse_running_daemon();
+            }
 
-        tracing::warn!(
-            "found a stale mesh daemon we started earlier (now orphaned) — restarting it for a clean transport"
-        );
-        stop_orphan(pid);
-        // Wait for it to stop answering, then fall through to spawn a fresh
-        // one. If it's *still* answering, we couldn't replace it cleanly —
-        // reuse it rather than spawn a conflicting second daemon.
-        let deadline = std::time::Instant::now() + ORPHAN_STOP_TIMEOUT;
-        loop {
-            if !probe(client).await {
-                break; // gone — fall through to the spawn path below
+            // Is the answering daemon the orphan we started earlier? Only if the
+            // pidfile names a live pid that is *actually* a myownmesh process
+            // (the sysinfo check guards pid reuse). Anything else — no pidfile, a
+            // dead pid, or a live pid that isn't myownmesh — is a daemon we
+            // didn't start, so we reuse it untouched.
+            let our_orphan = daemon_pidfile()
+                .as_deref()
+                .and_then(read_pidfile)
+                .filter(|&(pid, want_start)| pid_is_our_daemon(pid, want_start))
+                .map(|(pid, _)| pid);
+            let Some(pid) = our_orphan else {
+                return reuse_running_daemon();
+            };
+
+            tracing::warn!(
+                "found a stale mesh daemon we started earlier (now orphaned) — restarting it for a clean transport"
+            );
+            stop_orphan(pid);
+            // Only confirmed absence permits replacement. An unreadable or
+            // incompatible endpoint appearing during shutdown is not a free slot.
+            let deadline = std::time::Instant::now() + ORPHAN_STOP_TIMEOUT;
+            loop {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                let endpoint = tokio::time::timeout(remaining, client.probe_contract())
+                    .await
+                    .context("MyOwnMesh replacement readiness probe timed out")?;
+                match endpoint {
+                    EndpointProbe::Absent => break,
+                    EndpointProbe::Answered(ContractReadiness::ReadyLegacy(_)) => {}
+                    EndpointProbe::Answered(ContractReadiness::Refused(reason)) => {
+                        return Err(anyhow!("MyOwnMesh endpoint refused during replacement: {reason}"));
+                    }
+                    EndpointProbe::Unavailable(reason) => {
+                        return Err(anyhow!("MyOwnMesh endpoint unavailable during replacement: {reason}"));
+                    }
+                }
+                if std::time::Instant::now() >= deadline {
+                    tracing::warn!(
+                        "the orphaned daemon is still answering after {}s — couldn't replace it cleanly; reusing it",
+                        ORPHAN_STOP_TIMEOUT.as_secs()
+                    );
+                    return reuse_running_daemon();
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
             }
-            if std::time::Instant::now() >= deadline {
-                tracing::warn!(
-                    "the orphaned daemon is still answering after {}s — couldn't replace it cleanly; reusing it",
-                    ORPHAN_STOP_TIMEOUT.as_secs()
-                );
-                return reuse_running_daemon(client).await;
-            }
-            tokio::time::sleep(Duration::from_millis(250)).await;
         }
     }
 
     let (bin, source) = find_daemon_binary().context("locate myownmesh binary")?;
-    if source == DaemonSource::Installed {
-        ensure_daemon_current(&bin).await;
-    }
+    ensure_daemon_current(&bin, source).await?;
     tracing::info!(?bin, "spawning myownmesh daemon");
 
     let mut cmd = Command::new(&bin);
@@ -832,16 +823,27 @@ pub async fn ensure_daemon_running(client: &ControlClient) -> Result<Option<Daem
     let deadline = std::time::Instant::now() + Duration::from_secs(8);
     while std::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(150)).await;
-        if probe(client).await {
-            tracing::info!("myownmesh daemon up");
-            log_daemon_version(client).await;
-            return Ok(Some(handle));
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let endpoint = tokio::time::timeout(remaining, client.probe_contract())
+            .await
+            .context("spawned MyOwnMesh readiness probe timed out")?;
+        match endpoint {
+            EndpointProbe::Absent => {}
+            EndpointProbe::Answered(ContractReadiness::ReadyLegacy(_)) => {
+                tracing::info!("MyOwnMesh daemon up with supported v{SUPPORTED_DAEMON_VERSION} contract");
+                return Ok(Some(handle));
+            }
+            EndpointProbe::Answered(ContractReadiness::Refused(reason)) => {
+                return Err(anyhow!("spawned MyOwnMesh endpoint refused: {reason}"));
+            }
+            EndpointProbe::Unavailable(reason) => {
+                return Err(anyhow!("spawned MyOwnMesh endpoint unavailable: {reason}"));
+            }
         }
     }
-    tracing::warn!(
-        "daemon did not answer within 8s; leaving it running — the event pump will retry"
-    );
-    Ok(Some(handle))
+    // Dropping this owned handle stops our unready child. An external daemon
+    // never enters this ownership path.
+    Err(anyhow!("spawned MyOwnMesh daemon did not become ready within 8s"))
 }
 
 #[cfg(test)]
@@ -887,8 +889,8 @@ mod tests {
 
     #[test]
     fn tuple_ordering_matches_semver() {
-        // The whole fix rides on this comparison: numeric per-field,
-        // not lexicographic on the string ("0.10.0" > "0.2.4").
+        // Numeric diagnostic ordering can identify an older installed release
+        // for an update attempt. It does not establish protocol readiness.
         assert!((0, 2, 1) < (0, 2, 4));
         assert!((0, 10, 0) > (0, 2, 4));
         assert!((1, 0, 0) > (0, 10, 0));

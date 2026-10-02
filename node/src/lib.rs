@@ -111,6 +111,7 @@ pub mod labs;
 #[cfg(all(windows, feature = "host"))]
 pub mod mediafoundation;
 pub mod mesh;
+pub mod mesh_contract;
 pub mod namespace;
 pub mod networks_store;
 pub mod node_control;

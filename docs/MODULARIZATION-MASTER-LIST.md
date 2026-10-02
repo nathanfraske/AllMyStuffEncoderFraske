@@ -459,24 +459,38 @@ The existing [V4 transition proposal at 2349e6c](https://github.com/nathanfraske
 (blob `d449d0f9c4573518451411d5cb7ca053c3b6438e`, app baseline `8fc90d85`)
 supplies the AMS-V4-0..6 responsibility/order map. Its conceptual API names must
 be re-anchored to the exact current sources above. It is a proposal, not proof
-that those older method names exist. No production pin or transport change is
-part of this inventory.
+that those older method names exist. The original inventory changed no pin or
+transport. The first readiness slice below retains the shipping pin and refuses
+incomplete V1 product cutover.
 
 ### MESH-01 — Explicit supported contract and legacy inventory
 
-**P1 / Gated migration design; AMS-V4-0/1.** Evidence:
-[`ensure_daemon_current`, `log_daemon_version`](../node/src/daemon_spawn.rs)
-compare numeric versions; [`Mesh`](../node/src/mesh.rs) probes
-`Status.media_pipes` and falls back to JSON/base64. Neither demonstrates
-compatibility with a different daemon protocol. [Independent contract follow-up](reviews/modular-foundation/myownmesh-followups.md#2-distinguish-a-version-minimum-from-daemon-contract-support).
+**P1 / First contract/refusal slice implemented; product migration remains
+gated; AMS-V4-0/1.** The pure
+[`mesh_contract`](../node/src/mesh_contract.rs) policy explicitly supports
+v0.3.21's real Status envelope and media flag. A boolean false retains the
+legacy JSON media path within that supported contract; a missing/malformed flag
+or a greater version number cannot opt a different protocol into it. Reported
+v1.0.0 is recognized and refused for product use even with legacy-looking
+fields. Status does not prove a binary's exact Git revision or caller identity.
 
-Bounded action: inventory every current request/caller and define an explicit
-supported-contract/readiness matrix before selecting a new pin. Benefit:
-understandable refusal instead of assuming a newer number is compatible.
-Risk: unintended rejection of supported older daemons or authority fallback.
-Validate fake-daemon legacy/missing/malformed/error/unsupported-new-contract
-cases, followed by exact-version real sessions. Failed-helper Serve tests do
-not establish Mesh compatibility; never restart a foreign daemon as a fallback.
+[`ControlClient`](../node/src/control_client.rs) gates protected requests and
+legacy streams, including node UI passthroughs; [`Mesh`](../node/src/mesh.rs)
+checks before claim/governance startup and reconnect operations.
+[`daemon_spawn`](../node/src/daemon_spawn.rs) distinguishes confirmed absence
+from an occupied refused/unreadable endpoint, checks exact binary version text
+before launch and after self-update, and requires owned-child readiness. It
+never repairs/restarts an unowned daemon as an incompatibility fallback. The
+shipping pin remains v0.3.21. [Independent contract follow-up](reviews/modular-foundation/myownmesh-followups.md#2-distinguish-a-version-minimum-from-daemon-contract-support).
+
+Scoped isolated fixtures cover legacy, candidate, missing/malformed/error and
+unsupported contract evidence. Exact-version real sessions and full V1 product
+cutover remain separate gates; neither fake endpoints nor failed-helper Serve
+tests establish those results. H.264/Opus codecs and app permissions remain;
+retirement concerns the old daemon operations. MyOwnMesh is the signalling,
+connectivity, identity and evidence backplane, with reusable AllMyStuff tooling
+above it. Approved application identity and ledger access require a later
+explicit contract; daemon client capability C does not provide that approval.
 
 ### MESH-02 — Separate node IPC, daemon IPC and embedded session adaptation
 
@@ -487,9 +501,11 @@ not establish Mesh compatibility; never restart a foreign daemon as a fallback.
 MOD-07's [node client](../crates/allmystuff-node-client/src/lib.rs) speaks local
 application IPC; replacing it does not migrate the daemon contract.
 
-Bounded action: introduce one narrow adapter for exact supported operations,
-with typed lifetime/refusal outcomes; keep application route/consent policy
-above it. Dependency: db781 target and a reviewed migration/version decision.
+The first slice introduces a shared typed readiness/refusal boundary and
+explicit event-registration lifetime characterization while refusing incomplete
+V1 product use. Further bounded action: adapt exact supported operations and
+session capabilities; keep application route/consent policy above that adapter.
+Dependency: db781 target and a reviewed migration/version decision.
 Benefit: transport/session changes stop leaking through product owners.
 Risk: stale sessions, delivery semantics and local principal binding. Validate
 disconnect/replacement/revocation and bounded message/RPC/stream operations,

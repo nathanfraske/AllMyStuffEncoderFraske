@@ -68,6 +68,34 @@ engine bring-up, the frontend event contract — is byte-identical, and the
 shared Svelte UI cannot tell which platform answered. The full story is in
 [docs/MOBILE.md](docs/MOBILE.md).
 
+The shipping daemon contract is explicitly **v0.3.21**. The pure
+[contract policy](node/src/mesh_contract.rs) checks the real Status envelope,
+version, device/network field shapes and media-pipe flag. A newer version
+number or a missing media flag cannot select a legacy fallback. The staged
+v1.0.0 protocol reviewed at `db7818e` is characterized separately and refused
+for product use until its session, media, authority and state migration is
+complete; changing the pin alone does not enable it. H.264 and Opus remain
+codecs: migration retires old protocol operations, not those encodings.
+
+MyOwnMesh supplies the signalling, connectivity, identity and evidence
+backplane; AllMyStuff builds reusable interconnectivity tooling and application
+policy above it. Local node IPC remains separate from daemon IPC. Protected
+daemon operations, including node UI passthroughs and Mesh startup/reconnect,
+check the supported contract before delivery. Endpoint presence is a separate
+answer: denial, malformed replies and incompatible occupied endpoints never
+authorize spawning or restarting a foreign daemon. An owned child must become
+ready within its startup window; an unready child is stopped rather than
+reported as a successful launch.
+
+User-approved application identity and ledger access remain explicit later
+contracts. A daemon event-session capability binds its IPC operations; it does
+not enroll an approved application, authorize ledger access or replace the
+application’s owner/fleet, route and CEC consent checks. A supported
+same-account node-to-Mesh connection can sit behind an app-to-AllMyStuff broker;
+that topology is distinct from direct different-account daemon clients, and
+neither supplies implemented user approval today. See the
+[migration gates](docs/MODULARIZATION-MASTER-LIST.md#mesh-01--explicit-supported-contract-and-legacy-inventory).
+
 The library workspace (`crates/`) compiles and tests with nothing but
 `cargo` — no webview, no daemon, no network. The GUI is its own Cargo
 workspace (`gui/src-tauri`) so a root `cargo build --workspace` never drags
