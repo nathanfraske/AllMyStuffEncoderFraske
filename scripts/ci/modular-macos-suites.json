@@ -523,6 +523,112 @@
           ],
           "timeout_seconds": 120,
           "exact": true
+        },
+        {
+          "id": "node-mesh-contract-policy",
+          "source": "node/src/lib.rs",
+          "filter": "mesh_contract::tests::",
+          "tests": [
+            "mesh_contract::tests::binary_output_parser_preserves_the_first_exact_version_token",
+            "mesh_contract::tests::candidate_status_refuses_supported_and_unsupported_rtp_profiles",
+            "mesh_contract::tests::candidate_version_refuses_legacy_lookalike_fields",
+            "mesh_contract::tests::contradictory_success_and_error_envelope_is_refused",
+            "mesh_contract::tests::endpoints::candidate_refuses_event_and_media_handshakes_before_their_operation",
+            "mesh_contract::tests::endpoints::diagnostic_status_remains_readable_on_a_refused_candidate_endpoint",
+            "mesh_contract::tests::endpoints::malformed_and_closed_status_connections_are_unavailable",
+            "mesh_contract::tests::endpoints::missing_owned_endpoint_is_absent_without_lifecycle_launch",
+            "mesh_contract::tests::endpoints::occupied_legacy_status_and_false_flag_remain_ready",
+            "mesh_contract::tests::endpoints::occupied_non_socket_path_is_unavailable",
+            "mesh_contract::tests::endpoints::occupied_refusals_stop_lifecycle_before_binary_lookup_or_state_work",
+            "mesh_contract::tests::endpoints::occupied_status_refusals_are_answered_and_preserve_occupancy",
+            "mesh_contract::tests::endpoints::previous_ready_probe_does_not_authorize_a_new_candidate_connection",
+            "mesh_contract::tests::endpoints::protected_legacy_requests_check_status_on_their_actual_connection",
+            "mesh_contract::tests::endpoints::protected_operation_is_not_written_after_contract_refusal",
+            "mesh_contract::tests::endpoints::silent_occupied_status_endpoint_is_bounded_and_unavailable",
+            "mesh_contract::tests::legacy_false_media_flag_retains_json_fallback",
+            "mesh_contract::tests::numeric_newer_and_older_versions_are_not_compatibility_matches",
+            "mesh_contract::tests::rejected_status_cannot_become_ready_from_legacy_data",
+            "mesh_contract::tests::release_status_accepts_only_explicit_pin_spellings",
+            "mesh_contract::tests::released_status_requires_device_and_network_field_shapes",
+            "mesh_contract::tests::released_status_requires_explicit_media_flag_without_guessing_from_lanes",
+            "mesh_contract::tests::status_data_must_be_present_and_an_object",
+            "mesh_contract::tests::status_version_must_be_present_and_a_string",
+            "mesh_contract::tests::unrelated_or_malformed_binary_output_cannot_supply_readiness",
+            "mesh_contract::tests::version_suffixes_aliases_and_overflow_are_not_collapsed"
+          ],
+          "timeout_seconds": 180
+        }
+      ]
+    },
+    {
+      "id": "mesh-control",
+      "cargo_args": [
+        "--no-default-features",
+        "-p",
+        "allmystuff-mesh-control",
+        "--test",
+        "contract_compatibility",
+        "--test",
+        "session_lifecycle"
+      ],
+      "suites": [
+        {
+          "id": "mesh-control-contract-public",
+          "source": "crates/allmystuff-mesh-control/tests/contract_compatibility.rs",
+          "filter": "",
+          "tests": [
+            "absent_media_flag_is_not_inferred_from_lane_count",
+            "absent_realtime_is_not_inferred_from_legacy_media",
+            "bounded_status_line_keeps_the_next_ack_and_rejects_overflow",
+            "candidate_advert_preserves_h264_opus_and_disabled_evidence",
+            "common_device_and_network_fields_have_required_shapes",
+            "encoding_records_preserve_actual_widths_without_codec_policy",
+            "ipc::checked_legacy_request_uses_status_and_operation_on_one_connection",
+            "ipc::current_connection_guard_refuses_operation_after_a_previous_probe",
+            "ipc::diagnostic_status_sends_one_literal_request_on_either_selected_wire",
+            "ipc::explicit_candidate_generic_operation_refuses_before_transport",
+            "ipc::invalid_semantic_status_stays_answered_transport_evidence",
+            "ipc::malformed_and_closed_status_connections_are_unavailable",
+            "ipc::missing_owned_endpoint_is_absent",
+            "ipc::occupied_non_socket_path_is_unavailable",
+            "ipc::raw_candidate_and_unknown_status_are_answered_without_wire_selection",
+            "ipc::raw_legacy_status_retains_true_and_false_media_evidence",
+            "ipc::silent_occupied_status_endpoint_is_bounded_and_unavailable",
+            "present_media_flag_must_be_boolean_on_either_wire",
+            "realtime_advert_requires_boolean_supported_and_encoding_array",
+            "rejected_or_contradictory_envelopes_cannot_supply_status_evidence",
+            "released_status_preserves_exact_version_text_and_boolean_media",
+            "status_data_must_be_present_and_an_object",
+            "unknown_and_decorated_versions_are_evidence_without_wire_compatibility",
+            "version_must_be_present_and_a_string",
+            "wire_selection_rejects_cross_family_status_despite_lookalike_fields"
+          ],
+          "timeout_seconds": 180
+        },
+        {
+          "id": "mesh-control-session-lifecycle",
+          "source": "crates/allmystuff-mesh-control/tests/session_lifecycle.rs",
+          "filter": "",
+          "tests": [
+            "another_client_registration_refuses_before_write",
+            "cancelled_subscription_before_ack_closes_its_socket",
+            "candidate_ack_missing_empty_or_wrong_type_capability_refuses",
+            "candidate_ack_retains_secret_safe_owned_registration",
+            "candidate_channel_subscribe_carries_capability_and_routes_inbound",
+            "daemon_eof_closes_receiver_and_invalidates_registration",
+            "dropping_full_receiver_closes_owned_event_socket",
+            "dropping_idle_receiver_closes_owned_event_socket",
+            "dropping_idle_session_closes_socket_and_invalidates_registration",
+            "eof_before_ack_refuses_and_releases_event_sender",
+            "legacy_ack_retains_id_without_candidate_authority",
+            "legacy_channel_subscribe_omits_capability_and_routes_inbound",
+            "malformed_ack_errors_and_diagnostics_never_echo_capability",
+            "malformed_event_diagnostics_redact_secret_and_keep_valid_inbound",
+            "missing_or_invalid_client_id_refuses_both_contracts",
+            "reconnect_renews_generation_and_refuses_stale_before_write",
+            "refused_ack_errors_and_diagnostics_never_echo_remote_secret"
+          ],
+          "timeout_seconds": 180
         }
       ]
     },
