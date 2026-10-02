@@ -181,14 +181,14 @@ fn assert_secret_safe(text: &str) {
 }
 
 fn candidate_ack(id: &str, secret: &str) -> Value {
-    json!({"ok":true,"data":{"client_id":id,"client_capability":secret}})
+    json!({"ok":true,"data":{"subscribed":true,"client_id":id,"client_capability":secret}})
 }
 
 async fn accept_control(listener: &Listener, contract: EventContract) -> BufReader<LocalSocketStream> {
     let mut socket = BufReader::new(listener.accept().await.unwrap());
     if matches!(contract, EventContract::LegacyV0_3_21) {
         assert_eq!(read_request(&mut socket).await, json!({"op":"status"}));
-        write_json(socket.get_mut(), &json!({"ok":true,"data":{"version":"0.3.21"}})).await;
+        write_json(socket.get_mut(), &json!({"ok":true,"data":{"version":"0.3.21","device_id":"fixture-device","joined_networks":[],"media_pipes":true}})).await;
     }
     socket
 }
@@ -229,7 +229,7 @@ fn legacy_ack_retains_id_without_candidate_authority() {
         let endpoint = Endpoint::new();
         let listener = endpoint.bind();
         let server = tokio::spawn(async move {
-            let mut socket = accept_events(&listener, &json!({"ok":true,"data":{"client_id":"c7"}}), EventContract::LegacyV0_3_21).await;
+            let mut socket = accept_events(&listener, &json!({"ok":true,"data":{"subscribed":true,"client_id":"c7"}}), EventContract::LegacyV0_3_21).await;
             assert_eof(&mut socket).await;
         });
         let (tx, _rx) = mpsc::channel(1);
@@ -276,10 +276,10 @@ fn candidate_ack_missing_empty_or_wrong_type_capability_refuses() {
     check_refused_acks(
         EventContract::CandidateV1Db7818e,
         [
-            json!({"ok":true,"data":{"client_id":"c7"}}),
-            json!({"ok":true,"data":{"client_id":"c7","client_capability":""}}),
-            json!({"ok":true,"data":{"client_id":"c7","client_capability":null}}),
-            json!({"ok":true,"data":{"client_id":"c7","client_capability":7}}),
+            json!({"ok":true,"data":{"subscribed":true,"client_id":"c7"}}),
+            json!({"ok":true,"data":{"subscribed":true,"client_id":"c7","client_capability":""}}),
+            json!({"ok":true,"data":{"subscribed":true,"client_id":"c7","client_capability":null}}),
+            json!({"ok":true,"data":{"subscribed":true,"client_id":"c7","client_capability":7}}),
         ].into_iter().map(|ack| ack.to_string()).collect(),
     );
 }
@@ -292,9 +292,9 @@ fn missing_or_invalid_client_id_refuses_both_contracts() {
             [
                 json!({"ok":true}),
                 json!({"ok":true,"data":null}),
-                json!({"ok":true,"data":{"client_capability":SECRET_A}}),
-                json!({"ok":true,"data":{"client_id":"invalid","client_capability":SECRET_A}}),
-                json!({"ok":true,"data":{"client_id":7,"client_capability":SECRET_A}}),
+                json!({"ok":true,"data":{"subscribed":true,"client_capability":SECRET_A}}),
+                json!({"ok":true,"data":{"subscribed":true,"client_id":"invalid","client_capability":SECRET_A}}),
+                json!({"ok":true,"data":{"subscribed":true,"client_id":7,"client_capability":SECRET_A}}),
             ].into_iter().map(|ack| ack.to_string()).collect(),
         );
     }
@@ -308,7 +308,7 @@ fn malformed_ack_errors_and_diagnostics_never_echo_capability() {
             vec![
                 format!("not-json-{SECRET_A}"),
                 format!("{{\"ok\":true,\"data\":{{\"client_capability\":\"{SECRET_A}\"}}"),
-                json!({"ok":SECRET_A,"data":{"client_id":"c7","client_capability":SECRET_B}}).to_string(),
+                json!({"ok":SECRET_A,"data":{"subscribed":true,"client_id":"c7","client_capability":SECRET_B}}).to_string(),
             ],
         );
     }
@@ -319,7 +319,7 @@ fn refused_ack_errors_and_diagnostics_never_echo_remote_secret() {
     for contract in [EventContract::LegacyV0_3_21, EventContract::CandidateV1Db7818e] {
         check_refused_acks(
             contract,
-            vec![json!({"ok":false,"error":format!("refused-{SECRET_A}"),"data":{"client_id":"c7","client_capability":SECRET_B}}).to_string()],
+            vec![json!({"ok":false,"error":format!("refused-{SECRET_A}"),"data":{"subscribed":true,"client_id":"c7","client_capability":SECRET_B}}).to_string()],
         );
     }
 }
@@ -385,7 +385,7 @@ fn candidate_channel_subscribe_carries_capability_and_routes_inbound() {
 fn legacy_channel_subscribe_omits_capability_and_routes_inbound() {
     check_channel_round_trip(
         EventContract::LegacyV0_3_21,
-        json!({"ok":true,"data":{"client_id":"c7"}}),
+        json!({"ok":true,"data":{"subscribed":true,"client_id":"c7"}}),
         json!({"op":"channel_subscribe","client_id":"c7","network":"fixture-network","channel":"fixture-channel"}),
     );
 }
