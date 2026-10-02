@@ -1,0 +1,26 @@
+[package]
+name = "allmystuff-mesh-control"
+description = "Explicit local MyOwnMesh control transport and owned event sessions."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+allmystuff-protocol = { workspace = true }
+anyhow = "1"
+interprocess = { workspace = true }
+parking_lot = "0.12"
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+getrandom = "0.2"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
