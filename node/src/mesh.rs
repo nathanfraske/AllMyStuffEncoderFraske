@@ -27,7 +27,7 @@ use crate::UiSink;
 
 use allmystuff_graph::{Capability, Flow, Grant, MediaKind, NodeId, Person, PersonId, Route};
 use allmystuff_protocol::{
-    claim_code_network_id, format_claim_code, AppControl, ClientId, ControlMessage,
+    claim_code_network_id, format_claim_code, AppControl, ControlMessage,
     DriveRouteOffer, InventorySummary, KvmControl, NodeProfile, OwnedMember, OwnedRoster,
     OwnershipControl, Request, RoomMessage, RouteControl, ShareControl, SharedFileMeta,
     SiteControl, SiteService, TerminalSessionInfo, CHANNEL_CONTROL, CHANNEL_FILES_CANVAS,
@@ -47,8 +47,8 @@ use crate::canvas::{
 };
 use crate::clipboard::{ClipboardService, LocalClip};
 use crate::control_client::{
-    ControlClient, InboundVideoEvent, MediaPipe, MediaTrackPipe, MEDIA_AUDIO_QUEUE_CAPACITY,
-    MEDIA_VIDEO_QUEUE_CAPACITY,
+    ControlClient, EventRegistration, InboundVideoEvent, MediaPipe, MediaTrackPipe,
+    MEDIA_AUDIO_QUEUE_CAPACITY, MEDIA_VIDEO_QUEUE_CAPACITY,
 };
 use crate::drive_mount::DriveMounts;
 use crate::files::FilesPlane;
@@ -1739,7 +1739,7 @@ struct State {
     /// adverts — we answer with our state directly. This is what lets
     /// gossip be event-driven instead of a heartbeat.
     peer_boots: HashMap<String, u64>,
-    client_id: Option<ClientId>,
+    event_registration: Option<EventRegistration>,
     profile: Option<NodeProfile>,
 }
 
@@ -2026,7 +2026,7 @@ impl Mesh {
                 peer_features: HashMap::new(),
                 peer_links: HashMap::new(),
                 peer_boots: HashMap::new(),
-                client_id: None,
+                event_registration: None,
                 profile: None,
             }),
             ownership: Arc::new(Ownership::load()),
@@ -3213,10 +3213,10 @@ impl Mesh {
             let mut backoff = std::time::Duration::from_secs(1);
             loop {
                 let (tx, mut rx) = mpsc::channel::<Value>(512);
-                let client_id = match mesh.client.subscribe_events(tx).await {
-                    Ok(id) => {
+                let event_session = match mesh.client.subscribe_events(tx).await {
+                    Ok(session) => {
                         backoff = std::time::Duration::from_secs(1);
-                        id
+                        session
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -3228,10 +3228,32 @@ impl Mesh {
                         continue;
                     }
                 };
-                mesh.bring_up(client_id).await;
-                while let Some(value) = rx.recv().await {
-                    mesh.handle_value(value).await;
+                let registration = event_session.registration();
+                if let Err(error) = mesh.bring_up(&registration).await {
+                    tracing::warn!("mesh: session bring-up refused: {error}");
+                    mesh.emit_status("disconnected", Some(&error.to_string()));
+                    event_session.close().await;
+                } else {
+                    while let Some(value) = rx.recv().await {
+                        if mesh.client.validate_registration(&registration).is_err() {
+                            break;
+                        }
+                        mesh.handle_value(value).await;
+                    }
+                    // Hold the owning session for the entire event drain. EOF,
+                    // renewal or this close invalidates all registration clones.
+                    event_session.close().await;
                 }
+                {
+                    let mut state = mesh.state.lock();
+                    if state.event_registration.as_ref()
+                        .is_some_and(|current| current.generation() == registration.generation()) {
+                        state.event_registration = None;
+                    }
+                }
+                mesh.daemon_media_pipes.store(false, Ordering::SeqCst);
+                mesh.daemon_video.store(false, Ordering::SeqCst);
+                mesh.daemon_audio.store(false, Ordering::SeqCst);
                 // Stream ended: the daemon died or dropped the socket. Say
                 // so, then go re-subscribe — this loop *is* the retry.
                 tracing::warn!("mesh: daemon event stream ended — reconnecting");
@@ -3247,7 +3269,12 @@ impl Mesh {
     /// daemon restart nothing of the old session survives daemon-side, so
     /// everything is re-established, and peers re-learn us from the fresh
     /// presence broadcast.
-    async fn bring_up(self: &Arc<Self>, client_id: ClientId) {
+    async fn bring_up(self: &Arc<Self>, registration: &EventRegistration) -> anyhow::Result<()> {
+        // Readiness must precede claims/bootstrap/governance. An explicitly
+        // characterized candidate event adapter is never a partial V1 product.
+        self.client.validate_registration(registration)?;
+        let legacy = self.client.require_legacy_contract().await?;
+        self.client.validate_registration(registration)?;
         // Identity → our node id + presence profile. The label is the
         // user's optional override; `build_profile` falls back to the
         // hostname when it's unset.
@@ -3269,26 +3296,16 @@ impl Mesh {
 
         {
             let mut st = self.state.lock();
-            st.client_id = Some(client_id);
+            st.event_registration = Some(registration.clone());
             st.session = Some(Session::new(me.clone()));
             st.profile = Some(profile.clone());
             st.network = primary.clone();
             st.networks = networks.clone();
         }
 
-        // Probe the daemon's binary-media-pipe capability up front (the version
-        // pin can't gate it — the feature predates a release). This gates the
-        // inbound source pipe below and the outbound sends in
-        // `send_video_track`/`send_audio_track`. A daemon without it (an older
-        // build still on the socket) keeps streaming over the base64 path.
-        let media_pipes = self
-            .client
-            .request(&Request::Status)
-            .await
-            .ok()
-            .and_then(|r| r.data)
-            .and_then(|d| d.get("media_pipes").and_then(|v| v.as_bool()))
-            .unwrap_or(false);
+        // JSON fallback is a capability within the verified legacy contract;
+        // missing/incompatible Status cannot downgrade into product bring-up.
+        let media_pipes = legacy.media_pipes;
         self.daemon_media_pipes.store(media_pipes, Ordering::SeqCst);
 
         // Inbound media (H.264/Opus from peers) rides a dedicated binary pipe —
@@ -3310,7 +3327,7 @@ impl Mesh {
             });
             match self
                 .client
-                .subscribe_media_source(client_id, video_tx, audio_tx, video_framing)
+                .subscribe_media_source(registration, video_tx, audio_tx, video_framing)
                 .await
             {
                 Ok(()) => {
@@ -3407,7 +3424,7 @@ impl Mesh {
             // the primary only, a claim or route offer arriving on a shared
             // secondary network had no subscriber on the receiving side and
             // the daemon silently dropped it.
-            self.subscribe_channels(client_id, &networks).await;
+            self.subscribe_channels(registration, &networks).await;
             // Learn which network each *already-connected* peer lives on from the
             // daemon's peer list (their "approved" events fired before we
             // subscribed, so we'd otherwise only learn it once they send us a
@@ -3446,6 +3463,8 @@ impl Mesh {
         // hand — with nobody actually asking. A fresh node process starts
         // with both flags down, so this leaves the room.
         self.cec_sweep_stale_asking_room().await;
+        self.client.validate_registration(registration)?;
+        Ok(())
     }
 
     /// Sweep outbound route offers nobody has answered and expire them to
@@ -12673,8 +12692,9 @@ impl Mesh {
     /// on, not just the ones present at launch. Re-subscribing an existing
     /// channel is idempotent on the daemon.
     pub async fn sync_networks(self: &Arc<Self>) {
-        let client_id = { self.state.lock().client_id };
-        let Some(client_id) = client_id else { return };
+        let registration = { self.state.lock().event_registration.clone() };
+        let Some(registration) = registration else { return };
+        if self.client.validate_registration(&registration).is_err() { return; }
         let networks = self.fetch_networks().await;
         let primary = networks.first().cloned();
         {
@@ -12693,7 +12713,7 @@ impl Mesh {
         // the saved networks, exposed sites) is untouched (see
         // [`Mesh::prune_unjoined_peers`]).
         self.prune_unjoined_peers().await;
-        self.subscribe_channels(client_id, &networks).await;
+        self.subscribe_channels(&registration, &networks).await;
         // The joined set changed — re-learn each connected peer's network from
         // the daemon peer list so a peer reachable only on a newly-arrived or
         // re-enabled mesh (e.g. the fleet network) is addressed there, not the
@@ -12790,7 +12810,9 @@ impl Mesh {
     /// addressed to whichever network the *sender* last saw us on always has a
     /// subscriber here. (The fleet's `OwnedRoster` gossip channel is gone —
     /// membership is the closed network's signed roster now.)
-    async fn subscribe_channels(&self, client_id: ClientId, networks: &[String]) {
+    async fn subscribe_channels(&self, registration: &EventRegistration, networks: &[String]) {
+        if self.client.validate_registration(registration).is_err() { return; }
+        let client_id = registration.client_id();
         let channels = [
             CHANNEL_PRESENCE,
             CHANNEL_LOCAL_CLAIM_PRESENCE,
@@ -12827,11 +12849,7 @@ impl Mesh {
                     }
                     match self
                         .client
-                        .request(&Request::ChannelSubscribe {
-                            client_id,
-                            network: network.clone(),
-                            channel: channel.to_string(),
-                        })
+                        .subscribe_channel(registration, network, channel)
                         .await
                     {
                         Ok(resp) if resp.ok => {
@@ -12873,7 +12891,7 @@ impl Mesh {
             // degrades to MJPEG instead of a stream nobody can carry.
             match self
                 .client
-                .request(&Request::VideoSubscribe {
+                .request_for_registration(registration, &Request::VideoSubscribe {
                     client_id,
                     network: network.clone(),
                 })
@@ -12932,7 +12950,7 @@ impl Mesh {
             // op, and audio rides PCM frames over the media channel.
             match self
                 .client
-                .request(&Request::AudioSubscribe {
+                .request_for_registration(registration, &Request::AudioSubscribe {
                     client_id,
                     network: network.clone(),
                 })
