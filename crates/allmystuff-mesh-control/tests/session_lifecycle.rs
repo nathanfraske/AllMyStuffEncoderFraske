@@ -244,9 +244,10 @@ fn check_refused_acks(contract: EventContract, acks: Vec<String>) {
             let (tx, mut rx) = mpsc::channel(1);
             let client = endpoint.client();
             let result = client.subscribe_events_for_contract(contract, tx).await;
-            let error = result
-                .err()
-                .expect("invalid ACK must refuse the subscription");
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => panic!("invalid ACK must refuse the subscription"),
+            };
             assert_secret_safe(&format!("{error}\n{error:#}\n{error:?}"));
             assert!(
                 rx.recv().await.is_none(),

@@ -33,11 +33,7 @@ async fn status(client: &ControlClient, contract: EventContract) -> StatusEviden
     }
 }
 
-async fn channel(
-    client: &ControlClient,
-    registration: &EventRegistration,
-    network: &str,
-) {
+async fn channel(client: &ControlClient, registration: &EventRegistration, network: &str) {
     let response = client
         .subscribe_channel(registration, network, "isolated-session-check")
         .await
@@ -46,7 +42,10 @@ async fn channel(
         EventContract::LegacyV0_3_21 => {
             assert!(response.ok, "private legacy network subscription refused");
             assert_eq!(
-                response.data.as_ref().and_then(|data| data.get("subscribed")),
+                response
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("subscribed")),
                 Some(&Value::Bool(true))
             );
             let released = client
@@ -62,7 +61,10 @@ async fn channel(
                 .expect("release owned legacy channel");
             assert!(released.ok, "private legacy channel release refused");
             assert!(
-                released.data.as_ref().and_then(|data| data.get("unsubscribed"))
+                released
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("unsubscribed"))
                     == Some(&Value::Bool(true)),
                 "private legacy channel release must be acknowledged"
             );
@@ -89,11 +91,11 @@ fn isolated_daemon_sessions() {
     let owner = required("AMS_MESH_CONTROL_OWNER");
     let custody: Value =
         serde_json::from_slice(&std::fs::read(root.join("custody.json")).unwrap()).unwrap();
-    assert_eq!(custody.get("owner").and_then(Value::as_str), Some(owner.as_str()));
     assert_eq!(
-        custody.get("root").and_then(Value::as_str),
-        root.to_str()
+        custody.get("owner").and_then(Value::as_str),
+        Some(owner.as_str())
     );
+    assert_eq!(custody.get("root").and_then(Value::as_str), root.to_str());
     let contract = match required("AMS_MESH_CONTROL_CONTRACT").as_str() {
         "legacy" => EventContract::LegacyV0_3_21,
         "candidate" => EventContract::CandidateV1Db7818e,
@@ -135,19 +137,28 @@ fn isolated_daemon_sessions() {
                 }
 
                 let (tx_a, mut rx_a) = mpsc::channel(16);
-                let first = client.subscribe_events_for_contract(contract, tx_a).await.unwrap();
+                let first = client
+                    .subscribe_events_for_contract(contract, tx_a)
+                    .await
+                    .unwrap();
                 let old = first.registration();
                 assert!(old.is_active());
                 channel(&client, &old, &network).await;
 
                 let (tx_b, mut rx_b) = mpsc::channel(16);
-                let second = client.subscribe_events_for_contract(contract, tx_b).await.unwrap();
+                let second = client
+                    .subscribe_events_for_contract(contract, tx_b)
+                    .await
+                    .unwrap();
                 let current = second.registration();
                 assert_ne!(old.generation(), current.generation());
                 while rx_a.recv().await.is_some() {}
                 drop(first);
                 assert!(client.validate_registration(&old).is_err());
-                assert!(client.subscribe_channel(&old, &network, "stale-check").await.is_err());
+                assert!(client
+                    .subscribe_channel(&old, &network, "stale-check")
+                    .await
+                    .is_err());
                 assert!(current.is_active());
                 channel(&client, &current, &network).await;
                 second.close().await;
@@ -155,7 +166,10 @@ fn isolated_daemon_sessions() {
                 assert!(client.validate_registration(&current).is_err());
 
                 let (tx_c, mut rx_c) = mpsc::channel(16);
-                let before_restart = client.subscribe_events_for_contract(contract, tx_c).await.unwrap();
+                let before_restart = client
+                    .subscribe_events_for_contract(contract, tx_c)
+                    .await
+                    .unwrap();
                 let retired = before_restart.registration();
                 let ready_path = root.join("restart-ready");
                 let writing_path = root.join("restart-ready-writing");
@@ -179,35 +193,44 @@ fn isolated_daemon_sessions() {
                 let after_status = status(&client, contract).await;
                 assert_eq!(first_status.device_id, after_status.device_id);
                 let (tx_d, mut rx_d) = mpsc::channel(16);
-                let after_restart = client.subscribe_events_for_contract(contract, tx_d).await.unwrap();
+                let after_restart = client
+                    .subscribe_events_for_contract(contract, tx_d)
+                    .await
+                    .unwrap();
                 let renewed = after_restart.registration();
                 assert_ne!(retired.generation(), renewed.generation());
                 drop(before_restart);
                 assert!(renewed.is_active());
-                assert!(client.subscribe_channel(&retired, &network, "stale-check").await.is_err());
+                assert!(client
+                    .subscribe_channel(&retired, &network, "stale-check")
+                    .await
+                    .is_err());
                 channel(&client, &renewed, &network).await;
                 after_restart.close().await;
                 while rx_d.recv().await.is_some() {}
                 assert!(client.validate_registration(&renewed).is_err());
 
-                println!("MESH_CONTROL_ISOLATED {}", json!({
-                    "contract": match contract {
-                        EventContract::LegacyV0_3_21 => "legacy",
-                        EventContract::CandidateV1Db7818e => "candidate",
-                    },
-                    "sessions": 4,
-                    "channel_checks": 3,
-                    "channel_result": if contract == EventContract::LegacyV0_3_21 {
-                        "subscribed_and_released"
-                    } else {
-                        "authenticated_unknown_network_refusal"
-                    },
-                    "renewal": true,
-                    "owned_process_restart": true,
-                    "stable_private_identity": true,
-                    "stale_refusal": true,
-                    "awaited_local_close": true,
-                }));
+                println!(
+                    "MESH_CONTROL_ISOLATED {}",
+                    json!({
+                        "contract": match contract {
+                            EventContract::LegacyV0_3_21 => "legacy",
+                            EventContract::CandidateV1Db7818e => "candidate",
+                        },
+                        "sessions": 4,
+                        "channel_checks": 3,
+                        "channel_result": if contract == EventContract::LegacyV0_3_21 {
+                            "subscribed_and_released"
+                        } else {
+                            "authenticated_unknown_network_refusal"
+                        },
+                        "renewal": true,
+                        "owned_process_restart": true,
+                        "stable_private_identity": true,
+                        "stale_refusal": true,
+                        "awaited_local_close": true,
+                    })
+                );
             })
             .await
             .expect("isolated daemon lifecycle deadline");
