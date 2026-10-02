@@ -481,8 +481,7 @@ async fn ensure_daemon_current(bin: &Path, source: DaemonSource) -> Result<()> {
     let Err(reason) = assess_binary_version(&version) else {
         return Ok(());
     };
-    let pin_supports_current =
-        daemon_pin().is_some_and(|pin| assess_binary_version(pin).is_ok());
+    let pin_supports_current = daemon_pin().is_some_and(|pin| assess_binary_version(pin).is_ok());
     let older_release = matches!(reason, ContractRefusal::UnsupportedVersion(_))
         && parse_semverish(&version)
             .zip(parse_semverish(SUPPORTED_DAEMON_VERSION))
@@ -739,10 +738,14 @@ pub async fn ensure_daemon_running(client: &ControlClient) -> Result<Option<Daem
                     EndpointProbe::Absent => break,
                     EndpointProbe::Answered(ContractReadiness::ReadyLegacy(_)) => {}
                     EndpointProbe::Answered(ContractReadiness::Refused(reason)) => {
-                        return Err(anyhow!("MyOwnMesh endpoint refused during replacement: {reason}"));
+                        return Err(anyhow!(
+                            "MyOwnMesh endpoint refused during replacement: {reason}"
+                        ));
                     }
                     EndpointProbe::Unavailable(reason) => {
-                        return Err(anyhow!("MyOwnMesh endpoint unavailable during replacement: {reason}"));
+                        return Err(anyhow!(
+                            "MyOwnMesh endpoint unavailable during replacement: {reason}"
+                        ));
                     }
                 }
                 if std::time::Instant::now() >= deadline {
@@ -830,7 +833,9 @@ pub async fn ensure_daemon_running(client: &ControlClient) -> Result<Option<Daem
         match endpoint {
             EndpointProbe::Absent => {}
             EndpointProbe::Answered(ContractReadiness::ReadyLegacy(_)) => {
-                tracing::info!("MyOwnMesh daemon up with supported v{SUPPORTED_DAEMON_VERSION} contract");
+                tracing::info!(
+                    "MyOwnMesh daemon up with supported v{SUPPORTED_DAEMON_VERSION} contract"
+                );
                 return Ok(Some(handle));
             }
             EndpointProbe::Answered(ContractReadiness::Refused(reason)) => {
@@ -843,7 +848,9 @@ pub async fn ensure_daemon_running(client: &ControlClient) -> Result<Option<Daem
     }
     // Dropping this owned handle stops our unready child. An external daemon
     // never enters this ownership path.
-    Err(anyhow!("spawned MyOwnMesh daemon did not become ready within 8s"))
+    Err(anyhow!(
+        "spawned MyOwnMesh daemon did not become ready within 8s"
+    ))
 }
 
 #[cfg(test)]
