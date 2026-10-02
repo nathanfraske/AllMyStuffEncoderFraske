@@ -153,7 +153,13 @@ fn status_data_must_be_present_and_an_object() {
         },
         ContractRefusal::MissingStatusData,
     );
-    for data in [json!(null), json!(false), json!(7), json!("fixture"), json!([])] {
+    for data in [
+        json!(null),
+        json!(false),
+        json!(7),
+        json!("fixture"),
+        json!([]),
+    ] {
         assert_refusal(
             &Response::ok(data),
             ContractRefusal::MalformedStatus("data object"),
@@ -250,7 +256,12 @@ fn released_status_requires_device_and_network_field_shapes() {
         ),
         (
             "joined_networks",
-            vec![json!(null), json!("network"), json!(["network", 7]), json!({})],
+            vec![
+                json!(null),
+                json!("network"),
+                json!(["network", 7]),
+                json!({}),
+            ],
             "joined_networks field",
         ),
     ] {
@@ -424,7 +435,10 @@ mod endpoints {
         if bounded(reader.read_line(&mut line)).await.unwrap() == 0 {
             return None;
         }
-        assert!(line.len() <= 16 * 1024, "fixture request unexpectedly large");
+        assert!(
+            line.len() <= 16 * 1024,
+            "fixture request unexpectedly large"
+        );
         Some(serde_json::from_str(line.trim()).unwrap())
     }
 
@@ -463,9 +477,11 @@ mod endpoints {
                     while let Some(request) = read_request(&mut reader).await {
                         assert!(requests.len() < 4, "unexpected extra fixture requests");
                         requests.push(request);
-                        bounded(writer.write_all(b"{\"ok\":true,\"data\":{\"fixture_ack\":true}}\n"))
-                            .await
-                            .unwrap();
+                        bounded(
+                            writer.write_all(b"{\"ok\":true,\"data\":{\"fixture_ack\":true}}\n"),
+                        )
+                        .await
+                        .unwrap();
                         bounded(writer.flush()).await.unwrap();
                     }
                     connections.push(requests);
@@ -520,7 +536,10 @@ mod endpoints {
     async fn missing_owned_endpoint_is_absent_without_lifecycle_launch() {
         let endpoint = Endpoint::new();
         let client = endpoint.client();
-        assert_eq!(bounded(client.probe_contract()).await, EndpointProbe::Absent);
+        assert_eq!(
+            bounded(client.probe_contract()).await,
+            EndpointProbe::Absent
+        );
         assert!(!bounded(crate::daemon_spawn::probe(&client)).await);
         // Deliberately do not invoke ensure_daemon_running on an absent endpoint.
     }
@@ -556,7 +575,10 @@ mod endpoints {
         let mut invalid_media = released_status();
         set_field(&mut invalid_media, "media_pipes", json!("true"));
         for (status, refusal) in [
-            (candidate_status(true), ContractRefusal::CandidateNotMigrated),
+            (
+                candidate_status(true),
+                ContractRefusal::CandidateNotMigrated,
+            ),
             (
                 Response::err("fixture refusal"),
                 ContractRefusal::StatusRejected(Some("fixture refusal".into())),
@@ -570,7 +592,10 @@ mod endpoints {
                 ContractRefusal::MissingStatusData,
             ),
             (missing_version, ContractRefusal::MissingVersion),
-            (unknown, ContractRefusal::UnsupportedVersion("0.3.22".into())),
+            (
+                unknown,
+                ContractRefusal::UnsupportedVersion("0.3.22".into()),
+            ),
             (
                 invalid_media,
                 ContractRefusal::MalformedStatus("media_pipes field"),
@@ -597,7 +622,10 @@ mod endpoints {
         let candidate = candidate_status(true);
         let mut server = FakeDaemon::start(
             &endpoint,
-            vec![Reply::Status(candidate.clone()), Reply::Status(candidate.clone())],
+            vec![
+                Reply::Status(candidate.clone()),
+                Reply::Status(candidate.clone()),
+            ],
         );
         let client = endpoint.client();
         let response = bounded(client.request(&Request::Status)).await.unwrap();
@@ -691,13 +719,19 @@ mod endpoints {
             Reply::Status(missing_version),
             Reply::Status(malformed_version),
             Reply::Status(Response::err("fixture refusal")),
-            Reply::Status(Response { ok: true, error: None, data: None }),
+            Reply::Status(Response {
+                ok: true,
+                error: None,
+                data: None,
+            }),
             Reply::Raw(b"fixture-private-invalid-json\n"),
             Reply::Close,
         ] {
             let endpoint = Endpoint::new();
             let mut server = FakeDaemon::start(&endpoint, vec![reply]);
-            assert!(bounded(endpoint.client().request(&operation())).await.is_err());
+            assert!(bounded(endpoint.client().request(&operation()))
+                .await
+                .is_err());
             assert_eq!(server.finish().await, vec![status_only()]);
         }
     }
@@ -707,7 +741,10 @@ mod endpoints {
         let endpoint = Endpoint::new();
         let mut server = FakeDaemon::start(
             &endpoint,
-            vec![Reply::Status(released_status()), Reply::Status(candidate_status(true))],
+            vec![
+                Reply::Status(released_status()),
+                Reply::Status(candidate_status(true)),
+            ],
         );
         let client = endpoint.client();
         assert_eq!(
@@ -716,9 +753,11 @@ mod endpoints {
                 media_pipes: true,
             }))
         );
-        assert!(bounded(client.request_with_timeout(&operation(), Duration::from_secs(2)))
-            .await
-            .is_err());
+        assert!(
+            bounded(client.request_with_timeout(&operation(), Duration::from_secs(2)))
+                .await
+                .is_err()
+        );
         assert_eq!(server.finish().await, vec![status_only(), status_only()]);
     }
 
@@ -745,14 +784,20 @@ mod endpoints {
         // not forge a registration or negotiate another wire on its behalf.
         let raw_endpoint = Endpoint::new();
         let listener = raw_endpoint.bind();
-        let request = Request::MediaSourcePipe { client_id: "c1".parse().unwrap() };
-        let error = bounded(raw_endpoint.client().request(&request)).await.unwrap_err();
+        let request = Request::MediaSourcePipe {
+            client_id: "c1".parse().unwrap(),
+        };
+        let error = bounded(raw_endpoint.client().request(&request))
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains("owned event registration"));
         let mut accept = Box::pin(listener.accept());
-        let pending = std::future::poll_fn(|cx| {
-            std::task::Poll::Ready(accept.as_mut().poll(cx))
-        }).await;
-        assert!(pending.is_pending(), "a locally refused session operation must not connect");
+        let pending =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(accept.as_mut().poll(cx))).await;
+        assert!(
+            pending.is_pending(),
+            "a locally refused session operation must not connect"
+        );
     }
 
     #[tokio::test]
@@ -766,9 +811,11 @@ mod endpoints {
             let mut server = FakeDaemon::start(&endpoint, vec![reply]);
             // No absent/ready branch is selected; these return before any
             // installed binary lookup, orphan/pidfile inspection or spawning.
-            assert!(bounded(crate::daemon_spawn::ensure_daemon_running(&endpoint.client()))
-                .await
-                .is_err());
+            assert!(bounded(crate::daemon_spawn::ensure_daemon_running(
+                &endpoint.client()
+            ))
+            .await
+            .is_err());
             assert_eq!(server.finish().await, vec![status_only()]);
         }
     }
