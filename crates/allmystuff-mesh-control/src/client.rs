@@ -401,14 +401,20 @@ impl ControlClient {
                 let bytes = match line {
                     Ok(bytes) => bytes,
                     Err(_) => {
-                        tracing::debug!("daemon event stream ended or exceeded its adapter limit");
+                        tracing::debug!(
+                            target: "allmystuff_node::control_client",
+                            "daemon event stream ended or exceeded its adapter limit"
+                        );
                         break;
                     }
                 };
                 let mut value: serde_json::Value = match serde_json::from_slice(&bytes) {
                     Ok(value) => value,
                     Err(_) => {
-                        tracing::warn!("malformed daemon event JSON (payload omitted)");
+                        tracing::warn!(
+                            target: "allmystuff_node::control_client",
+                            "malformed daemon event JSON (payload omitted)"
+                        );
                         continue;
                     }
                 };
