@@ -6,6 +6,7 @@ members = [
     "crates/allmystuff-storage",
     "crates/allmystuff-video",
     "crates/allmystuff-node-client",
+    "crates/allmystuff-mesh-control",
     "crates/allmystuff-inventory-model",
     "crates/allmystuff-video-metadata",
     "crates/allmystuff-update-policy",
@@ -56,6 +57,7 @@ allmystuff-terminal = { path = "crates/allmystuff-terminal", version = "0.2.121"
 allmystuff-storage = { path = "crates/allmystuff-storage", version = "0.2.121" }
 allmystuff-video = { path = "crates/allmystuff-video", version = "0.2.121" }
 allmystuff-node-client = { path = "crates/allmystuff-node-client", version = "0.2.121" }
+allmystuff-mesh-control = { path = "crates/allmystuff-mesh-control", version = "0.2.121" }
 allmystuff-inventory-model = { path = "crates/allmystuff-inventory-model", version = "0.2.121" }
 allmystuff-video-metadata = { path = "crates/allmystuff-video-metadata", version = "0.2.121" }
 allmystuff-update-policy = { path = "crates/allmystuff-update-policy", version = "0.2.121" }

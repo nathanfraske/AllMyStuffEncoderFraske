@@ -109,6 +109,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "allmystuff-mesh-control"
+version = "0.2.121"
+dependencies = [
+ "allmystuff-protocol",
+ "anyhow",
+ "interprocess",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "allmystuff-node"
 version = "0.2.121"
 dependencies = [
@@ -119,6 +133,7 @@ dependencies = [
  "allmystuff-cec-protocol",
  "allmystuff-graph",
  "allmystuff-inventory",
+ "allmystuff-mesh-control",
  "allmystuff-node-client",
  "allmystuff-protocol",
  "allmystuff-session",
