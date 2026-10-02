@@ -26,18 +26,18 @@ use interprocess::local_socket::GenericNamespaced;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
+use crate::mesh_contract::{assess_status, EndpointProbe, LegacyStatus};
 use allmystuff_protocol::control::{
     decode_inbound_frame, encode_media_frame, InboundFrame, MAX_MEDIA_FRAME_BYTES,
     MEDIA_KIND_AUDIO, MEDIA_KIND_VIDEO, MEDIA_KIND_VIDEO_DISCONTINUITY,
 };
 pub use allmystuff_protocol::{Request, Response};
-use crate::mesh_contract::{assess_status, EndpointProbe, LegacyStatus};
 
 #[path = "control_client_session.rs"]
 mod event_session;
-pub use event_session::{ConnectionGeneration, EventRegistration, EventSession};
 pub(crate) use event_session::EventContract;
 use event_session::EventSessions;
+pub use event_session::{ConnectionGeneration, EventRegistration, EventSession};
 
 /// Where the daemon's control socket lives. Recomputed locally (via the
 /// protocol crate) so the GUI never has to link `myownmesh-core`.
@@ -224,8 +224,8 @@ impl ControlClient {
         #[cfg(not(unix))]
         {
             Ok(Self::from_address(SocketAddr::Name(
-                    allmystuff_protocol::control::default_pipe_name().to_string(),
-                )))
+                allmystuff_protocol::control::default_pipe_name().to_string(),
+            )))
         }
     }
 
@@ -240,7 +240,10 @@ impl ControlClient {
     }
 
     fn from_address(addr: SocketAddr) -> Self {
-        Self { addr, events: EventSessions::new() }
+        Self {
+            addr,
+            events: EventSessions::new(),
+        }
     }
 
     /// Test-owned endpoints only; fixtures never consult the process default.
@@ -257,7 +260,8 @@ impl ControlClient {
             Ok(stream) => stream,
             Err(error) => {
                 let missing = error.chain().any(|cause| {
-                    cause.downcast_ref::<std::io::Error>()
+                    cause
+                        .downcast_ref::<std::io::Error>()
                         .is_some_and(|cause| cause.kind() == std::io::ErrorKind::NotFound)
                 });
                 return if missing {
@@ -269,8 +273,15 @@ impl ControlClient {
         };
         let (reader, mut writer) = stream.split();
         let mut reader = BufReader::new(reader);
-        match Self::round_trip(&mut reader, &mut writer, "{\"op\":\"status\"}\n",
-            CONTROL_TIMEOUT, Some(STATUS_ACK_LIMIT)).await {
+        match Self::round_trip(
+            &mut reader,
+            &mut writer,
+            "{\"op\":\"status\"}\n",
+            CONTROL_TIMEOUT,
+            Some(STATUS_ACK_LIMIT),
+        )
+        .await
+        {
             Ok(response) => EndpointProbe::Answered(assess_status(&response)),
             Err(_) => EndpointProbe::Unavailable("daemon Status could not be read".into()),
         }
@@ -284,35 +295,71 @@ impl ControlClient {
         }
     }
 
-    async fn require_legacy_on_connection<R, W>(reader: &mut R, writer: &mut W) -> Result<LegacyStatus>
-    where R: tokio::io::AsyncBufRead + Unpin, W: tokio::io::AsyncWrite + Unpin {
-        let status = Self::round_trip(reader, writer, "{\"op\":\"status\"}\n",
-            CONTROL_TIMEOUT, Some(STATUS_ACK_LIMIT)).await?;
+    async fn require_legacy_on_connection<R, W>(
+        reader: &mut R,
+        writer: &mut W,
+    ) -> Result<LegacyStatus>
+    where
+        R: tokio::io::AsyncBufRead + Unpin,
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        let status = Self::round_trip(
+            reader,
+            writer,
+            "{\"op\":\"status\"}\n",
+            CONTROL_TIMEOUT,
+            Some(STATUS_ACK_LIMIT),
+        )
+        .await?;
         Ok(assess_status(&status).require_legacy()?)
     }
 
-    async fn round_trip<R, W>(reader: &mut R, writer: &mut W, line: &str,
-        read_timeout: Duration, limit: Option<usize>) -> Result<Response>
-    where R: tokio::io::AsyncBufRead + Unpin, W: tokio::io::AsyncWrite + Unpin {
+    async fn round_trip<R, W>(
+        reader: &mut R,
+        writer: &mut W,
+        line: &str,
+        read_timeout: Duration,
+        limit: Option<usize>,
+    ) -> Result<Response>
+    where
+        R: tokio::io::AsyncBufRead + Unpin,
+        W: tokio::io::AsyncWrite + Unpin,
+    {
         tokio::time::timeout(read_timeout, async {
-            writer.write_all(line.as_bytes()).await.context("write daemon request")?;
+            writer
+                .write_all(line.as_bytes())
+                .await
+                .context("write daemon request")?;
             writer.flush().await.context("flush daemon request")?;
             let bytes = Self::read_json_line(reader, limit).await?;
             // Never put remote JSON or deserializer values in diagnostics: ACKs
             // and even malformed response envelopes can contain capability C.
             serde_json::from_slice(&bytes).map_err(|_| anyhow!("invalid daemon response JSON"))
-        }).await.context("daemon request timed out")?
+        })
+        .await
+        .context("daemon request timed out")?
     }
 
     async fn read_json_line<R>(reader: &mut R, limit: Option<usize>) -> Result<Vec<u8>>
-    where R: tokio::io::AsyncBufRead + Unpin {
+    where
+        R: tokio::io::AsyncBufRead + Unpin,
+    {
         let mut bytes = Vec::new();
         let count = match limit {
-            Some(limit) => (&mut *reader).take(limit as u64 + 1).read_until(b'\n', &mut bytes).await?,
+            Some(limit) => {
+                (&mut *reader)
+                    .take(limit as u64 + 1)
+                    .read_until(b'\n', &mut bytes)
+                    .await?
+            }
             None => reader.read_until(b'\n', &mut bytes).await?,
         };
-        if count == 0 { bail!("daemon closed the connection without a response"); }
-        if limit.is_some_and(|limit| count > limit) { bail!("daemon JSON line exceeds the adapter limit"); }
+        if count == 0 {
+            bail!("daemon closed the connection without a response");
+        }
+        if limit.is_some_and(|limit| count > limit) {
+            bail!("daemon JSON line exceeds the adapter limit");
+        }
         Ok(bytes)
     }
 
@@ -343,9 +390,15 @@ impl ControlClient {
         self.request_inner(req, read_timeout, None).await
     }
 
-    async fn request_inner(&self, req: &Request, read_timeout: Duration,
-        registration: Option<&EventRegistration>) -> Result<Response> {
-        if let Some(registration) = registration { self.validate_registration(registration)?; }
+    async fn request_inner(
+        &self,
+        req: &Request,
+        read_timeout: Duration,
+        registration: Option<&EventRegistration>,
+    ) -> Result<Response> {
+        if let Some(registration) = registration {
+            self.validate_registration(registration)?;
+        }
         let stream = self.connect().await?;
         let (reader, mut writer) = stream.split();
         let mut reader = BufReader::new(reader);
@@ -354,10 +407,18 @@ impl ControlClient {
             // successful probe cannot authorize a different daemon connection.
             Self::require_legacy_on_connection(&mut reader, &mut writer).await?;
         }
-        if let Some(registration) = registration { self.validate_registration(registration)?; }
+        if let Some(registration) = registration {
+            self.validate_registration(registration)?;
+        }
         let line = serde_json::to_string(req)? + "\n";
-        Self::round_trip(&mut reader, &mut writer, &line, read_timeout,
-            matches!(req, Request::Status).then_some(STATUS_ACK_LIMIT)).await
+        Self::round_trip(
+            &mut reader,
+            &mut writer,
+            &line,
+            read_timeout,
+            matches!(req, Request::Status).then_some(STATUS_ACK_LIMIT),
+        )
+        .await
     }
 
     pub(crate) fn validate_registration(&self, registration: &EventRegistration) -> Result<()> {
@@ -366,35 +427,55 @@ impl ControlClient {
 
     fn request_client_id(req: &Request) -> Option<allmystuff_protocol::ClientId> {
         match req {
-            Request::ChannelSubscribe { client_id, .. } | Request::ChannelUnsubscribe { client_id, .. }
-            | Request::VideoSubscribe { client_id, .. } | Request::VideoUnsubscribe { client_id, .. }
-            | Request::AudioSubscribe { client_id, .. } | Request::AudioUnsubscribe { client_id, .. }
-            | Request::RpcRegister { client_id, .. } | Request::RpcUnregister { client_id, .. }
+            Request::ChannelSubscribe { client_id, .. }
+            | Request::ChannelUnsubscribe { client_id, .. }
+            | Request::VideoSubscribe { client_id, .. }
+            | Request::VideoUnsubscribe { client_id, .. }
+            | Request::AudioSubscribe { client_id, .. }
+            | Request::AudioUnsubscribe { client_id, .. }
+            | Request::RpcRegister { client_id, .. }
+            | Request::RpcUnregister { client_id, .. }
             | Request::MediaSourcePipe { client_id } => Some(*client_id),
             _ => None,
         }
     }
 
-    pub(crate) async fn request_for_registration(&self, registration: &EventRegistration,
-        req: &Request) -> Result<Response> {
+    pub(crate) async fn request_for_registration(
+        &self,
+        registration: &EventRegistration,
+        req: &Request,
+    ) -> Result<Response> {
         self.validate_registration(registration)?;
         if registration.contract() != EventContract::LegacyV0_3_21
-            || Self::request_client_id(req) != Some(registration.client_id()) {
+            || Self::request_client_id(req) != Some(registration.client_id())
+        {
             bail!("request is not part of this legacy event registration");
         }
-        self.request_inner(req, CONTROL_TIMEOUT, Some(registration)).await
+        self.request_inner(req, CONTROL_TIMEOUT, Some(registration))
+            .await
     }
 
     /// The only staged-candidate command implemented here. No generic V1
     /// request passthrough, governance, bootstrap, RPC or media is enabled.
-    pub(crate) async fn subscribe_channel(&self, registration: &EventRegistration,
-        network: &str, channel: &str) -> Result<Response> {
+    pub(crate) async fn subscribe_channel(
+        &self,
+        registration: &EventRegistration,
+        network: &str,
+        channel: &str,
+    ) -> Result<Response> {
         self.validate_registration(registration)?;
         match registration.contract() {
-            EventContract::LegacyV0_3_21 => self.request_for_registration(registration,
-                &Request::ChannelSubscribe {
-                    client_id: registration.client_id(), network: network.to_owned(), channel: channel.to_owned(),
-                }).await,
+            EventContract::LegacyV0_3_21 => {
+                self.request_for_registration(
+                    registration,
+                    &Request::ChannelSubscribe {
+                        client_id: registration.client_id(),
+                        network: network.to_owned(),
+                        channel: channel.to_owned(),
+                    },
+                )
+                .await
+            }
             EventContract::CandidateV1Db7818e => {
                 #[derive(serde::Serialize)]
                 struct ChannelSubscribe<'a> {
@@ -405,17 +486,27 @@ impl ControlClient {
                     channel: &'a str,
                 }
                 let request = ChannelSubscribe {
-                    op: "channel_subscribe", client_id: registration.client_id(),
-                    client_capability: registration.capability().ok_or_else(|| anyhow!("candidate registration has no client capability"))?,
-                    network, channel,
+                    op: "channel_subscribe",
+                    client_id: registration.client_id(),
+                    client_capability: registration.capability().ok_or_else(|| {
+                        anyhow!("candidate registration has no client capability")
+                    })?,
+                    network,
+                    channel,
                 };
                 let stream = self.connect().await?;
                 let (reader, mut writer) = stream.split();
                 let mut reader = BufReader::new(reader);
                 self.validate_registration(registration)?;
                 let line = serde_json::to_string(&request)? + "\n";
-                let mut response = Self::round_trip(&mut reader, &mut writer, &line,
-                    CONTROL_TIMEOUT, Some(STATUS_ACK_LIMIT)).await?;
+                let mut response = Self::round_trip(
+                    &mut reader,
+                    &mut writer,
+                    &line,
+                    CONTROL_TIMEOUT,
+                    Some(STATUS_ACK_LIMIT),
+                )
+                .await?;
                 registration.redact_response(&mut response);
                 Ok(response)
             }
@@ -428,11 +519,15 @@ impl ControlClient {
         &self,
         tx: mpsc::Sender<serde_json::Value>,
     ) -> Result<EventSession> {
-        self.subscribe_events_for_contract(EventContract::LegacyV0_3_21, tx).await
+        self.subscribe_events_for_contract(EventContract::LegacyV0_3_21, tx)
+            .await
     }
 
-    pub(crate) async fn subscribe_events_for_contract(&self, contract: EventContract,
-        tx: mpsc::Sender<serde_json::Value>) -> Result<EventSession> {
+    pub(crate) async fn subscribe_events_for_contract(
+        &self,
+        contract: EventContract,
+        tx: mpsc::Sender<serde_json::Value>,
+    ) -> Result<EventSession> {
         let _renewal = self.events.subscribe.lock().await;
         let generation = self.events.begin();
         let stream = self.connect().await?;
@@ -441,8 +536,14 @@ impl ControlClient {
         if contract == EventContract::LegacyV0_3_21 {
             Self::require_legacy_on_connection(&mut reader, &mut writer).await?;
         }
-        let ack = Self::round_trip(&mut reader, &mut writer, "{\"op\":\"events_subscribe\"}\n",
-            CONTROL_TIMEOUT, Some(STATUS_ACK_LIMIT)).await?;
+        let ack = Self::round_trip(
+            &mut reader,
+            &mut writer,
+            "{\"op\":\"events_subscribe\"}\n",
+            CONTROL_TIMEOUT,
+            Some(STATUS_ACK_LIMIT),
+        )
+        .await?;
         let registration = self.events.install(contract, generation, ack)?;
         let reader_registration = registration.clone();
         // Construct outside the future so even an unpolled cancelled task
@@ -473,7 +574,9 @@ impl ControlClient {
                     }
                 };
                 if contract == EventContract::CandidateV1Db7818e {
-                    let Some(channel) = Self::candidate_channel_inbound(value) else { continue };
+                    let Some(channel) = Self::candidate_channel_inbound(value) else {
+                        continue;
+                    };
                     value = channel;
                     reader_registration.redact_value(&mut value);
                 }
@@ -488,7 +591,9 @@ impl ControlClient {
     fn candidate_channel_inbound(value: serde_json::Value) -> Option<serde_json::Value> {
         // PR135/db7818e ipc/wire.rs ChannelInbound: these are arrival network
         // and authenticated sender evidence, not application authorization.
-        if value.get("kind")?.as_str()? != "channel_inbound" { return None; }
+        if value.get("kind")?.as_str()? != "channel_inbound" {
+            return None;
+        }
         Some(serde_json::json!({
             "kind": "channel_inbound",
             "network": value.get("network")?.as_str()?,
@@ -528,8 +633,14 @@ impl ControlClient {
         self.validate_registration(registration)?;
         let client_id = registration.client_id();
         let line = serde_json::to_string(&Request::MediaSourcePipe { client_id })? + "\n";
-        let parsed = Self::round_trip(&mut reader, &mut writer, &line,
-            CONTROL_TIMEOUT, Some(STATUS_ACK_LIMIT)).await?;
+        let parsed = Self::round_trip(
+            &mut reader,
+            &mut writer,
+            &line,
+            CONTROL_TIMEOUT,
+            Some(STATUS_ACK_LIMIT),
+        )
+        .await?;
         if !parsed.ok {
             return Err(anyhow!(
                 "media-source rejected: {}",

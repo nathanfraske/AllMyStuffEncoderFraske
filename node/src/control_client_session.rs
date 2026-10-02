@@ -5,8 +5,8 @@ use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 
-use anyhow::{anyhow, bail, Result};
 use allmystuff_protocol::{ClientId, Response};
+use anyhow::{anyhow, bail, Result};
 use parking_lot::Mutex;
 use serde_json::Value;
 use tokio::task::{AbortHandle, JoinHandle};
@@ -63,7 +63,10 @@ impl EventSessions {
         }
         slot.current = Weak::new();
         slot.generation = ConnectionGeneration(
-            slot.generation.0.checked_add(1).expect("event generation exhausted"),
+            slot.generation
+                .0
+                .checked_add(1)
+                .expect("event generation exhausted"),
         );
         slot.generation
     }
@@ -78,11 +81,17 @@ impl EventSessions {
         if !ack.ok || ack.error.is_some() {
             bail!("daemon rejected event subscription");
         }
-        let data = ack.data.as_ref().and_then(Value::as_object)
+        let data = ack
+            .data
+            .as_ref()
+            .and_then(Value::as_object)
             .ok_or_else(|| anyhow!("event subscription ack has no data object"))?;
-        let id_text = data.get("client_id").and_then(Value::as_str)
+        let id_text = data
+            .get("client_id")
+            .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("event subscription ack has no client_id"))?;
-        let client_id: ClientId = id_text.parse()
+        let client_id: ClientId = id_text
+            .parse()
             .map_err(|_| anyhow!("event subscription ack has an invalid client_id"))?;
         let capability = match contract {
             EventContract::LegacyV0_3_21 => None,
@@ -93,9 +102,13 @@ impl EventSessions {
                 if data.get("subscribed").and_then(Value::as_bool) != Some(true) {
                     bail!("candidate event subscription ack is not subscribed");
                 }
-                let value = data.get("client_capability").and_then(Value::as_str)
+                let value = data
+                    .get("client_capability")
+                    .and_then(Value::as_str)
                     .filter(|secret| !secret.is_empty())
-                    .ok_or_else(|| anyhow!("candidate event subscription ack has no client capability"))?;
+                    .ok_or_else(|| {
+                        anyhow!("candidate event subscription ack has no client capability")
+                    })?;
                 Some(ClientCapability(value.to_owned()))
             }
         };
@@ -162,22 +175,38 @@ impl fmt::Debug for EventRegistration {
 }
 
 impl EventRegistration {
-    pub fn client_id(&self) -> ClientId { self.state.client_id }
-    pub fn generation(&self) -> ConnectionGeneration { self.state.generation }
-    pub fn is_active(&self) -> bool { self.state.active.load(Ordering::Acquire) }
-    pub(super) fn contract(&self) -> EventContract { self.state.contract }
+    pub fn client_id(&self) -> ClientId {
+        self.state.client_id
+    }
+    pub fn generation(&self) -> ConnectionGeneration {
+        self.state.generation
+    }
+    pub fn is_active(&self) -> bool {
+        self.state.active.load(Ordering::Acquire)
+    }
+    pub(super) fn contract(&self) -> EventContract {
+        self.state.contract
+    }
     pub(super) fn capability(&self) -> Option<&str> {
-        self.state.capability.as_ref().map(|secret| secret.0.as_str())
+        self.state
+            .capability
+            .as_ref()
+            .map(|secret| secret.0.as_str())
     }
 
     pub(super) fn require_current(&self, owner: &Arc<EventSessions>) -> Result<()> {
-        let registered_owner = self.state.owner.upgrade()
+        let registered_owner = self
+            .state
+            .owner
+            .upgrade()
             .ok_or_else(|| anyhow!("event registration owner has ended"))?;
         if !Arc::ptr_eq(owner, &registered_owner) || !self.is_active() {
             bail!("event registration is stale or belongs to another client");
         }
         let slot = owner.slot.lock();
-        let matches = slot.current.upgrade()
+        let matches = slot
+            .current
+            .upgrade()
             .is_some_and(|current| Arc::ptr_eq(&current, &self.state));
         if slot.generation != self.generation() || !matches || !self.is_active() {
             bail!("event registration is stale or belongs to another client");
@@ -185,11 +214,17 @@ impl EventRegistration {
         Ok(())
     }
 
-    pub(super) fn invalidate(&self) { self.state.invalidate(); }
+    pub(super) fn invalidate(&self) {
+        self.state.invalidate();
+    }
 
     pub(super) fn own_reader(&self, reader: AbortHandle) {
         let mut readers = self.state.readers.lock();
-        if self.is_active() { readers.push(reader); } else { reader.abort(); }
+        if self.is_active() {
+            readers.push(reader);
+        } else {
+            reader.abort();
+        }
     }
 
     pub(super) fn reader_lifetime(&self) -> ReaderLifetime {
@@ -197,7 +232,9 @@ impl EventRegistration {
     }
 
     pub(super) fn redact_value(&self, value: &mut Value) {
-        let Some(secret) = self.capability() else { return };
+        let Some(secret) = self.capability() else {
+            return;
+        };
         redact_value(value, secret);
     }
 
@@ -206,7 +243,9 @@ impl EventRegistration {
             if let Some(error) = response.error.as_mut() {
                 *error = error.replace(secret, "[redacted]");
             }
-            if let Some(data) = response.data.as_mut() { redact_value(data, secret); }
+            if let Some(data) = response.data.as_mut() {
+                redact_value(data, secret);
+            }
         }
     }
 }
@@ -215,7 +254,9 @@ fn redact_value(value: &mut Value, secret: &str) {
     match value {
         Value::String(text) => *text = text.replace(secret, "[redacted]"),
         Value::Array(values) => {
-            for value in values { redact_value(value, secret); }
+            for value in values {
+                redact_value(value, secret);
+            }
         }
         Value::Object(values) => {
             let original = std::mem::take(values);
@@ -231,7 +272,9 @@ fn redact_value(value: &mut Value, secret: &str) {
 pub(super) struct ReaderLifetime(EventRegistration);
 
 impl Drop for ReaderLifetime {
-    fn drop(&mut self) { self.0.invalidate(); }
+    fn drop(&mut self) {
+        self.0.invalidate();
+    }
 }
 
 /// Owns the event reader task and both socket halves. There is no detached
@@ -253,20 +296,29 @@ impl fmt::Debug for EventSession {
 impl EventSession {
     pub(super) fn new(registration: EventRegistration, reader: JoinHandle<()>) -> Self {
         registration.own_reader(reader.abort_handle());
-        Self { registration, reader: Some(reader) }
+        Self {
+            registration,
+            reader: Some(reader),
+        }
     }
 
-    pub fn registration(&self) -> EventRegistration { self.registration.clone() }
+    pub fn registration(&self) -> EventRegistration {
+        self.registration.clone()
+    }
 
     pub async fn close(mut self) {
         self.registration.invalidate();
-        if let Some(reader) = self.reader.take() { let _ = reader.await; }
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.await;
+        }
     }
 }
 
 impl Drop for EventSession {
     fn drop(&mut self) {
         self.registration.invalidate();
-        if let Some(reader) = self.reader.take() { reader.abort(); }
+        if let Some(reader) = self.reader.take() {
+            reader.abort();
+        }
     }
 }

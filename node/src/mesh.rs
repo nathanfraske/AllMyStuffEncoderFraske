@@ -27,12 +27,12 @@ use crate::UiSink;
 
 use allmystuff_graph::{Capability, Flow, Grant, MediaKind, NodeId, Person, PersonId, Route};
 use allmystuff_protocol::{
-    claim_code_network_id, format_claim_code, AppControl, ControlMessage,
-    DriveRouteOffer, InventorySummary, KvmControl, NodeProfile, OwnedMember, OwnedRoster,
-    OwnershipControl, Request, RoomMessage, RouteControl, ShareControl, SharedFileMeta,
-    SiteControl, SiteService, TerminalSessionInfo, CHANNEL_CONTROL, CHANNEL_FILES_CANVAS,
-    CHANNEL_FLEETFILES, CHANNEL_FLEET_STORAGE, CHANNEL_MEDIA, CHANNEL_PRESENCE, CHANNEL_ROOMS,
-    LOCAL_CLAIM_NETWORK_ID, PROTOCOL_VERSION,
+    claim_code_network_id, format_claim_code, AppControl, ControlMessage, DriveRouteOffer,
+    InventorySummary, KvmControl, NodeProfile, OwnedMember, OwnedRoster, OwnershipControl, Request,
+    RoomMessage, RouteControl, ShareControl, SharedFileMeta, SiteControl, SiteService,
+    TerminalSessionInfo, CHANNEL_CONTROL, CHANNEL_FILES_CANVAS, CHANNEL_FLEETFILES,
+    CHANNEL_FLEET_STORAGE, CHANNEL_MEDIA, CHANNEL_PRESENCE, CHANNEL_ROOMS, LOCAL_CLAIM_NETWORK_ID,
+    PROTOCOL_VERSION,
 };
 use allmystuff_session::{
     AudioFrame, ClipboardContentKind, ClipboardEvent, ClipboardFrame, ClipboardItem, Effect,
@@ -3246,8 +3246,11 @@ impl Mesh {
                 }
                 {
                     let mut state = mesh.state.lock();
-                    if state.event_registration.as_ref()
-                        .is_some_and(|current| current.generation() == registration.generation()) {
+                    if state
+                        .event_registration
+                        .as_ref()
+                        .is_some_and(|current| current.generation() == registration.generation())
+                    {
                         state.event_registration = None;
                     }
                 }
@@ -12693,8 +12696,12 @@ impl Mesh {
     /// channel is idempotent on the daemon.
     pub async fn sync_networks(self: &Arc<Self>) {
         let registration = { self.state.lock().event_registration.clone() };
-        let Some(registration) = registration else { return };
-        if self.client.validate_registration(&registration).is_err() { return; }
+        let Some(registration) = registration else {
+            return;
+        };
+        if self.client.validate_registration(&registration).is_err() {
+            return;
+        }
         let networks = self.fetch_networks().await;
         let primary = networks.first().cloned();
         {
@@ -12811,7 +12818,9 @@ impl Mesh {
     /// subscriber here. (The fleet's `OwnedRoster` gossip channel is gone —
     /// membership is the closed network's signed roster now.)
     async fn subscribe_channels(&self, registration: &EventRegistration, networks: &[String]) {
-        if self.client.validate_registration(registration).is_err() { return; }
+        if self.client.validate_registration(registration).is_err() {
+            return;
+        }
         let client_id = registration.client_id();
         let channels = [
             CHANNEL_PRESENCE,
@@ -12891,10 +12900,13 @@ impl Mesh {
             // degrades to MJPEG instead of a stream nobody can carry.
             match self
                 .client
-                .request_for_registration(registration, &Request::VideoSubscribe {
-                    client_id,
-                    network: network.clone(),
-                })
+                .request_for_registration(
+                    registration,
+                    &Request::VideoSubscribe {
+                        client_id,
+                        network: network.clone(),
+                    },
+                )
                 .await
             {
                 Ok(resp) if resp.ok => {
@@ -12950,10 +12962,13 @@ impl Mesh {
             // op, and audio rides PCM frames over the media channel.
             match self
                 .client
-                .request_for_registration(registration, &Request::AudioSubscribe {
-                    client_id,
-                    network: network.clone(),
-                })
+                .request_for_registration(
+                    registration,
+                    &Request::AudioSubscribe {
+                        client_id,
+                        network: network.clone(),
+                    },
+                )
                 .await
             {
                 Ok(resp) if resp.ok => {
