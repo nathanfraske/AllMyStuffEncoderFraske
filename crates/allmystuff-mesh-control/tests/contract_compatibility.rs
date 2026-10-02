@@ -219,7 +219,10 @@ fn rejected_or_contradictory_envelopes_cannot_supply_status_evidence() {
             EventContract::LegacyV0_3_21,
             EventContract::CandidateV1Db7818e,
         ] {
-            assert_eq!(verify_wire_status(&response, selected), Err(expected.clone()));
+            assert_eq!(
+                verify_wire_status(&response, selected),
+                Err(expected.clone())
+            );
         }
     }
     let mut response = released_status();
@@ -586,7 +589,10 @@ mod ipc {
         if bounded(reader.read_line(&mut line)).await.unwrap() == 0 {
             return None;
         }
-        assert!(line.len() <= 16 * 1024, "fixture request unexpectedly large");
+        assert!(
+            line.len() <= 16 * 1024,
+            "fixture request unexpectedly large"
+        );
         assert!(line.ends_with('\n'), "fixture request must be line framed");
         let value = serde_json::from_str(line.trim()).unwrap();
         Some((line, value))
@@ -803,10 +809,11 @@ mod ipc {
         // Session/capability fixtures use only real owned registrations in the
         // separate session_lifecycle suite; none is fabricated here.
         let endpoint = OwnedEndpoint::new();
-        let error = bounded(endpoint.client().request(
-            EventContract::CandidateV1Db7818e,
-            &operation(),
-        ))
+        let error = bounded(
+            endpoint
+                .client()
+                .request(EventContract::CandidateV1Db7818e, &operation()),
+        )
         .await
         .unwrap_err();
         assert!(error.to_string().contains("candidate request"));
