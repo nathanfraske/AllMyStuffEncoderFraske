@@ -13,11 +13,11 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
 use crate::mesh_contract::{assess_status, EndpointProbe, LegacyStatus};
-pub(crate) use allmystuff_mesh_control::Endpoint as SocketAddr;
 use allmystuff_mesh_control::transport::round_trip;
+pub(crate) use allmystuff_mesh_control::Endpoint as SocketAddr;
 pub(crate) use allmystuff_mesh_control::EventContract;
-use allmystuff_mesh_control::{StatusProbe, CONTROL_TIMEOUT, STATUS_ACK_LIMIT};
 pub use allmystuff_mesh_control::{ConnectionGeneration, EventRegistration, EventSession};
+use allmystuff_mesh_control::{StatusProbe, CONTROL_TIMEOUT, STATUS_ACK_LIMIT};
 use allmystuff_protocol::control::{
     decode_inbound_frame, encode_media_frame, InboundFrame, MAX_MEDIA_FRAME_BYTES,
     MEDIA_KIND_AUDIO, MEDIA_KIND_VIDEO, MEDIA_KIND_VIDEO_DISCONTINUITY,
