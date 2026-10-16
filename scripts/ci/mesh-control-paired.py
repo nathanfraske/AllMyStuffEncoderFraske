@@ -7,6 +7,7 @@ daemon. Complete child streams and a separate cleanup receipt are retained.
 """
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
@@ -25,6 +26,37 @@ def support():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module, path
+
+
+def candidate_receipt(args, features):
+    path = args.daemon_build_receipt
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("regular explicit build receipt required")
+    data = path.read_bytes()
+    receipt_sha = hashlib.sha256(data).hexdigest()
+    if args.daemon_build_receipt_sha256 is not None:
+        if (not re.fullmatch(r"[0-9a-f]{64}", args.daemon_build_receipt_sha256)
+                or receipt_sha != args.daemon_build_receipt_sha256):
+            raise ValueError("selected build receipt SHA256 differs")
+    build = json.loads(data)
+    if args.candidate_kind == "stock":
+        if (not isinstance(build, dict)
+                or build.get("source_commit") != "db7818e09fedd98899490347b86ac9bc9f97b59b"
+                or build.get("source_kind") not in (None, "stock")
+                or build.get("sha256") != args.daemon_sha256.lower()
+                or build.get("features") != features or build.get("default_features") is not False):
+            raise ValueError("exact stock candidate build/feature/SHA mapping required")
+    else:
+        if args.daemon_build_receipt_sha256 is None:
+            raise ValueError("patched candidate requires an explicitly pinned build receipt")
+        helper_path = Path(__file__).with_name("myownmesh-corrections") / "prepare-candidate.py"
+        spec = importlib.util.spec_from_file_location("mesh_corrected_candidate_identity", helper_path)
+        helper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(helper)
+        helper.validate_build_receipt(build, args.daemon_sha256.lower(), features, args.candidate_kind)
+        if args.daemon.stat().st_size != build["bytes"]:
+            raise ValueError("selected artifact byte length differs")
+    return build, receipt_sha
 
 
 def positive(value, name, maximum=(1 << 64) - 1):
@@ -196,6 +228,8 @@ def main():
     parser.add_argument("--daemon", type=Path, required=True)
     parser.add_argument("--daemon-sha256", required=True)
     parser.add_argument("--daemon-build-receipt", type=Path, required=True)
+    parser.add_argument("--daemon-build-receipt-sha256")
+    parser.add_argument("--candidate-kind", choices=("stock", "diagnostic", "corrected"), default="stock")
     parser.add_argument("--probe", type=Path, required=True)
     parser.add_argument("--probe-sha256", required=True)
     parser.add_argument("--probe-kind", choices=("transport", "consumer"), required=True)
@@ -213,12 +247,8 @@ def main():
         parser.error("exact reviewed application commit required")
     if not 1024 <= args.signaling_port <= 65535:
         parser.error("choose an explicit unprivileged signaling port; collisions fail without retry")
-    build = json.loads(args.daemon_build_receipt.read_text())
     selected_features = ["transport-lab"] if args.mode == "relay-lab" else []
-    if (build.get("source_commit") != "db7818e09fedd98899490347b86ac9bc9f97b59b"
-            or build.get("sha256") != args.daemon_sha256.lower()
-            or build.get("features") != selected_features or build.get("default_features") is not False):
-        parser.error("exact candidate build receipt/selected feature/SHA mapping required")
+    build, build_receipt_sha = candidate_receipt(args, selected_features)
     relay = None
     if args.mode == "relay-lab":
         if args.relay_policy is None:
@@ -253,7 +283,11 @@ def main():
     started = time.monotonic()
     receipt = {
         "app_commit_input": args.app_commit, "daemon_build_receipt": build,
-        "daemon_build_receipt_sha256": owned.digest(args.daemon_build_receipt),
+        "candidate_kind": args.candidate_kind,
+        "candidate_qualification": "diagnostic_only" if args.candidate_kind == "diagnostic" else args.candidate_kind,
+        "diagnostic_log_profile": {"MYOWNMESH_LOG": "warn,mesh_first_unit=debug", "MYOWNMESH_LOG_FORMAT": "json"}
+        if args.candidate_kind == "diagnostic" else None,
+        "daemon_build_receipt_sha256": build_receipt_sha,
         "probe_sha256": args.probe_sha256, "probe_kind": args.probe_kind,
         "mode": args.mode, "native_uname": platform.uname()._asdict(),
         "relay_test_policy": relay,
@@ -305,6 +339,9 @@ def main():
                        MYOWNMESH_CONNECTOR_REALTIME_POLICY="enabled",
                        MYOWNMESH_REALTIME_PROFILE=json.dumps(policy["profile"]),
                        MYOWNMESH_IPC_REALTIME_FRAME_BYTES=str(policy["ipc_frame_bytes"]))
+            if args.candidate_kind == "diagnostic":
+                env["MYOWNMESH_LOG"] = "warn,mesh_first_unit=debug"
+                env["MYOWNMESH_LOG_FORMAT"] = "json"
             if relay:
                 env["MYOWNMESH_TRANSPORT_LAB_ICE_POLICY"] = "relay"
             environments[side] = env
