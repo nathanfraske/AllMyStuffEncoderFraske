@@ -1,0 +1,17 @@
+{
+  "schema": "myownmesh-corrections-patch-set-v1",
+  "kind": "diagnostic",
+  "base_commit": "db7818e09fedd98899490347b86ac9bc9f97b59b",
+  "base_tree": "5492d1845e15dbc067acec3ec592bb9500b9e21d",
+  "expected_tree": "64ee11db1c038ca58191c3369b132a779c7f2ce4",
+  "cargo_lock_sha256": "8f5a30ce863c43b0a8c5225f74d7446aed7656cd7032f47e70030526381930c6",
+  "patches": [
+    {
+      "path": "startup-diagnostic.patch",
+      "sha256": "69c46e1dacd6cd47dfbbf408c0812b66f667841028017089a3dcea2b26b88ff7",
+      "purpose": "diagnostic",
+      "tree_before": "5492d1845e15dbc067acec3ec592bb9500b9e21d",
+      "tree_after": "64ee11db1c038ca58191c3369b132a779c7f2ce4"
+    }
+  ]
+}

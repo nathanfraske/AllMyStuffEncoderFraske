@@ -1,0 +1,248 @@
+diff --git a/crates/myownmesh-core/src/transport/webrtc/inbound.rs b/crates/myownmesh-core/src/transport/webrtc/inbound.rs
+index 92e14612345eddf82a9dba1a21c8a23700c13ce2..267e8428a722c98cad6632ec05243c98c1ce843e 100644
+--- a/crates/myownmesh-core/src/transport/webrtc/inbound.rs
++++ b/crates/myownmesh-core/src/transport/webrtc/inbound.rs
+@@ -15,6 +15,7 @@
+ //! nor how it is reassembled.
+ 
+ use super::*;
++use sha2::{Digest, Sha256};
+ 
+ /// Exact ownership retained by one session-flow inbound track pump.
+ pub(super) struct SessionInboundTrackOwner {
+@@ -88,6 +89,7 @@ pub(super) async fn pump_session_flow_track(
+     // wake that lands between two turns is still there on the next poll.
+     let ended = end.notify().notified();
+     tokio::pin!(ended);
++    let mut diagnostic_packets = 0usize;
+     loop {
+         // Upgraded per packet and held across nothing that awaits. This is the
+         // close check as well as the accounting route: a closed flow answers
+@@ -111,6 +113,17 @@ pub(super) async fn pump_session_flow_track(
+                 Err(_) => break, // track ended with its connection
+             },
+         };
++        let diagnostic_ordinal = diagnostic_packets;
++        diagnostic_packets = diagnostic_packets.saturating_add(1);
++        let diagnostic = diagnostic_ordinal < 4
++            && tracing::enabled!(target: "mesh_first_unit", tracing::Level::DEBUG);
++        if diagnostic {
++            tracing::debug!(target: "mesh_first_unit", stage = "track_read_rtp",
++                ordinal = diagnostic_ordinal, bytes = pkt.payload.len(),
++                sha256 = %format!("{:x}", Sha256::digest(&pkt.payload)),
++                timestamp = pkt.header.timestamp, sequence = pkt.header.sequence_number,
++                "MESH04_FIRST_UNIT");
++        }
+         let Some(flow) = port.port() else {
+             break;
+         };
+@@ -177,7 +190,12 @@ pub(super) async fn pump_session_flow_track(
+         // does. Both are the same shared record, so this is a refcount rather
+         // than a second name.
+         let delivery = RealtimeInboundDelivery::new(label.clone(), unit);
+-        if !tx.emit_realtime(&flow, TransportEvent::RealtimeUnit(delivery), output) {
++        let emitted = tx.emit_realtime(&flow, TransportEvent::RealtimeUnit(delivery), output);
++        if diagnostic {
++            tracing::debug!(target: "mesh_first_unit", stage = "core_emit_realtime",
++                ordinal = diagnostic_ordinal, accepted = emitted, "MESH04_FIRST_UNIT");
++        }
++        if !emitted {
+             break;
+         }
+     }
+diff --git a/crates/myownmesh/src/control/realtime_pipe.rs b/crates/myownmesh/src/control/realtime_pipe.rs
+index 2119e784e1a8c2b7d2ef720610b5bae4a68f2ce3..a7d02cfb48678641d8dcf7a857181a92fbc30250 100644
+--- a/crates/myownmesh/src/control/realtime_pipe.rs
++++ b/crates/myownmesh/src/control/realtime_pipe.rs
+@@ -217,6 +217,7 @@ where
+ {
+     use tokio::io::AsyncReadExt as _;
+ 
++    let mut diagnostic_units = 0usize;
+     loop {
+         let mut len_buf = [0u8; 4];
+         // A clean EOF (the client closed the pipe) ends the loop; a short read
+@@ -274,6 +275,7 @@ where
+             duration: std::time::Duration::from_micros(u64::from(duration_us)),
+             data: body.slice(payload_range),
+         };
++        let diagnostic_bytes = outbound.data.len();
+         // Lent for exactly this unit and never held: the borrow ends with the
+         // closure, so the daemon's stored handle stays the only one and a close
+         // arriving on another connection is not racing a copy.
+@@ -291,6 +293,14 @@ where
+             }
+             net.send_webrtc_realtime(flow, outbound).map_err(Some)
+         });
++        if diagnostic_units < 4
++            && tracing::enabled!(target: "mesh_first_unit", tracing::Level::DEBUG)
++        {
++            tracing::debug!(target: "mesh_first_unit", stage = "ipc_outbound_admission",
++                ordinal = diagnostic_units, bytes = diagnostic_bytes, duration_us,
++                accepted = matches!(&sent, Some(Ok(()))), "MESH04_FIRST_UNIT");
++        }
++        diagnostic_units = diagnostic_units.saturating_add(1);
+         let Some(sent) = sent else {
+             // The flow was closed while this pipe was running — by this client
+             // on another connection, or by its disconnect drain. There is
+@@ -458,6 +468,7 @@ where
+     use tokio::io::AsyncReadExt as _;
+ 
+     let mut probe = [0u8; 1];
++    let mut diagnostic_units = 0usize;
+     loop {
+         let arrival = match tokio::select! {
+             biased;
+@@ -481,6 +492,15 @@ where
+             debug!(%peer, "realtime inbound stream ended (session over)");
+             return Ok(());
+         };
++        if diagnostic_units < 8
++            && tracing::enabled!(target: "mesh_first_unit", tracing::Level::DEBUG)
++        {
++            tracing::debug!(target: "mesh_first_unit", stage = "ipc_inbound_unit",
++                ordinal = diagnostic_units, bytes = arrival.unit.data.len(),
++                timestamp = arrival.unit.rtp_timestamp, marker = arrival.unit.marker,
++                "MESH04_FIRST_UNIT");
++        }
++        diagnostic_units = diagnostic_units.saturating_add(1);
+         let framed_len = REALTIME_FRAME_HEADER
+             .checked_add(arrival.label.len())
+             .and_then(|length| length.checked_add(arrival.unit.data.len()));
+diff --git a/vendor/webrtc-0.13.0/src/track/track_local/track_local_static_sample.rs b/vendor/webrtc-0.13.0/src/track/track_local/track_local_static_sample.rs
+index 2c4d5166e01f6025afecf0defb4c1b267eeea7b3..55ee2aea4966c5adc946c8e60bee9c47e3bc5495 100644
+--- a/vendor/webrtc-0.13.0/src/track/track_local/track_local_static_sample.rs
++++ b/vendor/webrtc-0.13.0/src/track/track_local/track_local_static_sample.rs
+@@ -1,5 +1,6 @@
+ use log::warn;
+ use media::Sample;
++use sha2::{Digest, Sha256};
+ use tokio::sync::Mutex;
+ 
+ use super::track_local_static_rtp::TrackLocalStaticRTP;
+@@ -13,6 +14,7 @@ struct TrackLocalStaticSampleInternal {
+     sequencer: Option<Box<dyn rtp::sequence::Sequencer + Send + Sync>>,
+     clock_rate: f64,
+     did_warn_about_wonky_pause: bool,
++    diagnostic_units: usize,
+ }
+ 
+ /// TrackLocalStaticSample is a TrackLocal that has a pre-set codec and accepts Samples.
+@@ -35,6 +37,7 @@ impl TrackLocalStaticSample {
+                 sequencer: None,
+                 clock_rate: 0.0f64,
+                 did_warn_about_wonky_pause: false,
++                diagnostic_units: 0,
+             }),
+         }
+     }
+@@ -55,6 +58,7 @@ impl TrackLocalStaticSample {
+                 sequencer: None,
+                 clock_rate: 0.0f64,
+                 did_warn_about_wonky_pause: false,
++                diagnostic_units: 0,
+             }),
+         }
+     }
+@@ -84,9 +88,25 @@ impl TrackLocalStaticSample {
+     ) -> Result<()> {
+         let mut internal = self.internal.lock().await;
+ 
++        let diagnostic_ordinal = internal.diagnostic_units;
++        internal.diagnostic_units = internal.diagnostic_units.saturating_add(1);
++        let diagnostic = diagnostic_ordinal < 4
++            && log::log_enabled!(target: "mesh_first_unit", log::Level::Debug);
++
+         if internal.packetizer.is_none() || internal.sequencer.is_none() {
++            if diagnostic {
++                log::debug!(target: "mesh_first_unit",
++                    "MESH04_FIRST_UNIT stage=sample_not_ready ordinal={} bytes={} sha256={:x} packetizer={} sequencer={}",
++                    diagnostic_ordinal, sample.data.len(), Sha256::digest(&sample.data),
++                    internal.packetizer.is_some(), internal.sequencer.is_some());
++            }
+             return Ok(());
+         }
++        if diagnostic {
++            log::debug!(target: "mesh_first_unit",
++                "MESH04_FIRST_UNIT stage=sample_ready ordinal={} bytes={} sha256={:x}",
++                diagnostic_ordinal, sample.data.len(), Sha256::digest(&sample.data));
++        }
+ 
+         let (any_paused, all_paused) = (
+             self.rtp_track.any_binding_paused().await,
+@@ -94,6 +114,10 @@ impl TrackLocalStaticSample {
+         );
+ 
+         if all_paused {
++            if diagnostic {
++                log::debug!(target: "mesh_first_unit",
++                    "MESH04_FIRST_UNIT stage=sample_all_paused ordinal={}", diagnostic_ordinal);
++            }
+             // Abort already here to not increment sequence numbers.
+             return Ok(());
+         }
+@@ -144,12 +168,23 @@ impl TrackLocalStaticSample {
+         };
+ 
+         let mut write_errs = vec![];
+-        for p in packets {
+-            if let Err(err) = self
++        if diagnostic {
++            log::debug!(target: "mesh_first_unit",
++                "MESH04_FIRST_UNIT stage=packetized ordinal={} packets={}", diagnostic_ordinal, packets.len());
++        }
++        for (diagnostic_packet, p) in packets.into_iter().enumerate() {
++            let write = self
+                 .rtp_track
+                 .write_rtp_with_extensions(&p, extensions)
+-                .await
+-            {
++                .await;
++            if diagnostic && diagnostic_packet < 4 {
++                log::debug!(target: "mesh_first_unit",
++                    "MESH04_FIRST_UNIT stage=rtp_write ordinal={} packet={} bytes={} sha256={:x} timestamp={} sequence={} marker={} write_ok={} written_bytes={}",
++                    diagnostic_ordinal, diagnostic_packet, p.payload.len(), Sha256::digest(&p.payload),
++                    p.header.timestamp, p.header.sequence_number, p.header.marker, write.is_ok(),
++                    write.as_ref().map_or(0, |bytes| *bytes));
++            }
++            if let Err(err) = write {
+                 write_errs.push(err);
+             }
+         }
+diff --git a/vendor/webrtc-0.13.0/src/track/track_remote/mod.rs b/vendor/webrtc-0.13.0/src/track/track_remote/mod.rs
+index 7d0565cf9414764baf4f54ec53a6e2d7ee79960a..c96e5eee520c668355050df5dec40047e94d1c93 100644
+--- a/vendor/webrtc-0.13.0/src/track/track_remote/mod.rs
++++ b/vendor/webrtc-0.13.0/src/track/track_remote/mod.rs
+@@ -7,6 +7,7 @@ use std::sync::{Arc, Weak};
+ use arc_swap::ArcSwapOption;
+ use interceptor::{Attributes, Interceptor};
+ use portable_atomic::{AtomicU32, AtomicU8, AtomicUsize};
++use sha2::{Digest, Sha256};
+ use smol_str::SmolStr;
+ use tokio::sync::Mutex;
+ use util::sync::Mutex as SyncMutex;
+@@ -33,6 +34,7 @@ struct Handlers {
+ #[derive(Default)]
+ struct TrackRemoteInternal {
+     peeked: VecDeque<(rtp::packet::Packet, Attributes)>,
++    diagnostic_peeks: usize,
+ }
+ 
+ /// TrackRemote represents a single inbound source of media
+@@ -286,6 +288,16 @@ impl TrackRemote {
+         {
+             let mut internal = self.internal.lock().await;
+             internal.peeked.push_back((pkt.clone(), a.clone()));
++            let diagnostic_ordinal = internal.diagnostic_peeks;
++            internal.diagnostic_peeks = internal.diagnostic_peeks.saturating_add(1);
++            if diagnostic_ordinal < 4
++                && log::log_enabled!(target: "mesh_first_unit", log::Level::Debug)
++            {
++                log::debug!(target: "mesh_first_unit",
++                    "MESH04_FIRST_UNIT stage=remote_peek_retained ordinal={} bytes={} sha256={:x} timestamp={} sequence={}",
++                    diagnostic_ordinal, pkt.payload.len(), Sha256::digest(&pkt.payload),
++                    pkt.header.timestamp, pkt.header.sequence_number);
++            }
+         }
+         Ok((pkt, a))
+     }
