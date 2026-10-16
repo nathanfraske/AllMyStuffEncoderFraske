@@ -112,6 +112,10 @@ pub mod labs;
 pub mod mediafoundation;
 pub mod mesh;
 pub mod mesh_contract;
+/// Explicit realtime media for application-approved live routes. This tooling
+/// does not select a product daemon or change the node's startup contract.
+#[cfg(feature = "mesh-realtime")]
+pub mod mesh_realtime;
 pub mod namespace;
 pub mod networks_store;
 pub mod node_control;

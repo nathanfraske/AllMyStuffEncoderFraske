@@ -1928,6 +1928,58 @@ async fn paced_gap(gap: std::time::Duration) {
 }
 
 impl Mesh {
+    /// Sample already-approved application routes for the explicitly selected
+    /// realtime tooling. The embedding application supplies its route epoch and
+    /// advances it when either route is replaced or approval ends.
+    #[cfg(feature = "mesh-realtime")]
+    pub fn realtime_av_context(
+        &self,
+        video_route_id: &str,
+        audio_route_id: &str,
+        route_generation: u64,
+    ) -> crate::mesh_realtime::Result<crate::mesh_realtime::AvRouteContext> {
+        let context =
+            {
+                let state = self.state.lock();
+                let session = state.session.as_ref().ok_or(
+                    crate::mesh_realtime::AvRouteError::InvalidRoutes(
+                        "application session is not active",
+                    ),
+                )?;
+                crate::mesh_realtime::AvRouteContext::from_session(
+                    session,
+                    video_route_id,
+                    audio_route_id,
+                    route_generation,
+                )?
+            };
+        // Reuse the current room and source-authority checks after releasing
+        // state. An active snapshot cannot extend an expired room or consent.
+        for live in context.live_routes() {
+            let room_allowed = live.room.as_ref().is_some_and(|room| {
+                self.room_scope_authorizes(room, live.peer.as_str(), &live.route)
+            });
+            if live.room.is_some() && !room_allowed {
+                return Err(crate::mesh_realtime::AvRouteError::ApprovalEnded);
+            }
+            if context.direction() == crate::mesh_realtime::AvDirection::Send {
+                let source_allowed =
+                    room_allowed || self.sender_may_source_media(live.peer.as_str(), &live.route);
+                let incoming_denied =
+                    live.origin == allmystuff_session::Origin::Inbound && !source_allowed;
+                let cec_denied = matches!(live.route.media, MediaKind::Display | MediaKind::Video)
+                    && cec_screen_consent_blocks(
+                        source_allowed,
+                        self.cec_screen_offer_denied(live.peer.as_str()),
+                    );
+                if incoming_denied || cec_denied {
+                    return Err(crate::mesh_realtime::AvRouteError::ApprovalEnded);
+                }
+            }
+        }
+        Ok(context)
+    }
+
     pub fn new(client: Arc<ControlClient>, sink: Arc<dyn UiSink>) -> Arc<Self> {
         // Shallow queues both: at most a few frames in flight, so a slow
         // link sheds load by dropping captures rather than growing latency.
@@ -20456,7 +20508,7 @@ fn h264_ipc_bytes(ts_us: u64, key: bool, data: &[u8]) -> Vec<u8> {
 
 /// Node id from a capability id (`"<node>:<device>"`). The node segment is
 /// everything before the first colon.
-fn node_of(cap_id: &str) -> String {
+pub(crate) fn node_of(cap_id: &str) -> String {
     cap_id
         .split_once(':')
         .map(|(n, _)| n.to_string())
@@ -20474,11 +20526,11 @@ fn same_node(a: &str, b: &str) -> bool {
     pubkey_part(a) == pubkey_part(b)
 }
 
-fn route_sources_on(route: &Route, node: &str) -> bool {
+pub(crate) fn route_sources_on(route: &Route, node: &str) -> bool {
     same_node(&node_of(route.from.as_str()), node)
 }
 
-fn route_sinks_on(route: &Route, node: &str) -> bool {
+pub(crate) fn route_sinks_on(route: &Route, node: &str) -> bool {
     same_node(&node_of(route.to.as_str()), node)
 }
 
@@ -21109,7 +21161,7 @@ fn eviction_stamps(data: &Value) -> std::collections::HashMap<String, u64> {
         .collect()
 }
 
-fn pubkey_part(id: &str) -> &str {
+pub(crate) fn pubkey_part(id: &str) -> &str {
     if let Some((body, suffix)) = id.rsplit_once('-') {
         if suffix.len() == 5 && suffix.chars().all(|c| c.is_ascii_alphanumeric()) {
             return body;

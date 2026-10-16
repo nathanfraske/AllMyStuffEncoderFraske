@@ -57,6 +57,10 @@ path = "src/bin/serve.rs"
 default = ["host"]
 hwenc = ["host", "allmystuff-video/hwenc"]
 
+# Explicit candidate realtime media tooling. Product startup retains its
+# supported legacy contract; applications supply approved live route context.
+mesh-realtime = ["allmystuff-mesh-control/realtime"]
+
 # Field-test instrumentation the fork added: the periodic telemetry line
 # (telemetry.rs — CPU/GPU-engine/VRAM every second). Diagnostic/prototype
 # builds opt into that sampler with `--features field-telemetry`; ordinary dev
@@ -254,6 +258,16 @@ windows-sys = { version = "0.60", features = [
 # CLI's `allmystuff service install` registers it with `sc.exe`.
 windows-service = "0.7"
 widestring = "1"
+
+[dev-dependencies]
+# Software media vectors for the isolated opt-in consumer gate. Reuse the
+# already locked codec and existing vendor patch, without a transport edge.
+openh264 = "=0.9.3"
+
+[[test]]
+name = "mesh_realtime_paired"
+path = "tests/mesh_realtime_paired.rs"
+required-features = ["mesh-realtime"]
 
 [profile.release]
 panic = "abort"

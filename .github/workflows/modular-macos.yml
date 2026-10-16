@@ -2,14 +2,24 @@ name: Modular macOS validation
 
 on:
   push:
-    branches: [agent/1503a621-audio-macos, agent/1503a621-bound01]
+    branches: [agent/1503a621-audio-macos, agent/1503a621-bound01, agent/1503a621-mesh03-realtime]
   workflow_dispatch:
+    inputs:
+      mode:
+        description: Validation scope on the selected task ref
+        type: choice
+        options: [cumulative, realtime]
+        default: cumulative
+        required: true
 
 permissions:
   contents: read
 
 jobs:
   cumulative:
+    if: >-
+      (github.event_name != 'push' || github.ref != 'refs/heads/agent/1503a621-mesh03-realtime') &&
+      (github.event_name != 'workflow_dispatch' || inputs.mode != 'realtime')
     name: Cumulative libraries (${{ matrix.arch }})
     strategy:
       fail-fast: false
@@ -53,5 +63,71 @@ jobs:
         with:
           name: modular-macos-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/modular-macos-artifacts
+          if-no-files-found: error
+          retention-days: 14
+
+  realtime:
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/agent/1503a621-mesh03-realtime') ||
+      (github.event_name == 'workflow_dispatch' && inputs.mode == 'realtime')
+    name: Realtime pair (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            python: python3
+          - runner: macos-15-intel
+            python: python3
+          - runner: windows-latest
+            python: python
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    env:
+      CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Preserve exact selected policy and source bytes on this runner
+        shell: bash
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Checkout the exact characterized candidate separately
+        uses: actions/checkout@v4
+        with:
+          repository: nathanfraske/MyOwnMeshSecurityReview
+          ref: db7818e09fedd98899490347b86ac9bc9f97b59b
+          path: target/mesh03-ci-upstream
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88.0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Native Linux build prerequisites from existing project recipes
+        if: runner.os == 'Linux'
+        timeout-minutes: 8
+        shell: bash
+        run: |
+          set -euo pipefail
+          # bootstrap.sh and mesh-control-setup-linux.sh, captureless subset.
+          sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y --no-install-recommends build-essential pkg-config cmake
+      - name: Locked minimal consumer, new contracts and actual native AV pairs
+        timeout-minutes: 78
+        shell: bash
+        run: >-
+          exec ${{ matrix.python }} scripts/ci/mesh-realtime-native.py
+          --upstream target/mesh03-ci-upstream
+          --expected-app '${{ github.sha }}'
+          --artifacts '${{ runner.temp }}/mesh03-native-artifacts'
+      - name: Retain commands, native identities, media receipts and cleanup
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mesh03-native-${{ matrix.runner }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/mesh03-native-artifacts
           if-no-files-found: error
           retention-days: 14

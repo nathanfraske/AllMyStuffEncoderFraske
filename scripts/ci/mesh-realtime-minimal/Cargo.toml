@@ -1,0 +1,15 @@
+[package]
+name = "mesh-realtime-minimal-consumer"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.88.0"
+publish = false
+
+[workspace]
+
+[features]
+default = []
+realtime = ["dep:allmystuff-mesh-control", "allmystuff-mesh-control/realtime"]
+
+[dependencies]
+allmystuff-mesh-control = { path = "../../../crates/allmystuff-mesh-control", default-features = false, optional = true }

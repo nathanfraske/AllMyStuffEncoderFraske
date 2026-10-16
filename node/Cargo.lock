@@ -157,6 +157,7 @@ dependencies = [
  "interprocess",
  "libc",
  "notify",
+ "openh264",
  "parking_lot",
  "plist",
  "reqwest",
