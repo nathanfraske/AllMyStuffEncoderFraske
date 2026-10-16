@@ -16,6 +16,15 @@ use serde_json::{json, Value};
 
 use paired::{Context, Unit};
 
+// Only static phase names, source/received hashes and bounded numeric metadata.
+// Never log a capability, raw response, received label spelling or media bytes.
+fn diagnostic(phase: &'static str, event: &'static str, details: Value) {
+    println!(
+        "MESH_CONTROL_PAIRED_DIAGNOSTIC {}",
+        json!({"phase":phase, "event":event, "details":details})
+    );
+}
+
 fn run(work: impl Future<Output = ()>, deadline: Duration) {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -53,6 +62,7 @@ async fn receive(
     context: &Context,
     pipe: &mut InboundPipe,
     prefix: &str,
+    phase: &'static str,
     video: bool,
     audio: bool,
 ) -> Value {
@@ -67,6 +77,28 @@ async fn receive(
     let audio_count = if audio { context.audio.len() } else { 0 };
     while vi < video_count || ai < audio_count {
         let unit = pipe.recv().await.unwrap();
+        let diagnostic_video = unit.label() == video_label.as_bytes();
+        let diagnostic_index = if diagnostic_video { vi } else { ai };
+        let diagnostic_expected = if diagnostic_video {
+            context.video.get(vi)
+        } else {
+            context.audio.get(ai)
+        };
+        diagnostic(
+            phase,
+            "receive_before_checks",
+            json!({
+                "kind":if diagnostic_video { "video" } else { "audio_or_unrecognized_label" },
+                "expected_index":diagnostic_index, "prior_units_verified":observations.len(),
+                "expected_bytes":diagnostic_expected.map(|unit| unit.data.len()),
+                "expected_sha256":diagnostic_expected.map(|unit| unit.sha256.as_str()),
+                "received_bytes":unit.payload().len(), "received_sha256":paired::digest(unit.payload()),
+                "received_label_bytes":unit.label().len(),
+                "label_matches_expected":unit.label() == if diagnostic_video { video_label.as_bytes() } else { audio_label.as_bytes() },
+                "rtp_timestamp":unit.rtp_timestamp(), "marker":unit.marker(),
+                "prior_rtp_timestamp":if diagnostic_video { video_prior } else { audio_prior }
+            }),
+        );
         let (expected, is_video, previous) = if unit.label() == video_label.as_bytes() {
             assert!(vi < video_count, "unexpected/extra video on actual pair");
             let expected = &context.video[vi];
@@ -104,9 +136,25 @@ async fn receive(
     json!({"video_units":vi,"audio_packets":ai,"units":observations})
 }
 
-async fn send_units(flow: &mut RealtimeFlow, units: &[Unit]) {
-    for unit in units {
+async fn send_units(
+    phase: &'static str,
+    kind: &'static str,
+    flow: &mut RealtimeFlow,
+    units: &[Unit],
+) {
+    for (index, unit) in units.iter().enumerate() {
+        diagnostic(
+            phase,
+            "send_before_local_write",
+            json!({"kind":kind, "index":index,
+            "bytes":unit.data.len(), "sha256":unit.sha256, "duration_us":unit.duration_us}),
+        );
         flow.send(unit.duration_us, &unit.data).await.unwrap();
+        diagnostic(
+            phase,
+            "local_write_complete_not_delivery",
+            json!({"kind":kind, "index":index}),
+        );
         tokio::time::sleep(Duration::from_micros(u64::from(unit.duration_us))).await;
     }
 }
@@ -115,16 +163,27 @@ async fn batch(
     context: &Context,
     pipe: &mut InboundPipe,
     prefix: &str,
+    phase: &'static str,
     video: &mut RealtimeFlow,
     audio: &mut RealtimeFlow,
 ) -> Value {
+    diagnostic(
+        phase,
+        "phase_begin",
+        json!({"expected_video_units":context.video.len(), "expected_audio_packets":context.audio.len()}),
+    );
     let sending = async {
         let ((), ()) = tokio::join!(
-            send_units(video, &context.video),
-            send_units(audio, &context.audio)
+            send_units(phase, "video", video, &context.video),
+            send_units(phase, "audio", audio, &context.audio)
         );
     };
-    let ((), received) = tokio::join!(sending, receive(context, pipe, prefix, true, true));
+    let ((), received) = tokio::join!(sending, receive(context, pipe, prefix, phase, true, true));
+    diagnostic(
+        phase,
+        "phase_complete",
+        json!({"video_units":received["video_units"], "audio_packets":received["audio_packets"]}),
+    );
     received
 }
 
@@ -132,11 +191,22 @@ async fn audio_batch(
     context: &Context,
     pipe: &mut InboundPipe,
     prefix: &str,
+    phase: &'static str,
     audio: &mut RealtimeFlow,
 ) -> Value {
+    diagnostic(
+        phase,
+        "phase_begin",
+        json!({"expected_video_units":0, "expected_audio_packets":context.audio.len()}),
+    );
     let ((), received) = tokio::join!(
-        send_units(audio, &context.audio),
-        receive(context, pipe, prefix, false, true)
+        send_units(phase, "audio", audio, &context.audio),
+        receive(context, pipe, prefix, phase, false, true)
+    );
+    diagnostic(
+        phase,
+        "phase_complete",
+        json!({"video_units":received["video_units"], "audio_packets":received["audio_packets"]}),
     );
     received
 }
@@ -199,12 +269,26 @@ fn isolated_realtime_pair() {
                 false,
             )
             .await;
-            let initial = batch(&context, &mut inbound_b, "forward", &mut video, &mut audio).await;
+            let initial = batch(
+                &context,
+                &mut inbound_b,
+                "forward",
+                "initial_forward",
+                &mut video,
+                &mut audio,
+            )
+            .await;
             let initial_path = paired::selected_paths(&context, &a_id, &b_id).await;
             video.close().await.unwrap();
             video_in.close().await.unwrap();
-            let audio_after_video_close =
-                audio_batch(&context, &mut inbound_b, "forward", &mut audio).await;
+            let audio_after_video_close = audio_batch(
+                &context,
+                &mut inbound_b,
+                "forward",
+                "audio_after_video_close",
+                &mut audio,
+            )
+            .await;
 
             let mut unsupported = context.flow(&b_id, "unsupported", FlowDirection::Outbound, true);
             unsupported.encoding.clock_rate = 90001;
@@ -260,8 +344,14 @@ fn isolated_realtime_pair() {
             );
             pressure.close().await.unwrap();
             pressure_in.close().await.unwrap();
-            let audio_after_pressure =
-                audio_batch(&context, &mut inbound_b, "forward", &mut audio).await;
+            let audio_after_pressure = audio_batch(
+                &context,
+                &mut inbound_b,
+                "forward",
+                "audio_after_pressure",
+                &mut audio,
+            )
+            .await;
             audio.close().await.unwrap();
             audio_in.close().await.unwrap();
             inbound_b.close().await.unwrap();
@@ -294,6 +384,7 @@ fn isolated_realtime_pair() {
             let reverse = batch(
                 &context,
                 &mut inbound_a,
+                "reverse",
                 "reverse",
                 &mut reverse_video,
                 &mut reverse_audio,
@@ -416,6 +507,7 @@ fn isolated_realtime_pair() {
                 &context,
                 &mut fresh_inbound,
                 "reconnect",
+                "after_owned_peer_restart",
                 &mut new_video,
                 &mut new_audio,
             )
