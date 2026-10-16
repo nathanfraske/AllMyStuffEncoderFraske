@@ -2,7 +2,7 @@ name: Modular macOS validation
 
 on:
   push:
-    branches: [agent/1503a621-audio-macos, agent/1503a621-bound01, agent/1503a621-mesh03-realtime]
+    branches: [agent/1503a621-audio-macos, agent/1503a621-bound01, agent/1503a621-mesh03-realtime, agent/1503a621-mesh04-correctness]
   workflow_dispatch:
     inputs:
       mode:
@@ -18,7 +18,9 @@ permissions:
 jobs:
   cumulative:
     if: >-
-      (github.event_name != 'push' || github.ref != 'refs/heads/agent/1503a621-mesh03-realtime') &&
+      (github.event_name != 'push' ||
+       (github.ref != 'refs/heads/agent/1503a621-mesh03-realtime' &&
+        github.ref != 'refs/heads/agent/1503a621-mesh04-correctness')) &&
       (github.event_name != 'workflow_dispatch' || inputs.mode != 'realtime')
     name: Cumulative libraries (${{ matrix.arch }})
     strategy:
@@ -68,7 +70,9 @@ jobs:
 
   realtime:
     if: >-
-      (github.event_name == 'push' && github.ref == 'refs/heads/agent/1503a621-mesh03-realtime') ||
+      (github.event_name == 'push' &&
+       (github.ref == 'refs/heads/agent/1503a621-mesh03-realtime' ||
+        github.ref == 'refs/heads/agent/1503a621-mesh04-correctness')) ||
       (github.event_name == 'workflow_dispatch' && inputs.mode == 'realtime')
     name: Realtime pair (${{ matrix.runner }})
     strategy:
@@ -116,6 +120,7 @@ jobs:
           sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
           sudo env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y --no-install-recommends build-essential pkg-config cmake
       - name: Locked minimal consumer, new contracts and actual native AV pairs
+        if: github.ref != 'refs/heads/agent/1503a621-mesh04-correctness'
         timeout-minutes: 78
         shell: bash
         run: >-
@@ -123,6 +128,18 @@ jobs:
           --upstream target/mesh03-ci-upstream
           --expected-app '${{ github.sha }}'
           --artifacts '${{ runner.temp }}/mesh03-native-artifacts'
+      - name: Locked corrected candidate, contracts and strict native AV pairs
+        if: github.ref == 'refs/heads/agent/1503a621-mesh04-correctness'
+        timeout-minutes: 78
+        shell: bash
+        run: >-
+          exec ${{ matrix.python }} scripts/ci/mesh-realtime-native.py
+          --upstream target/mesh03-ci-upstream
+          --expected-app '${{ github.sha }}'
+          --artifacts '${{ runner.temp }}/mesh03-native-artifacts'
+          --candidate-kind corrected
+          --patch-set scripts/ci/myownmesh-corrections/patch-set.json
+          --patch-set-sha256 4cb553e829e61dab2858357b1a2c031a2cf5995d0e49eaa9770517c345a497e6
       - name: Retain commands, native identities, media receipts and cleanup
         if: always()
         uses: actions/upload-artifact@v4
