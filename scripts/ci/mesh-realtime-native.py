@@ -21,7 +21,7 @@ import tempfile
 import time
 
 CANDIDATE = "db7818e09fedd98899490347b86ac9bc9f97b59b"
-POLICY = "0e8b132f6373c771eb3bdcfea9e2d95d541fcc9c533c1aa8674858288d3755c7"
+POLICY = "e6729ca6d0887ec0b4ef2cd91da404ffb477b251e00a5a8c1381254c1a9a9fe6"
 LOCKS = ["Cargo.lock", "node/Cargo.lock", "gui/src-tauri/Cargo.lock",
          "gui/mobile/Cargo.lock", "scripts/ci/mesh-realtime-minimal/Cargo.lock"]
 CONTRACT_TESTS = frozenset([
@@ -202,7 +202,10 @@ def main():
             raise RuntimeError("checkout identity mismatch")
         commands.run("app-source-clean-before", ["git", "diff", "--exit-code", "HEAD", "--"], root)
         commands.run("candidate-source-clean-before", ["git", "diff", "--exit-code", "HEAD", "--"], upstream)
-        if digest(root / "scripts/ci/mesh-control-paired-policy.json") != POLICY:
+        policy_bytes = (root / "scripts/ci/mesh-control-paired-policy.json").read_bytes()
+        receipt["policy_raw_sha256"] = hashlib.sha256(policy_bytes).hexdigest()
+        receipt["policy_lf_sha256"] = hashlib.sha256(policy_bytes.replace(b"\r\n", b"\n")).hexdigest()
+        if receipt["policy_lf_sha256"] != POLICY:
             raise RuntimeError("fixture policy differs from the explicit owner selection")
         before = {path: digest(root / path) for path in LOCKS}
         upstream_lock = digest(upstream / "Cargo.lock")
