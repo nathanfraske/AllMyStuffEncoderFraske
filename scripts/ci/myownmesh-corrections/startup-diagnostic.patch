@@ -1,3 +1,114 @@
+diff --git a/crates/myownmesh-core/src/engine/state.rs b/crates/myownmesh-core/src/engine/state.rs
+index 26a01742605a9d5dda0fdf9a375aa974c86137b5..5e1cfd34a2b1512683c7a838f0411c2a58b2e15f 100644
+--- a/crates/myownmesh-core/src/engine/state.rs
++++ b/crates/myownmesh-core/src/engine/state.rs
+@@ -8,6 +8,29 @@ use std::sync::Arc;
+ 
+ use bytes::Bytes;
+ 
++fn diagnostic_realtime_open_refusal(
++    phase: &'static str,
++    inbound: bool,
++    refusal: RealtimeFlowError,
++) {
++    if !tracing::enabled!(target: "mesh_first_unit", tracing::Level::DEBUG) {
++        return;
++    }
++    static FAILURES: AtomicUsize = AtomicUsize::new(0);
++    if let Ok(ordinal) = FAILURES.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
++        if count < 8 {
++            Some(count + 1)
++        } else {
++            None
++        }
++    }) {
++        tracing::debug!(target: "mesh_first_unit", stage = "flow_open_refused",
++            phase, inbound, ordinal,
++            code = crate::realtime::RealtimeRefusal::from(refusal).code(),
++            "MESH04_FIRST_UNIT");
++    }
++}
++
+ struct SignalingEmissionAllocator {
+     next: AtomicU64,
+ }
+@@ -6238,6 +6261,7 @@ impl NetworkState {
+         spec: RealtimeFlowSpec,
+     ) -> std::result::Result<crate::realtime::RealtimeFlowHandle, crate::realtime::RealtimeRefusal>
+     {
++        let diagnostic_inbound = spec.direction == RealtimeDirection::Inbound;
+         let encoding = spec.encoding.clone();
+         // The one resolution. Everything after this names the installation it
+         // produced, never the bytes it was produced from.
+@@ -6310,6 +6334,10 @@ impl NetworkState {
+                     identity,
+                     session.validity_witness(),
+                 ))
++            })
++            .map_err(|error| {
++                diagnostic_realtime_open_refusal("admission", diagnostic_inbound, error);
++                error
+             })?;
+         let owner = owner.for_worker(Arc::clone(&worker));
+ 
+@@ -6334,6 +6362,11 @@ impl NetworkState {
+             } => native,
+         };
+         let Ok(mut track) = native else {
++            diagnostic_realtime_open_refusal(
++                "native",
++                diagnostic_inbound,
++                RealtimeFlowError::FlowRefused,
++            );
+             // The connector cleaned up its own failed construction; what is
+             // left is the flow, its name, and — for an inbound open — a
+             // binding to an identity nothing will ever present.
+@@ -6377,6 +6410,7 @@ impl NetworkState {
+                 Arc::downgrade(self),
+             )),
+             Err(error) => {
++                diagnostic_realtime_open_refusal("commit", diagnostic_inbound, error);
+                 // Ordered so the caller does not return before the transceiver
+                 // is retired. If the flow set is still ours, `abandon` closed
+                 // the flow and the close handed the retirement back, so it has
+diff --git a/crates/myownmesh-core/src/transport/webrtc.rs b/crates/myownmesh-core/src/transport/webrtc.rs
+index 53b0af55838790a07cd6cf5c62d07e71aa2099b4..3bf447c7312bacc923effec492010d82c5cbb846 100644
+--- a/crates/myownmesh-core/src/transport/webrtc.rs
++++ b/crates/myownmesh-core/src/transport/webrtc.rs
+@@ -5611,7 +5611,32 @@ impl WebRtcConnectorWorker {
+             .pc
+             .add_track(Arc::clone(&track) as Arc<dyn TrackLocal + Send + Sync>)
+             .await
+-            .map_err(|error| Error::Transport(format!("outbound realtime add_track: {error}")))?;
++            .map_err(|error| {
++                if tracing::enabled!(target: "mesh_first_unit", tracing::Level::DEBUG) {
++                    static FAILURES: std::sync::atomic::AtomicUsize =
++                        std::sync::atomic::AtomicUsize::new(0);
++                    if let Ok(ordinal) =
++                        FAILURES.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
++                            if count < 8 {
++                                Some(count + 1)
++                            } else {
++                                None
++                            }
++                        })
++                    {
++                        let category = match &error {
++                            webrtc::Error::ErrRTPSenderNewTrackHasIncorrectEnvelope => {
++                                "incorrect_sender_envelope"
++                            }
++                            _ => "other",
++                        };
++                        tracing::debug!(target: "mesh_first_unit",
++                            stage = "outbound_add_track_refused", ordinal, category,
++                            "MESH04_FIRST_UNIT");
++                    }
++                }
++                Error::Transport(format!("outbound realtime add_track: {error}"))
++            })?;
+         Ok(RealtimeOutboundTrack {
+             track,
+             sender,
 diff --git a/crates/myownmesh-core/src/transport/webrtc/inbound.rs b/crates/myownmesh-core/src/transport/webrtc/inbound.rs
 index 92e14612345eddf82a9dba1a21c8a23700c13ce2..267e8428a722c98cad6632ec05243c98c1ce843e 100644
 --- a/crates/myownmesh-core/src/transport/webrtc/inbound.rs
