@@ -12,8 +12,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use allmystuff_mesh_control::realtime::{
-    Encoding, FlowDirection, FlowSpec, PipeEnd, RealtimeError,
-    RealtimePolicy, RealtimeSession, RtpKind,
+    Encoding, FlowDirection, FlowSpec, PipeEnd, RealtimeError, RealtimePolicy, RealtimeSession,
+    RtpKind,
 };
 use allmystuff_mesh_control::{ClientId, ControlClient, Endpoint, EventContract, EventSession};
 use interprocess::local_socket::tokio::{prelude::*, Listener};
@@ -144,13 +144,16 @@ impl PrivateEndpoint {
         #[cfg(unix)]
         let name = self.path.as_path().to_fs_name::<GenericFilePath>().unwrap();
         #[cfg(not(unix))]
-        let name = self.name.as_str().to_ns_name::<GenericNamespaced>().unwrap();
+        let name = self
+            .name
+            .as_str()
+            .to_ns_name::<GenericNamespaced>()
+            .unwrap();
         let listener = ListenerOptions::new().name(name).create_tokio().unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600))
-                .unwrap();
+            std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
         listener
     }
@@ -190,7 +193,8 @@ impl DaemonPeer {
                 {"kind":"video","mime":"video/H264","clock_rate":90000,"channels":0},
                 {"kind":"audio","mime":"audio/opus","clock_rate":48000,"channels":2}
             ]}
-        }})).await;
+        }}))
+        .await;
         peer
     }
 
@@ -205,7 +209,9 @@ impl DaemonPeer {
     }
 
     async fn bytes(&mut self, bytes: &[u8]) {
-        bounded(self.reader.get_mut().write_all(bytes)).await.unwrap();
+        bounded(self.reader.get_mut().write_all(bytes))
+            .await
+            .unwrap();
         bounded(self.reader.get_mut().flush()).await.unwrap();
     }
 
@@ -222,7 +228,9 @@ impl DaemonPeer {
         assert!(length <= 4096, "unexpected private frame size");
         let mut framed = prefix.to_vec();
         framed.resize(length + 4, 0);
-        bounded(self.reader.read_exact(&mut framed[4..])).await.unwrap();
+        bounded(self.reader.read_exact(&mut framed[4..]))
+            .await
+            .unwrap();
         framed
     }
 
@@ -243,7 +251,8 @@ async fn event_registration(
     secret: &str,
 ) -> (EventSession, DaemonPeer, mpsc::Receiver<Value>) {
     let (sender, receiver) = mpsc::channel(8);
-    let subscribing = client.subscribe_events_for_contract(EventContract::CandidateV1Db7818e, sender);
+    let subscribing =
+        client.subscribe_events_for_contract(EventContract::CandidateV1Db7818e, sender);
     let answering = async {
         let mut peer = DaemonPeer::accept(listener).await;
         assert_eq!(peer.request().await, json!({"op":"events_subscribe"}));
@@ -329,14 +338,17 @@ async fn opened(
         .await;
     let mut pipe = DaemonPeer::verified(listener).await;
     assert_eq!(pipe.request().await, outbound_request(capability));
-    pipe.reply(json!({"ok":true,"data":{"realtime_pipe":true}})).await;
+    pipe.reply(json!({"ok":true,"data":{"realtime_pipe":true}}))
+        .await;
     (command, pipe)
 }
 
 async fn closed(listener: &Listener, capability: &str) -> DaemonPeer {
     let mut command = DaemonPeer::verified(listener).await;
     assert_eq!(command.request().await, close_request(capability));
-    command.reply(json!({"ok":true,"data":{"closed":true}})).await;
+    command
+        .reply(json!({"ok":true,"data":{"closed":true}}))
+        .await;
     command
 }
 
@@ -350,7 +362,8 @@ async fn inbound_opened(listener: &Listener, peer_name: &str) -> DaemonPeer {
             "client_capability":CLIENT_SECRET
         })
     );
-    pipe.reply(json!({"ok":true,"data":{"realtime_pipe":true}})).await;
+    pipe.reply(json!({"ok":true,"data":{"realtime_pipe":true}}))
+        .await;
     pipe
 }
 
@@ -361,7 +374,12 @@ async fn h264_and_opus_keep_literal_open_pipe_and_unit_fields() {
     let generation = session.generation();
     let (flow, peers) = tokio::join!(
         bounded(session.open_flow(video("v"))),
-        bounded(opened(&fixture.listener, open_request("v", "video", "video/H264", 90_000, 0), "v", FLOW_A))
+        bounded(opened(
+            &fixture.listener,
+            open_request("v", "video", "video/H264", 90_000, 0),
+            "v",
+            FLOW_A
+        ))
     );
     let mut video_flow = success(flow);
     let (mut video_command, mut video_pipe) = peers;
@@ -370,7 +388,12 @@ async fn h264_and_opus_keep_literal_open_pipe_and_unit_fields() {
     assert_eq!(video_flow.spec().label, "v");
     let (flow, peers) = tokio::join!(
         bounded(session.open_flow(audio("a"))),
-        bounded(opened(&fixture.listener, open_request("a", "audio", "audio/opus", 48_000, 2), "a", FLOW_B))
+        bounded(opened(
+            &fixture.listener,
+            open_request("a", "audio", "audio/opus", 48_000, 2),
+            "a",
+            FLOW_B
+        ))
     );
     let mut audio_flow = success(flow);
     let (mut audio_command, mut audio_pipe) = peers;
@@ -382,15 +405,24 @@ async fn h264_and_opus_keep_literal_open_pipe_and_unit_fields() {
         bounded(video_pipe.frame())
     );
     success(sent);
-    assert_eq!(bytes, [18, 0, 0, 0, 1, 0, 0x35, 0x82, 0, 0, 7, 0, 0, 0, b'v', 0, 0, 0, 1, 0x65, 0x88, 0x84]);
+    assert_eq!(
+        bytes,
+        [18, 0, 0, 0, 1, 0, 0x35, 0x82, 0, 0, 7, 0, 0, 0, b'v', 0, 0, 0, 1, 0x65, 0x88, 0x84]
+    );
     let (sent, bytes) = tokio::join!(
         bounded(audio_flow.send(20_000, &[0xf8, 0xff, 0xfe])),
         bounded(audio_pipe.frame())
     );
     success(sent);
-    assert_eq!(bytes, [14, 0, 0, 0, 1, 0, 0x20, 0x4e, 0, 0, 3, 0, 0, 0, b'a', 0xf8, 0xff, 0xfe]);
+    assert_eq!(
+        bytes,
+        [14, 0, 0, 0, 1, 0, 0x20, 0x4e, 0, 0, 3, 0, 0, 0, b'a', 0xf8, 0xff, 0xfe]
+    );
     for (flow, capability) in [(video_flow, FLOW_A), (audio_flow, FLOW_B)] {
-        let (result, mut command) = tokio::join!(bounded(flow.close()), bounded(closed(&fixture.listener, capability)));
+        let (result, mut command) = tokio::join!(
+            bounded(flow.close()),
+            bounded(closed(&fixture.listener, capability))
+        );
         success(result);
         command.eof().await;
     }
@@ -403,22 +435,37 @@ async fn h264_and_opus_keep_literal_open_pipe_and_unit_fields() {
 async fn inbound_keeps_pipe_context_binary_label_marker_and_wrapping_rtp_timestamp() {
     let mut fixture = Fixture::new(policy()).await;
     let (pipe, mut remote) = tokio::join!(
-        bounded(fixture.session.as_mut().unwrap().open_inbound(NETWORK, PEER)),
+        bounded(
+            fixture
+                .session
+                .as_mut()
+                .unwrap()
+                .open_inbound(NETWORK, PEER)
+        ),
         bounded(inbound_opened(&fixture.listener, PEER))
     );
     let mut pipe = success(pipe);
     assert_eq!(pipe.network(), NETWORK);
     assert_eq!(pipe.peer(), PEER);
-    assert_eq!(pipe.generation(), fixture.session.as_ref().unwrap().generation());
+    assert_eq!(
+        pipe.generation(),
+        fixture.session.as_ref().unwrap().generation()
+    );
     // A label is raw bytes inbound. It is neither lossy UTF-8 nor authority.
-    remote.bytes(&[15, 0, 0, 0, 2, 1, 0xf0, 0xff, 0xff, 0xff, 3, 0, 0, 0, 0xff, 0, 0xf8, 0xff, 0xfe]).await;
+    remote
+        .bytes(&[
+            15, 0, 0, 0, 2, 1, 0xf0, 0xff, 0xff, 0xff, 3, 0, 0, 0, 0xff, 0, 0xf8, 0xff, 0xfe,
+        ])
+        .await;
     let unit = success(bounded(pipe.recv()).await);
     assert_eq!(unit.label(), &[0xff, 0]);
     assert_eq!(unit.payload(), &[0xf8, 0xff, 0xfe]);
     assert!(unit.marker());
     assert_eq!(unit.rtp_timestamp(), 0xfffffff0);
     drop(unit);
-    remote.bytes(&[12, 0, 0, 0, 1, 0, 0x10, 0, 0, 0, 1, 0, 0, 0, b'v', 0x41]).await;
+    remote
+        .bytes(&[12, 0, 0, 0, 1, 0, 0x10, 0, 0, 0, 1, 0, 0, 0, b'v', 0x41])
+        .await;
     let unit = success(bounded(pipe.recv()).await);
     assert_eq!(unit.label(), b"v");
     assert_eq!(unit.payload(), &[0x41]);
@@ -435,19 +482,36 @@ async fn local_send_size_refusal_preserves_the_healthy_frame_boundary() {
     let mut fixture = Fixture::new(policy()).await;
     let (flow, peers) = tokio::join!(
         bounded(fixture.session.as_mut().unwrap().open_flow(video("v"))),
-        bounded(opened(&fixture.listener, open_request("v", "video", "video/H264", 90_000, 0), "v", FLOW_A))
+        bounded(opened(
+            &fixture.listener,
+            open_request("v", "video", "video/H264", 90_000, 0),
+            "v",
+            FLOW_A
+        ))
     );
     let mut flow = success(flow);
     let (mut command, mut remote) = peers;
     command.eof().await;
     // 10-byte body header + 1-byte label + 54 payload bytes is one byte over.
-    assert!(matches!(failure(bounded(flow.send(1, &[7; 54])).await), RealtimeError::LimitExceeded(_)));
-    let (sent, bytes) = tokio::join!(bounded(flow.send(u32::MAX, &[7; 53])), bounded(remote.frame()));
+    assert!(matches!(
+        failure(bounded(flow.send(1, &[7; 54])).await),
+        RealtimeError::LimitExceeded(_)
+    ));
+    let (sent, bytes) = tokio::join!(
+        bounded(flow.send(u32::MAX, &[7; 53])),
+        bounded(remote.frame())
+    );
     success(sent);
     let mut expected = vec![64, 0, 0, 0, 1, 0, 0xff, 0xff, 0xff, 0xff, 53, 0, 0, 0, b'v'];
     expected.extend_from_slice(&[7; 53]);
-    assert_eq!(bytes, expected, "local refusal must not write even a partial prefix");
-    let (result, mut command) = tokio::join!(bounded(flow.close()), bounded(closed(&fixture.listener, FLOW_A)));
+    assert_eq!(
+        bytes, expected,
+        "local refusal must not write even a partial prefix"
+    );
+    let (result, mut command) = tokio::join!(
+        bounded(flow.close()),
+        bounded(closed(&fixture.listener, FLOW_A))
+    );
     success(result);
     command.eof().await;
     remote.eof().await;
@@ -460,13 +524,24 @@ async fn retained_inbound_unit_holds_the_shared_frame_budget_until_drop() {
     limits.max_retained_bytes = 68; // one maximum body plus its four-byte prefix
     let mut fixture = Fixture::new(limits).await;
     let (pipe, mut inbound_remote) = tokio::join!(
-        bounded(fixture.session.as_mut().unwrap().open_inbound(NETWORK, PEER)),
+        bounded(
+            fixture
+                .session
+                .as_mut()
+                .unwrap()
+                .open_inbound(NETWORK, PEER)
+        ),
         bounded(inbound_opened(&fixture.listener, PEER))
     );
     let mut inbound = success(pipe);
     let (flow, peers) = tokio::join!(
         bounded(fixture.session.as_mut().unwrap().open_flow(video("v"))),
-        bounded(opened(&fixture.listener, open_request("v", "video", "video/H264", 90_000, 0), "v", FLOW_A))
+        bounded(opened(
+            &fixture.listener,
+            open_request("v", "video", "video/H264", 90_000, 0),
+            "v",
+            FLOW_A
+        ))
     );
     let mut flow = success(flow);
     let (mut command, mut outbound_remote) = peers;
@@ -476,12 +551,21 @@ async fn retained_inbound_unit_holds_the_shared_frame_budget_until_drop() {
     inbound_remote.bytes(&frame).await;
     let unit = success(bounded(inbound.recv()).await);
     assert_eq!(unit.payload(), &[9; 53]);
-    assert!(matches!(failure(bounded(flow.send(1, &[3])).await), RealtimeError::LimitExceeded(_)));
+    assert!(matches!(
+        failure(bounded(flow.send(1, &[3])).await),
+        RealtimeError::LimitExceeded(_)
+    ));
     drop(unit);
-    let (sent, frame) = tokio::join!(bounded(flow.send(1, &[3])), bounded(outbound_remote.frame()));
+    let (sent, frame) = tokio::join!(
+        bounded(flow.send(1, &[3])),
+        bounded(outbound_remote.frame())
+    );
     success(sent);
     assert_eq!(frame, [12, 0, 0, 0, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, b'v', 3]);
-    let (result, mut command) = tokio::join!(bounded(flow.close()), bounded(closed(&fixture.listener, FLOW_A)));
+    let (result, mut command) = tokio::join!(
+        bounded(flow.close()),
+        bounded(closed(&fixture.listener, FLOW_A))
+    );
     success(result);
     command.eof().await;
     outbound_remote.eof().await;
@@ -504,14 +588,26 @@ async fn invalid_inbound_lengths_and_marker_end_the_pipe_without_resynchronizing
     for frame in cases {
         let mut fixture = Fixture::new(policy()).await;
         let (pipe, mut remote) = tokio::join!(
-            bounded(fixture.session.as_mut().unwrap().open_inbound(NETWORK, PEER)),
+            bounded(
+                fixture
+                    .session
+                    .as_mut()
+                    .unwrap()
+                    .open_inbound(NETWORK, PEER)
+            ),
             bounded(inbound_opened(&fixture.listener, PEER))
         );
         let mut pipe = success(pipe);
         remote.bytes(frame).await;
-        assert!(matches!(failure(bounded(pipe.recv()).await), RealtimeError::InvalidResponse(_) | RealtimeError::PipeEnded(PipeEnd::InvalidData)));
+        assert!(matches!(
+            failure(bounded(pipe.recv()).await),
+            RealtimeError::InvalidResponse(_) | RealtimeError::PipeEnded(PipeEnd::InvalidData)
+        ));
         remote.eof().await;
-        assert!(matches!(failure(bounded(pipe.recv()).await), RealtimeError::PipeEnded(_)));
+        assert!(matches!(
+            failure(bounded(pipe.recv()).await),
+            RealtimeError::PipeEnded(_)
+        ));
         success(bounded(pipe.close()).await);
         fixture.finish().await;
     }
@@ -521,14 +617,23 @@ async fn invalid_inbound_lengths_and_marker_end_the_pipe_without_resynchronizing
 async fn oversized_inbound_prefix_refuses_before_waiting_for_its_body() {
     let mut fixture = Fixture::new(policy()).await;
     let (pipe, mut remote) = tokio::join!(
-        bounded(fixture.session.as_mut().unwrap().open_inbound(NETWORK, PEER)),
+        bounded(
+            fixture
+                .session
+                .as_mut()
+                .unwrap()
+                .open_inbound(NETWORK, PEER)
+        ),
         bounded(inbound_opened(&fixture.listener, PEER))
     );
     let mut pipe = success(pipe);
     // No body follows. This must be a local size refusal, not an IO timeout
     // while trying to allocate/read an attacker-selected four-gigabyte body.
     remote.bytes(&[0xff, 0xff, 0xff, 0xff]).await;
-    assert!(matches!(failure(bounded(pipe.recv()).await), RealtimeError::LimitExceeded(_)));
+    assert!(matches!(
+        failure(bounded(pipe.recv()).await),
+        RealtimeError::LimitExceeded(_)
+    ));
     remote.eof().await;
     success(bounded(pipe.close()).await);
     fixture.finish().await;
@@ -538,7 +643,13 @@ async fn oversized_inbound_prefix_refuses_before_waiting_for_its_body() {
 async fn cancelled_partial_receive_closes_the_socket_and_cannot_reuse_a_prefix() {
     let mut fixture = Fixture::new(policy()).await;
     let (pipe, mut remote) = tokio::join!(
-        bounded(fixture.session.as_mut().unwrap().open_inbound(NETWORK, PEER)),
+        bounded(
+            fixture
+                .session
+                .as_mut()
+                .unwrap()
+                .open_inbound(NETWORK, PEER)
+        ),
         bounded(inbound_opened(&fixture.listener, PEER))
     );
     let mut pipe = success(pipe);
@@ -549,10 +660,14 @@ async fn cancelled_partial_receive_closes_the_socket_and_cannot_reuse_a_prefix()
     std::future::poll_fn(|context| {
         assert!(receiving.as_mut().poll(context).is_pending());
         std::task::Poll::Ready(())
-    }).await;
+    })
+    .await;
     drop(receiving);
     remote.eof().await;
-    assert!(matches!(failure(bounded(pipe.recv()).await), RealtimeError::PipeEnded(_)));
+    assert!(matches!(
+        failure(bounded(pipe.recv()).await),
+        RealtimeError::PipeEnded(_)
+    ));
     success(bounded(pipe.close()).await);
     fixture.finish().await;
 }
@@ -563,17 +678,32 @@ async fn partial_receive_timeout_is_terminal_and_releases_its_reservation() {
     limits.io_timeout = Duration::from_millis(40);
     let mut fixture = Fixture::new(limits).await;
     let (pipe, mut remote) = tokio::join!(
-        bounded(fixture.session.as_mut().unwrap().open_inbound(NETWORK, PEER)),
+        bounded(
+            fixture
+                .session
+                .as_mut()
+                .unwrap()
+                .open_inbound(NETWORK, PEER)
+        ),
         bounded(inbound_opened(&fixture.listener, PEER))
     );
     let mut pipe = success(pipe);
     remote.bytes(&[12, 0, 0, 0, 1]).await;
-    assert!(matches!(failure(bounded(pipe.recv()).await), RealtimeError::Timeout));
+    assert!(matches!(
+        failure(bounded(pipe.recv()).await),
+        RealtimeError::Timeout
+    ));
     remote.eof().await;
     success(bounded(pipe.close()).await);
     // A new explicit pipe claim can use the slot/budget the failed read held.
     let (pipe, mut remote) = tokio::join!(
-        bounded(fixture.session.as_mut().unwrap().open_inbound(NETWORK, "replacement")),
+        bounded(
+            fixture
+                .session
+                .as_mut()
+                .unwrap()
+                .open_inbound(NETWORK, "replacement")
+        ),
         bounded(inbound_opened(&fixture.listener, "replacement"))
     );
     let pipe = success(pipe);
@@ -587,17 +717,31 @@ async fn outbound_terminal_observer_sees_remote_eof_without_another_send() {
     let mut fixture = Fixture::new(policy()).await;
     let (flow, peers) = tokio::join!(
         bounded(fixture.session.as_mut().unwrap().open_flow(video("v"))),
-        bounded(opened(&fixture.listener, open_request("v", "video", "video/H264", 90_000, 0), "v", FLOW_A))
+        bounded(opened(
+            &fixture.listener,
+            open_request("v", "video", "video/H264", 90_000, 0),
+            "v",
+            FLOW_A
+        ))
     );
     let mut flow = success(flow);
     let (mut command, remote) = peers;
     command.eof().await;
     let mut termination = flow.termination();
     drop(remote);
-    assert_eq!(success(bounded(termination.wait(Duration::from_secs(2))).await), PipeEnd::RemoteClosed);
-    assert!(matches!(failure(bounded(flow.send(1, &[1])).await), RealtimeError::PipeEnded(PipeEnd::RemoteClosed)));
+    assert_eq!(
+        success(bounded(termination.wait(Duration::from_secs(2))).await),
+        PipeEnd::RemoteClosed
+    );
+    assert!(matches!(
+        failure(bounded(flow.send(1, &[1])).await),
+        RealtimeError::PipeEnded(PipeEnd::RemoteClosed)
+    ));
     // EOF does not consume F or turn a local socket into a native close ACK.
-    let (result, mut command) = tokio::join!(bounded(flow.close()), bounded(closed(&fixture.listener, FLOW_A)));
+    let (result, mut command) = tokio::join!(
+        bounded(flow.close()),
+        bounded(closed(&fixture.listener, FLOW_A))
+    );
     success(result);
     command.eof().await;
     fixture.finish().await;
@@ -610,15 +754,26 @@ async fn dropped_flow_keeps_its_exact_cleanup_owner_and_capacity_charge() {
     let mut fixture = Fixture::new(limits).await;
     let (flow, peers) = tokio::join!(
         bounded(fixture.session.as_mut().unwrap().open_flow(video("v"))),
-        bounded(opened(&fixture.listener, open_request("v", "video", "video/H264", 90_000, 0), "v", FLOW_A))
+        bounded(opened(
+            &fixture.listener,
+            open_request("v", "video", "video/H264", 90_000, 0),
+            "v",
+            FLOW_A
+        ))
     );
     let flow = success(flow);
     let (mut command, mut remote) = peers;
     command.eof().await;
-    assert!(matches!(failure(bounded(fixture.session.as_mut().unwrap().open_flow(video("other"))).await), RealtimeError::LimitExceeded(_)));
+    assert!(matches!(
+        failure(bounded(fixture.session.as_mut().unwrap().open_flow(video("other"))).await),
+        RealtimeError::LimitExceeded(_)
+    ));
     drop(flow);
     remote.eof().await;
-    assert!(matches!(failure(bounded(fixture.session.as_mut().unwrap().open_flow(video("other"))).await), RealtimeError::LimitExceeded(_)));
+    assert!(matches!(
+        failure(bounded(fixture.session.as_mut().unwrap().open_flow(video("other"))).await),
+        RealtimeError::LimitExceeded(_)
+    ));
     let (result, mut command) = tokio::join!(
         bounded(fixture.session.take().unwrap().close()),
         bounded(closed(&fixture.listener, FLOW_A))
@@ -634,15 +789,39 @@ async fn inbound_capacity_returns_after_explicit_pipe_close() {
     limits.max_inbound_pipes = 1;
     let mut fixture = Fixture::new(limits).await;
     let (pipe, mut remote) = tokio::join!(
-        bounded(fixture.session.as_mut().unwrap().open_inbound(NETWORK, PEER)),
+        bounded(
+            fixture
+                .session
+                .as_mut()
+                .unwrap()
+                .open_inbound(NETWORK, PEER)
+        ),
         bounded(inbound_opened(&fixture.listener, PEER))
     );
     let pipe = success(pipe);
-    assert!(matches!(failure(bounded(fixture.session.as_mut().unwrap().open_inbound(NETWORK, "other")).await), RealtimeError::LimitExceeded(_)));
+    assert!(matches!(
+        failure(
+            bounded(
+                fixture
+                    .session
+                    .as_mut()
+                    .unwrap()
+                    .open_inbound(NETWORK, "other")
+            )
+            .await
+        ),
+        RealtimeError::LimitExceeded(_)
+    ));
     success(bounded(pipe.close()).await);
     remote.eof().await;
     let (pipe, mut remote) = tokio::join!(
-        bounded(fixture.session.as_mut().unwrap().open_inbound(NETWORK, "other")),
+        bounded(
+            fixture
+                .session
+                .as_mut()
+                .unwrap()
+                .open_inbound(NETWORK, "other")
+        ),
         bounded(inbound_opened(&fixture.listener, "other"))
     );
     success(bounded(success(pipe).close()).await);
@@ -658,13 +837,21 @@ async fn utf8_label_limit_counts_wire_bytes_without_truncation() {
     let mut fixture = Fixture::new(limits).await;
     let overlong = "\u{e9}".repeat(128); // 128 characters, 256 bytes
     for label in ["", overlong.as_str()] {
-        assert!(matches!(failure(bounded(fixture.session.as_mut().unwrap().open_flow(video(label))).await), RealtimeError::InvalidInput(_)));
+        assert!(matches!(
+            failure(bounded(fixture.session.as_mut().unwrap().open_flow(video(label))).await),
+            RealtimeError::InvalidInput(_)
+        ));
     }
     let label = "\u{e9}".repeat(127) + "x";
     assert_eq!(label.len(), 255);
     let (flow, peers) = tokio::join!(
         bounded(fixture.session.as_mut().unwrap().open_flow(video(&label))),
-        bounded(opened(&fixture.listener, open_request(&label, "video", "video/H264", 90_000, 0), &label, FLOW_A))
+        bounded(opened(
+            &fixture.listener,
+            open_request(&label, "video", "video/H264", 90_000, 0),
+            &label,
+            FLOW_A
+        ))
     );
     let mut flow = success(flow);
     let (mut command, mut remote) = peers;
@@ -674,7 +861,10 @@ async fn utf8_label_limit_counts_wire_bytes_without_truncation() {
     let mut expected = vec![9, 1, 0, 0, 255, 0, 1, 0, 0, 0, 0, 0, 0, 0];
     expected.extend_from_slice(label.as_bytes());
     assert_eq!(frame, expected);
-    let (result, mut command) = tokio::join!(bounded(flow.close()), bounded(closed(&fixture.listener, FLOW_A)));
+    let (result, mut command) = tokio::join!(
+        bounded(flow.close()),
+        bounded(closed(&fixture.listener, FLOW_A))
+    );
     success(result);
     command.eof().await;
     remote.eof().await;
@@ -686,8 +876,13 @@ async fn known_flow_is_closed_once_when_outbound_pipe_setup_refuses() {
     let mut fixture = Fixture::new(policy()).await;
     let answering = async {
         let mut command = DaemonPeer::verified(&fixture.listener).await;
-        assert_eq!(command.request().await, open_request("v", "video", "video/H264", 90_000, 0));
-        command.reply(json!({"ok":true,"data":{"flow_label":"v","flow_capability":FLOW_A}})).await;
+        assert_eq!(
+            command.request().await,
+            open_request("v", "video", "video/H264", 90_000, 0)
+        );
+        command
+            .reply(json!({"ok":true,"data":{"flow_label":"v","flow_capability":FLOW_A}}))
+            .await;
         let mut pipe = DaemonPeer::verified(&fixture.listener).await;
         assert_eq!(pipe.request().await, outbound_request(FLOW_A));
         pipe.reply(json!({"ok":false,"error":"fixture pipe admission refusal","data":{"code":"flow_refused"}})).await;
@@ -700,7 +895,9 @@ async fn known_flow_is_closed_once_when_outbound_pipe_setup_refuses() {
         bounded(fixture.session.as_mut().unwrap().open_flow(video("v"))),
         bounded(answering)
     );
-    assert!(matches!(failure(result), RealtimeError::Refused { code: Some(code) } if code == "flow_refused"));
+    assert!(
+        matches!(failure(result), RealtimeError::Refused { code: Some(code) } if code == "flow_refused")
+    );
     // No flow was delivered. The exact rollback ACK discharged the known F;
     // finishing the owner must not issue a second close for that capability.
     fixture.finish().await;
@@ -721,7 +918,9 @@ async fn cancelled_open_tracks_late_capability_until_one_acknowledged_close() {
     drop(opening);
     assert!(fixture.session.as_ref().unwrap().is_fenced());
     let cleanup = async {
-        command.reply(json!({"ok":true,"data":{"flow_label":"v","flow_capability":FLOW_A}})).await;
+        command
+            .reply(json!({"ok":true,"data":{"flow_label":"v","flow_capability":FLOW_A}}))
+            .await;
         let mut next = DaemonPeer::verified(&fixture.listener).await;
         let request = next.request().await;
         let mut pipe = None;
@@ -729,7 +928,8 @@ async fn cancelled_open_tracks_late_capability_until_one_acknowledged_close() {
             // A cancelled offer may be noticed before or after pipe setup.
             // Both paths must still retire exactly the same returned F once.
             assert_eq!(request, outbound_request(FLOW_A));
-            next.reply(json!({"ok":true,"data":{"realtime_pipe":true}})).await;
+            next.reply(json!({"ok":true,"data":{"realtime_pipe":true}}))
+                .await;
             pipe = Some(next);
             let mut close = DaemonPeer::verified(&fixture.listener).await;
             assert_eq!(close.request().await, close_request(FLOW_A));
@@ -745,7 +945,10 @@ async fn cancelled_open_tracks_late_capability_until_one_acknowledged_close() {
         }
         command.eof().await;
     };
-    let (result, ()) = tokio::join!(bounded(fixture.session.take().unwrap().close()), bounded(cleanup));
+    let (result, ()) = tokio::join!(
+        bounded(fixture.session.take().unwrap().close()),
+        bounded(cleanup)
+    );
     success(result);
     fixture.events.eof().await;
 }
@@ -756,7 +959,10 @@ async fn unknown_open_capability_is_uncertain_and_fences_label_retry() {
         let mut fixture = Fixture::new(policy()).await;
         let answering = async {
             let mut command = DaemonPeer::verified(&fixture.listener).await;
-            assert_eq!(command.request().await, open_request("v", "video", "video/H264", 90_000, 0));
+            assert_eq!(
+                command.request().await,
+                open_request("v", "video", "video/H264", 90_000, 0)
+            );
             let mut data = json!({"flow_label":"v"});
             if let Some(capability) = capability {
                 data["flow_capability"] = capability;
@@ -772,7 +978,17 @@ async fn unknown_open_capability_is_uncertain_and_fences_label_retry() {
         assert!(fixture.session.as_ref().unwrap().is_fenced());
         let (finished_tx, mut finished_rx) = tokio::sync::oneshot::channel();
         let owner_close = async {
-            assert!(matches!(failure(fixture.session.as_mut().unwrap().open_flow(video("v")).await), RealtimeError::SessionFenced));
+            assert!(matches!(
+                failure(
+                    fixture
+                        .session
+                        .as_mut()
+                        .unwrap()
+                        .open_flow(video("v"))
+                        .await
+                ),
+                RealtimeError::SessionFenced
+            ));
             let result = fixture.session.take().unwrap().close().await;
             let _ = finished_tx.send(());
             result
@@ -797,19 +1013,36 @@ async fn refusal_codes_survive_without_exposing_client_or_known_flow_secrets() {
     let mut fixture = Fixture::new(policy()).await;
     let (flow, peers) = tokio::join!(
         bounded(fixture.session.as_mut().unwrap().open_flow(video("v"))),
-        bounded(opened(&fixture.listener, open_request("v", "video", "video/H264", 90_000, 0), "v", FLOW_A))
+        bounded(opened(
+            &fixture.listener,
+            open_request("v", "video", "video/H264", 90_000, 0),
+            "v",
+            FLOW_A
+        ))
     );
     let flow = success(flow);
     let (mut command, mut pipe) = peers;
     command.eof().await;
-    for code in ["session_not_current", "label_in_use", "flow_refused", "provider_configuration_invalid", CLIENT_SECRET, FLOW_A] {
+    for code in [
+        "session_not_current",
+        "label_in_use",
+        "flow_refused",
+        "provider_configuration_invalid",
+        CLIENT_SECRET,
+        FLOW_A,
+    ] {
         let answering = async {
             let mut command = DaemonPeer::verified(&fixture.listener).await;
-            assert_eq!(command.request().await, open_request("other", "video", "video/H264", 90_000, 0));
-            command.reply(json!({"ok":false,
-                "error":format!("remote diagnostic {CLIENT_SECRET} {FLOW_A}"),
-                "data":{"code":code}
-            })).await;
+            assert_eq!(
+                command.request().await,
+                open_request("other", "video", "video/H264", 90_000, 0)
+            );
+            command
+                .reply(json!({"ok":false,
+                    "error":format!("remote diagnostic {CLIENT_SECRET} {FLOW_A}"),
+                    "data":{"code":code}
+                }))
+                .await;
             command.eof().await;
         };
         let (result, ()) = tokio::join!(
@@ -827,7 +1060,10 @@ async fn refusal_codes_survive_without_exposing_client_or_known_flow_secrets() {
             assert!(matches!(error, RealtimeError::Refused { .. }));
         }
     }
-    let (result, mut command) = tokio::join!(bounded(flow.close()), bounded(closed(&fixture.listener, FLOW_A)));
+    let (result, mut command) = tokio::join!(
+        bounded(flow.close()),
+        bounded(closed(&fixture.listener, FLOW_A))
+    );
     success(result);
     command.eof().await;
     pipe.eof().await;
@@ -839,20 +1075,36 @@ async fn owner_close_attempts_every_known_flow_and_reports_unacknowledged_retire
     let mut fixture = Fixture::new(policy()).await;
     let (first, peers) = tokio::join!(
         bounded(fixture.session.as_mut().unwrap().open_flow(video("v"))),
-        bounded(opened(&fixture.listener, open_request("v", "video", "video/H264", 90_000, 0), "v", FLOW_A))
+        bounded(opened(
+            &fixture.listener,
+            open_request("v", "video", "video/H264", 90_000, 0),
+            "v",
+            FLOW_A
+        ))
     );
     let (mut first_command, mut first_pipe) = peers;
     first_command.eof().await;
     let (second, peers) = tokio::join!(
         bounded(fixture.session.as_mut().unwrap().open_flow(audio("a"))),
-        bounded(opened(&fixture.listener, open_request("a", "audio", "audio/opus", 48_000, 2), "a", FLOW_B))
+        bounded(opened(
+            &fixture.listener,
+            open_request("a", "audio", "audio/opus", 48_000, 2),
+            "a",
+            FLOW_B
+        ))
     );
     let (mut second_command, mut second_pipe) = peers;
     second_command.eof().await;
     let first = success(first);
     let second = success(second);
     let (inbound, mut inbound_remote) = tokio::join!(
-        bounded(fixture.session.as_mut().unwrap().open_inbound(NETWORK, PEER)),
+        bounded(
+            fixture
+                .session
+                .as_mut()
+                .unwrap()
+                .open_inbound(NETWORK, PEER)
+        ),
         bounded(inbound_opened(&fixture.listener, PEER))
     );
     let inbound = success(inbound);
@@ -863,18 +1115,26 @@ async fn owner_close_attempts_every_known_flow_and_reports_unacknowledged_retire
             let request = command.request().await;
             let capability = request["flow_capability"].as_str().unwrap().to_owned();
             assert!(capability == FLOW_A || capability == FLOW_B);
-            assert!(seen.insert(capability.clone()), "consumed close must never be retried");
+            assert!(
+                seen.insert(capability.clone()),
+                "consumed close must never be retried"
+            );
             assert_eq!(request, close_request(&capability));
             if capability == FLOW_A {
                 command.reply(json!({"ok":false,"error":"fixture consumed close refused","data":{"code":"flow_refused"}})).await;
             } else {
-                command.reply(json!({"ok":true,"data":{"closed":true}})).await;
+                command
+                    .reply(json!({"ok":true,"data":{"closed":true}}))
+                    .await;
             }
             command.eof().await;
         }
         assert_eq!(seen.len(), 2);
     };
-    let (result, ()) = tokio::join!(bounded(fixture.session.take().unwrap().close()), bounded(answering));
+    let (result, ()) = tokio::join!(
+        bounded(fixture.session.take().unwrap().close()),
+        bounded(answering)
+    );
     assert!(matches!(failure(result), RealtimeError::CleanupUncertain));
     // Local owner end must close idle sockets while the external handles
     // remain alive. No later send/recv or handle Drop may be needed to do so.
@@ -895,15 +1155,26 @@ async fn inbound_direction_cannot_send_or_acquire_an_outbound_pipe() {
         let mut expected = open_request("v", "video", "video/H264", 90_000, 0);
         expected["direction"] = json!("inbound");
         assert_eq!(command.request().await, expected);
-        command.reply(json!({"ok":true,"data":{"flow_label":"v","flow_capability":FLOW_A}})).await;
+        command
+            .reply(json!({"ok":true,"data":{"flow_label":"v","flow_capability":FLOW_A}}))
+            .await;
         command
     };
-    let (flow, mut command) = tokio::join!(bounded(fixture.session.as_mut().unwrap().open_flow(spec)), bounded(answering));
+    let (flow, mut command) = tokio::join!(
+        bounded(fixture.session.as_mut().unwrap().open_flow(spec)),
+        bounded(answering)
+    );
     let mut flow = success(flow);
     command.eof().await;
-    assert!(matches!(failure(bounded(flow.send(1, &[1])).await), RealtimeError::InvalidInput(_)));
+    assert!(matches!(
+        failure(bounded(flow.send(1, &[1])).await),
+        RealtimeError::InvalidInput(_)
+    ));
     // The next accepted command must be exact close, never an outbound pipe.
-    let (result, mut command) = tokio::join!(bounded(flow.close()), bounded(closed(&fixture.listener, FLOW_A)));
+    let (result, mut command) = tokio::join!(
+        bounded(flow.close()),
+        bounded(closed(&fixture.listener, FLOW_A))
+    );
     success(result);
     command.eof().await;
     fixture.finish().await;
@@ -914,9 +1185,13 @@ async fn another_client_cannot_adopt_an_owned_event_session() {
     let endpoint = PrivateEndpoint::new();
     let listener = endpoint.listen();
     let client = endpoint.client();
-    let (events, mut peer, _receiver) = event_registration(&listener, &client, ClientId(7), CLIENT_SECRET).await;
+    let (events, mut peer, _receiver) =
+        event_registration(&listener, &client, ClientId(7), CLIENT_SECRET).await;
     let foreign_client = endpoint.client();
-    assert!(matches!(failure(RealtimeSession::new(foreign_client, events, policy())), RealtimeError::StaleSession));
+    assert!(matches!(
+        failure(RealtimeSession::new(foreign_client, events, policy())),
+        RealtimeError::StaleSession
+    ));
     peer.eof().await;
 }
 
@@ -927,19 +1202,34 @@ async fn event_replacement_fences_old_io_and_cleanup_keeps_the_new_owner_alive()
     let old_generation = fixture.session.as_ref().unwrap().generation();
     let (flow, peers) = tokio::join!(
         bounded(fixture.session.as_mut().unwrap().open_flow(video("v"))),
-        bounded(opened(&fixture.listener, open_request("v", "video", "video/H264", 90_000, 0), "v", FLOW_A))
+        bounded(opened(
+            &fixture.listener,
+            open_request("v", "video", "video/H264", 90_000, 0),
+            "v",
+            FLOW_A
+        ))
     );
     let mut flow = success(flow);
     let (mut command, mut old_pipe) = peers;
     command.eof().await;
     let (old_inbound, mut old_inbound_remote) = tokio::join!(
-        bounded(fixture.session.as_mut().unwrap().open_inbound(NETWORK, PEER)),
+        bounded(
+            fixture
+                .session
+                .as_mut()
+                .unwrap()
+                .open_inbound(NETWORK, PEER)
+        ),
         bounded(inbound_opened(&fixture.listener, PEER))
     );
     let old_inbound = success(old_inbound);
     let (next_events, mut next_peer, _next_receiver) =
         event_registration(&fixture.listener, &fixture.client, ClientId(8), NEXT_SECRET).await;
-    let mut next = success(RealtimeSession::new(Arc::clone(&fixture.client), next_events, policy()));
+    let mut next = success(RealtimeSession::new(
+        Arc::clone(&fixture.client),
+        next_events,
+        policy(),
+    ));
     assert_ne!(next.generation(), old_generation);
     assert!(!fixture.session.as_ref().unwrap().is_current());
     fixture.events.eof().await;
@@ -947,24 +1237,44 @@ async fn event_replacement_fences_old_io_and_cleanup_keeps_the_new_owner_alive()
     // an old handle is operated on or dropped.
     old_pipe.eof().await;
     old_inbound_remote.eof().await;
-    assert!(matches!(failure(bounded(flow.send(1, &[1])).await), RealtimeError::StaleSession | RealtimeError::SessionFenced | RealtimeError::PipeEnded(PipeEnd::SessionEnded)));
+    assert!(matches!(
+        failure(bounded(flow.send(1, &[1])).await),
+        RealtimeError::StaleSession
+            | RealtimeError::SessionFenced
+            | RealtimeError::PipeEnded(PipeEnd::SessionEnded)
+    ));
     drop((flow, old_inbound));
-    let (result, mut command) = tokio::join!(bounded(fixture.session.take().unwrap().close()), bounded(closed(&fixture.listener, FLOW_A)));
+    let (result, mut command) = tokio::join!(
+        bounded(fixture.session.take().unwrap().close()),
+        bounded(closed(&fixture.listener, FLOW_A))
+    );
     success(result);
     command.eof().await;
-    assert!(next.is_current(), "old cleanup must not invalidate the successor generation");
+    assert!(
+        next.is_current(),
+        "old cleanup must not invalidate the successor generation"
+    );
     let answering = async {
         let mut peer = DaemonPeer::verified(&fixture.listener).await;
-        assert_eq!(peer.request().await, json!({
-            "op":"realtime_pipe","direction":"inbound","network":NETWORK,
-            "peer":PEER,"client_id":ClientId(8).to_string(),"client_capability":NEXT_SECRET
-        }));
-        peer.reply(json!({"ok":true,"data":{"realtime_pipe":true}})).await;
+        assert_eq!(
+            peer.request().await,
+            json!({
+                "op":"realtime_pipe","direction":"inbound","network":NETWORK,
+                "peer":PEER,"client_id":ClientId(8).to_string(),"client_capability":NEXT_SECRET
+            })
+        );
+        peer.reply(json!({"ok":true,"data":{"realtime_pipe":true}}))
+            .await;
         peer
     };
-    let (pipe, mut remote) = tokio::join!(bounded(next.open_inbound(NETWORK, PEER)), bounded(answering));
+    let (pipe, mut remote) = tokio::join!(
+        bounded(next.open_inbound(NETWORK, PEER)),
+        bounded(answering)
+    );
     let mut pipe = success(pipe);
-    remote.bytes(&[12, 0, 0, 0, 1, 0, 3, 0, 0, 0, 1, 0, 0, 0, b'v', 9]).await;
+    remote
+        .bytes(&[12, 0, 0, 0, 1, 0, 3, 0, 0, 0, 1, 0, 0, 0, b'v', 9])
+        .await;
     let unit = success(bounded(pipe.recv()).await);
     assert_eq!(unit.payload(), &[9]);
     drop(unit);
@@ -981,14 +1291,24 @@ async fn cancelled_close_is_uncertain_without_retrying_the_consumed_capability()
     let mut fixture = Fixture::new(policy()).await;
     let (first, peers) = tokio::join!(
         bounded(fixture.session.as_mut().unwrap().open_flow(video("v"))),
-        bounded(opened(&fixture.listener, open_request("v", "video", "video/H264", 90_000, 0), "v", FLOW_A))
+        bounded(opened(
+            &fixture.listener,
+            open_request("v", "video", "video/H264", 90_000, 0),
+            "v",
+            FLOW_A
+        ))
     );
     let first = success(first);
     let (mut first_command, mut first_pipe) = peers;
     first_command.eof().await;
     let (second, peers) = tokio::join!(
         bounded(fixture.session.as_mut().unwrap().open_flow(audio("a"))),
-        bounded(opened(&fixture.listener, open_request("a", "audio", "audio/opus", 48_000, 2), "a", FLOW_B))
+        bounded(opened(
+            &fixture.listener,
+            open_request("a", "audio", "audio/opus", 48_000, 2),
+            "a",
+            FLOW_B
+        ))
     );
     let (mut second_command, mut second_pipe) = peers;
     second_command.eof().await;
@@ -1057,7 +1377,10 @@ async fn impossible_body_budget_and_deadline_policies_refuse_before_transport() 
         let client = endpoint.client();
         let (events, mut peer, _receiver) =
             event_registration(&listener, &client, ClientId(7), CLIENT_SECRET).await;
-        assert!(matches!(failure(RealtimeSession::new(client, events, limits)), RealtimeError::InvalidPolicy(_)));
+        assert!(matches!(
+            failure(RealtimeSession::new(client, events, limits)),
+            RealtimeError::InvalidPolicy(_)
+        ));
         peer.eof().await;
     }
 }
