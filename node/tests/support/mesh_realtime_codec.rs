@@ -152,7 +152,9 @@ pub fn annex_b_nal_payloads(data: &[u8]) -> Vec<Vec<u8>> {
         .iter()
         .enumerate()
         .map(|(index, &(_, payload))| {
-            let end = starts.get(index + 1).map_or(data.len(), |&(start, _)| start);
+            let end = starts
+                .get(index + 1)
+                .map_or(data.len(), |&(start, _)| start);
             assert!(payload < end, "empty H264 NAL is not a picture fixture");
             let nal = &data[payload..end];
             assert_eq!(nal[0] & 0x80, 0, "H264 forbidden_zero_bit");
@@ -172,7 +174,10 @@ pub fn assert_decoded_video(units: &[Vec<u8>]) {
     .expect("initialize source OpenH264 decoder");
     let mut pictures = 0;
     for unit in units {
-        assert!(!unit.is_empty(), "empty unit cannot stand in for a received AU");
+        assert!(
+            !unit.is_empty(),
+            "empty unit cannot stand in for a received AU"
+        );
         if let Some(yuv) = decoder.decode(unit).expect("decode received H264 unit") {
             assert_picture(&yuv, pictures);
             pictures += 1;
@@ -191,9 +196,14 @@ pub fn assert_decoded_audio(packets: &[Vec<u8>]) {
     let mut decoder = OpusDecoder::new().expect("initialize software Opus decoder");
     let mut decoded = Vec::with_capacity(OPUS_FRAME_SAMPLES * AUDIO_PACKETS);
     for packet in packets {
-        assert!(!packet.is_empty(), "do not substitute PLC for a received packet");
+        assert!(
+            !packet.is_empty(),
+            "do not substitute PLC for a received packet"
+        );
         let mut pcm = [0; OPUS_FRAME_SAMPLES];
-        let count = decoder.decode(packet, &mut pcm).expect("decode received Opus");
+        let count = decoder
+            .decode(packet, &mut pcm)
+            .expect("decode received Opus");
         assert_eq!(count, OPUS_FRAME_SAMPLES, "one packet decodes to 20 ms");
         decoded.extend_from_slice(&pcm);
     }
@@ -210,10 +220,16 @@ pub fn assert_decoded_audio(packets: &[Vec<u8>]) {
     assert!((4_500.0..9_500.0).contains(&rms), "decoded tone RMS {rms}");
     let dc = steady.iter().map(|&s| f64::from(s)).sum::<f64>() / n;
     assert!(dc.abs() < 500.0, "unexpected decoded DC level {dc}");
-    let (sin, cos) = steady.iter().enumerate().fold((0.0, 0.0), |(s, c), (i, &v)| {
-        let angle = tone_angle(i);
-        (s + f64::from(v) * angle.sin(), c + f64::from(v) * angle.cos())
-    });
+    let (sin, cos) = steady
+        .iter()
+        .enumerate()
+        .fold((0.0, 0.0), |(s, c), (i, &v)| {
+            let angle = tone_angle(i);
+            (
+                s + f64::from(v) * angle.sin(),
+                c + f64::from(v) * angle.cos(),
+            )
+        });
     // Phase-independent projection onto the known 1-kHz sine/cosine pair.
     // At least 90% of decoded energy must be in the transmitted tone; this
     // checks useful content rather than merely accepting nonzero PCM.
