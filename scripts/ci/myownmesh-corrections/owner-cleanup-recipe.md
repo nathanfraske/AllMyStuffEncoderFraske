@@ -48,17 +48,23 @@ git apply --check <absolute-C2-owner-cleanup-regression.patch>
 git apply <absolute-C2-owner-cleanup-regression.patch>
 
 rustup run 1.88.0 rustfmt --check --edition 2021 --config skip_children=true crates/myownmesh/src/control.rs crates/myownmesh/src/control/handoff.rs crates/myownmesh/src/ipc/clients/registry.rs crates/myownmesh/src/control/owner_cleanup_regression.rs
-cargo +1.88.0 test -p myownmesh --bin myownmesh --no-default-features --locked --offline control::owner_cleanup_regression:: -- --test-threads=1
-cargo +1.88.0 test -p myownmesh --bin myownmesh --no-default-features --locked --offline control::handoff::tests:: -- --test-threads=1
+cargo +1.88.0 test -p myownmesh --lib --no-default-features --locked --offline control::owner_cleanup_regression:: -- --test-threads=1
+cargo +1.88.0 test -p myownmesh --lib --no-default-features --locked --offline control::handoff::tests:: -- --test-threads=1
 cargo +1.88.0 clippy -p myownmesh --all-targets --no-default-features --locked --offline -- -D warnings
 cargo +1.88.0 build -p myownmesh --bin myownmesh --release --no-default-features --locked --offline
 ```
 
 The new module's names/count are frozen by C2's regression receipt; the retained
 handoff filter has three definitions. They exercise production tables/guards
-using already-retired handles and cannot prove native flow retirement. The
-daemon package is a binary target, so these commands deliberately use
-`--bin myownmesh`.
+using already-retired handles and cannot prove native flow retirement. Control
+tests live in the implicit library target (`crates/myownmesh/src/lib.rs` exports
+`control`); the two unit commands must select `--lib`. The release build still
+selects `--bin myownmesh`. Initial runtime selections
+`88299aab-1780-43c2-9551-610b1326312e` and
+`6ef3cfe7-e347-4749-ba9f-e72dfd8e2186` selected the CLI binary and each ran zero
+tests with 56 filtered out. Inventory `227870a5-1416-411a-bb28-965bb6dd1b5e`
+lists those 56 CLI cases. These receipts remain target-selection failures,
+not passing focused gates; corrected library execution is still required.
 
 The real quiet-EOF gate uses C2's corrected raw probe/controller with explicit
 `--expect revoked`, the newly built checksum-pinned corrected daemon, a freshly
