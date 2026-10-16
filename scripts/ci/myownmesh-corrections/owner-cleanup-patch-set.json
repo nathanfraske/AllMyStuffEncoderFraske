@@ -1,0 +1,25 @@
+{
+  "schema": "myownmesh-corrections-patch-set-v1",
+  "kind": "corrected",
+  "qualification_scope": "owner-cleanup-only; no startup or AV-corrected qualification",
+  "base_commit": "db7818e09fedd98899490347b86ac9bc9f97b59b",
+  "base_tree": "5492d1845e15dbc067acec3ec592bb9500b9e21d",
+  "expected_tree": "b6a5aaeecb6aacaec142d986ff30d6bff149cc57",
+  "cargo_lock_sha256": "8f5a30ce863c43b0a8c5225f74d7446aed7656cd7032f47e70030526381930c6",
+  "patches": [
+    {
+      "path": "owner-cleanup-fix.patch",
+      "sha256": "6f8c1da2070208c159c663df3d6a67120558aeddb2b20b6b78c17a787e42caaf",
+      "purpose": "production",
+      "tree_before": "5492d1845e15dbc067acec3ec592bb9500b9e21d",
+      "tree_after": "d7f3723d7c2beb361659fef9f06abfe70631be06"
+    },
+    {
+      "path": "owner-cleanup-regression.patch",
+      "sha256": "1a5f193bc89766d47a53d5ebe76e75f72331e0d55bff39ceac42242e1b3068e5",
+      "purpose": "regression",
+      "tree_before": "d7f3723d7c2beb361659fef9f06abfe70631be06",
+      "tree_after": "b6a5aaeecb6aacaec142d986ff30d6bff149cc57"
+    }
+  ]
+}
