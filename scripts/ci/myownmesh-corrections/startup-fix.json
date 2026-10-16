@@ -1,0 +1,18 @@
+{
+  "schema": "myownmesh-corrections-patch-set-v1",
+  "kind": "corrected",
+  "qualification_scope": "startup-first-bind-only",
+  "base_commit": "db7818e09fedd98899490347b86ac9bc9f97b59b",
+  "base_tree": "5492d1845e15dbc067acec3ec592bb9500b9e21d",
+  "expected_tree": "3491be3b0b8e92fb965a770ef486e336e98a9ff1",
+  "cargo_lock_sha256": "8f5a30ce863c43b0a8c5225f74d7446aed7656cd7032f47e70030526381930c6",
+  "patches": [
+    {
+      "path": "startup-fix.patch",
+      "sha256": "74a666370dec84650bd1975a52e0a21fb87c721479b2ed33671b3f67ef4e4eb4",
+      "purpose": "production",
+      "tree_before": "5492d1845e15dbc067acec3ec592bb9500b9e21d",
+      "tree_after": "3491be3b0b8e92fb965a770ef486e336e98a9ff1"
+    }
+  ]
+}

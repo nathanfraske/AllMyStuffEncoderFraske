@@ -1,0 +1,142 @@
+diff --git a/crates/myownmesh-core/src/transport/webrtc.rs b/crates/myownmesh-core/src/transport/webrtc.rs
+index 53b0af55838790a07cd6cf5c62d07e71aa2099b4..277110bfdc752ca576b41d721df95eba1e7739bd 100644
+--- a/crates/myownmesh-core/src/transport/webrtc.rs
++++ b/crates/myownmesh-core/src/transport/webrtc.rs
+@@ -1937,6 +1937,21 @@ fn spawn_outbound_realtime_pump(
+         let incarnation = Arc::clone(&track.incarnation);
+         let native = Arc::clone(&track.track);
+         async {
++            // Keep accepted units and their leases in the existing queue while
++            // negotiation binds the native track. Closing the exact owner or
++            // retiring the connector cancels this wait, then the common tail
++            // below still removes the native sender and completes retirement.
++            let bound = tokio::select! {
++                biased;
++                () = pump.closed() => false,
++                ready = await_until_connector_retirement(
++                    incarnation.subscribe_retirement(),
++                    native.wait_for_first_bind(),
++                ) => ready.is_some(),
++            };
++            if !bound {
++                return;
++            }
+             loop {
+                 match pump.next() {
+                     session_flow::RealtimePumpStep::Unit(unit) => {
+diff --git a/crates/myownmesh-core/src/transport/webrtc/session_flow/queue.rs b/crates/myownmesh-core/src/transport/webrtc/session_flow/queue.rs
+index 04b78ff9ab8795dd146d674460f32ad55f3477c7..0f7c69884bde6545c2f3911b6620c307079aeac0 100644
+--- a/crates/myownmesh-core/src/transport/webrtc/session_flow/queue.rs
++++ b/crates/myownmesh-core/src/transport/webrtc/session_flow/queue.rs
+@@ -285,6 +285,19 @@ pub(crate) struct RealtimeOutboundPump {
+ }
+ 
+ impl RealtimeOutboundPump {
++    /// Observe this exact queue's end without taking or retaining a unit.
++    pub(in crate::transport::webrtc) async fn closed(&self) {
++        loop {
++            let ended = self.ready.notify().notified();
++            tokio::pin!(ended);
++            ended.as_mut().enable();
++            if self.queue.upgrade().is_none() {
++                return;
++            }
++            ended.await;
++        }
++    }
++
+     /// Take the next unit to write, or answer why there is none.
+     ///
+     /// `Closed` is terminal: the flow is gone and the pump must stop rather
+diff --git a/vendor/webrtc-0.13.0/src/track/track_local/track_local_static_sample.rs b/vendor/webrtc-0.13.0/src/track/track_local/track_local_static_sample.rs
+index 2c4d5166e01f6025afecf0defb4c1b267eeea7b3..57b3c315ceab56e46f91e088d2f81354c2b66303 100644
+--- a/vendor/webrtc-0.13.0/src/track/track_local/track_local_static_sample.rs
++++ b/vendor/webrtc-0.13.0/src/track/track_local/track_local_static_sample.rs
+@@ -1,6 +1,6 @@
+ use log::warn;
+ use media::Sample;
+-use tokio::sync::Mutex;
++use tokio::sync::{Mutex, MutexGuard, Notify};
+ 
+ use super::track_local_static_rtp::TrackLocalStaticRTP;
+ use super::*;
+@@ -21,6 +21,7 @@ struct TrackLocalStaticSampleInternal {
+ pub struct TrackLocalStaticSample {
+     rtp_track: TrackLocalStaticRTP,
+     internal: Mutex<TrackLocalStaticSampleInternal>,
++    first_bind: Notify,
+ }
+ 
+ impl TrackLocalStaticSample {
+@@ -30,6 +31,7 @@ impl TrackLocalStaticSample {
+ 
+         TrackLocalStaticSample {
+             rtp_track,
++            first_bind: Notify::new(),
+             internal: Mutex::new(TrackLocalStaticSampleInternal {
+                 packetizer: None,
+                 sequencer: None,
+@@ -50,6 +52,7 @@ impl TrackLocalStaticSample {
+ 
+         TrackLocalStaticSample {
+             rtp_track,
++            first_bind: Notify::new(),
+             internal: Mutex::new(TrackLocalStaticSampleInternal {
+                 packetizer: None,
+                 sequencer: None,
+@@ -64,10 +67,34 @@ impl TrackLocalStaticSample {
+         self.rtp_track.codec()
+     }
+ 
++    async fn bound_internal(&self) -> MutexGuard<'_, TrackLocalStaticSampleInternal> {
++        loop {
++            let bound = self.first_bind.notified();
++            tokio::pin!(bound);
++            bound.as_mut().enable();
++            let internal = self.internal.lock().await;
++            if internal.packetizer.is_some() && internal.sequencer.is_some() {
++                return internal;
++            }
++            drop(internal);
++            bound.await;
++        }
++    }
++
++    /// Wait until the first native bind has installed the packetizer and clock.
++    ///
++    /// This does not retain samples or establish remote delivery. The caller
++    /// owns cancellation and the lifetime within which binding may complete.
++    pub async fn wait_for_first_bind(&self) {
++        drop(self.bound_internal().await);
++    }
++
+     /// write_sample writes a Sample to the TrackLocalStaticSample
+     /// If one PeerConnection fails the packets will still be sent to
+     /// all PeerConnections. The error message will contain the ID of the failed
+     /// PeerConnections so you can remove them
++    /// Before the first bind this awaits negotiation instead of discarding the
++    /// sample. Cancelling that pending wait emits no sample data.
+     pub async fn write_sample(&self, sample: &Sample) -> Result<()> {
+         self.write_sample_with_extensions(sample, &[]).await
+     }
+@@ -82,11 +109,7 @@ impl TrackLocalStaticSample {
+         sample: &Sample,
+         extensions: &[rtp::extension::HeaderExtension],
+     ) -> Result<()> {
+-        let mut internal = self.internal.lock().await;
+-
+-        if internal.packetizer.is_none() || internal.sequencer.is_none() {
+-            return Ok(());
+-        }
++        let mut internal = self.bound_internal().await;
+ 
+         let (any_paused, all_paused) = (
+             self.rtp_track.any_binding_paused().await,
+@@ -224,6 +247,7 @@ impl TrackLocal for TrackLocalStaticSample {
+         )));
+         internal.sequencer = Some(sequencer);
+         internal.clock_rate = codec.capability.clock_rate as f64;
++        self.first_bind.notify_waiters();
+ 
+         Ok(codec)
+     }
