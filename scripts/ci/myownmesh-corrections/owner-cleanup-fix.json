@@ -1,0 +1,44 @@
+{
+  "upstream_base": "db7818e09fedd98899490347b86ac9bc9f97b59b",
+  "upstream_tree": "5492d1845e15dbc067acec3ec592bb9500b9e21d",
+  "application_base": "69f5913c21ff5db56ac51fac0a485fc5c74b8205",
+  "patch": "scripts/ci/myownmesh-corrections/owner-cleanup-fix.patch",
+  "patch_sha256": "6f8c1da2070208c159c663df3d6a67120558aeddb2b20b6b78c17a787e42caaf",
+  "patch_blob": "7b5897c5f0353d08059ad7fa9ba76544fed0daee",
+  "patch_bytes": 17394,
+  "files": [
+    {
+      "path": "crates/myownmesh/src/control.rs",
+      "mode": "100644",
+      "base_blob": "59c73564b0e5fea0677ceb077578a2ea626e3dcd",
+      "base_sha256": "8fa4cfc5fc372d406e79dc6436d3d0592d68aac1db037d0009a0e59d33f9a6d0",
+      "blob": "373b23e19e4d30514fb2fd61a6f0e5d7a81c203d",
+      "sha256": "c543da166eea638033d1eaf5b18aa01ceae88e25eec502909f88ae788ffd28f0",
+      "bytes": 243718
+    },
+    {
+      "path": "crates/myownmesh/src/control/handoff.rs",
+      "mode": "100644",
+      "base_blob": "1db48d34a46dae6482e5dd207da3fec3026cc3f1",
+      "base_sha256": "d9dd3f449e9da59efe26180cf891433c51fa45059bf4a2b999c4d712c3ea5417",
+      "blob": "f6580ed4ae708630f328f5573a7edd6c296b2f45",
+      "sha256": "9efd4a65c741c4c4e6a5e044bfe49b9af6abd77a686c181285469ad1f66a6ec3",
+      "bytes": 17346
+    },
+    {
+      "path": "crates/myownmesh/src/ipc/clients/registry.rs",
+      "mode": "100644",
+      "base_blob": "1fecf683a1cb7ef2a68b29f7ca2cdc31a21494de",
+      "base_sha256": "2ffa6526aec8e2a75029100cec542c4222cb1acd8c9649de49eec02206536926",
+      "blob": "1d8de9c8381c7b4465563df300882d37b32e905b",
+      "sha256": "8c3ec7bc64e07b9b053ec066d79f61ee3b73264076829db054c42f22d19affbb",
+      "bytes": 109643
+    }
+  ],
+  "source_count": 762,
+  "unchanged_source_count": 759,
+  "native_execution": "pending manager-only durable gates; no worker Rust/native execution",
+  "test_dependency": "C2 disjoint control/owner_cleanup_regression.rs patch required for cfg(test)",
+  "contract": "Exact Events-owner EOF/error/drop revocation; exact live-owner open/close cancellation and Sent settlement. Server write is not client receipt. Consumed F remains an error; no label retry or guessed-coordinate close.",
+  "private_source_note": "Initial archive exported CRLF. Immutable raw cat-file blobs verified against all exact-tree entries; unowned private bytes restored to canonical blobs, owned patch is canonical LF. Private f70 snapshot is export-form only, not the upstream Git commit."
+}

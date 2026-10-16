@@ -1,0 +1,366 @@
+diff --git a/crates/myownmesh/src/control.rs b/crates/myownmesh/src/control.rs
+index 59c73564b0e5fea0677ceb077578a2ea626e3dcd..373b23e19e4d30514fb2fd61a6f0e5d7a81c203d 100644
+--- a/crates/myownmesh/src/control.rs
++++ b/crates/myownmesh/src/control.rs
+@@ -65,6 +65,9 @@
+ /// performs an operation or knows what a network is — it is what the two ends
+ /// have to agree on, and it is the part a client reimplements.
+ mod wire;
++
++#[cfg(test)]
++mod owner_cleanup_regression;
+
+ pub use wire::{RealtimeAdvert, RealtimeEncoding, RealtimePipeDirection, Request, Response};
+
+@@ -326,6 +329,19 @@
+         }
+     }
+
++    /// Bind a command socket to the Events owner whose authority it presents.
++    /// Invalid authority still reaches dispatch's existing refusal response.
++    fn authenticated(
++        clients: &crate::ipc::ClientRegistry,
++        id: crate::ipc::ClientId,
++        capability: &str,
++    ) -> Self {
++        match clients.authenticate(id, capability) {
++            Some(owner) => Self::owned_by(clients, &owner),
++            None => Self::runtime(clients),
++        }
++    }
++
+     /// Resolves when this connection must stop, whatever the socket is doing.
+     ///
+     /// Both halves are edge-safe on their own: `closing` subscribes before it
+@@ -342,6 +358,58 @@
+             }
+             None => self.clients.closing().await,
+         }
++    }
++}
++
++/// Custody of the exact Events registration across errors and task cancellation.
++///
++/// Normal completion takes the removed record through the awaited release path.
++/// If the task is dropped first, revoke only this handle and use the existing
++/// synchronous flow cleanup and route-join custodian. No cleanup task is spawned.
++struct EventsOwner<'a> {
++    clients: &'a crate::ipc::ClientRegistry,
++    client: &'a myownmesh_core::FundedArc<crate::ipc::ClientHandle>,
++}
++
++impl<'a> EventsOwner<'a> {
++    fn new(
++        clients: &'a crate::ipc::ClientRegistry,
++        client: &'a myownmesh_core::FundedArc<crate::ipc::ClientHandle>,
++    ) -> Self {
++        Self { clients, client }
++    }
++
++    fn unregister(&self) -> Option<crate::ipc::UnregisteredClient> {
++        self.clients.unregister_exact(self.client)
++    }
++}
++
++impl Drop for EventsOwner<'_> {
++    fn drop(&mut self) {
++        if let Some(removed) = self.unregister() {
++            // Other command tasks can still hold this client handle. Draining
++            // now makes revocation independent of when those clones are dropped.
++            drop(removed.handle.drain_realtime_flows());
++            drop(removed);
++        }
++    }
++}
++
++/// Observe departure even while the one-way Events writer is blocked.
++///
++/// There are no client frames in this mode, so any completed read is terminal.
++/// The caller supplies its already-admitted reader and keeps the exact owner
++/// guard outside this future; cancellation therefore runs the same cleanup.
++async fn until_events_departure<R, F>(reader: &mut R, serving: F) -> Result<()>
++where
++    R: tokio::io::AsyncRead + Unpin,
++    F: std::future::Future<Output = Result<()>>,
++{
++    let mut probe = [0_u8; 1];
++    tokio::select! {
++        biased;
++        _ = tokio::io::AsyncReadExt::read(reader, &mut probe) => Ok(()),
++        result = serving => result,
+     }
+ }
+
+@@ -1356,7 +1424,7 @@
+                         }
+                     }
+                 };
+-                let client_id = client.id;
++                let events_owner = EventsOwner::new(&state.clients, &client);
+                 // From here the exact client is a cancellation owner too. See
+                 // [`ConnectionCancel::owned_by`]: the mailbox alone cannot end
+                 // this task, because this task is holding the handle its sender
+@@ -1364,32 +1432,38 @@
+                 let cancel = ConnectionCancel::owned_by(&state.clients, &client);
+                 // Ack carries the client_id so the caller knows what to pass
+                 // back on subsequent `client_id`-bearing ops.
+-                let ack = PreparedReply::EventsSubscribed(client.clone());
+-                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&ack), output)
+-                    .context("events-subscribe response exceeded its structural ceiling")?;
+-                let result = match write_admitted_line(&mut writer, &cancel, line).await? {
+-                    Wrote::Sent => {
+-                        // The subscription is live and the request that opened
+-                        // it is finished with. See
+-                        // [`ControlHooks::at_events_stream_entry`].
+-                        #[cfg(test)]
+-                        if let Some(barrier) = &state.at_events_stream_entry {
+-                            barrier.pass().await;
++                let serving = async {
++                    let ack = PreparedReply::EventsSubscribed(client.clone());
++                    let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&ack), output)
++                        .context("events-subscribe response exceeded its structural ceiling")?;
++                    match write_admitted_line(&mut writer, &cancel, line).await? {
++                        Wrote::Sent => {
++                            // The subscription is live and the request that opened
++                            // it is finished with. See
++                            // [`ControlHooks::at_events_stream_entry`].
++                            #[cfg(test)]
++                            if let Some(barrier) = &state.at_events_stream_entry {
++                                barrier.pass().await;
++                            }
++                            run_events_stream(
++                                &json_lines,
++                                &cancel,
++                                &mut writer,
++                                rx,
++                                state.mesh.events(),
++                            )
++                            .await
+                         }
+-                        run_events_stream(
+-                            &json_lines,
+-                            &cancel,
+-                            &mut writer,
+-                            rx,
+-                            state.mesh.events(),
+-                        )
+-                        .await
++                        // A server write is not proof of client receipt. Either
++                        // outcome below still releases the exact registration.
++                        Wrote::Ended => Ok(()),
+                     }
+-                    // The client never learned its own id, so there is nothing
+-                    // for it to do with the subscription. Cleanup below is the
+-                    // same either way.
+-                    Wrote::Ended => Ok(()),
+                 };
++                // Events is one-way from this point: as on an inbound realtime
++                // pipe, EOF, a read error, or an unsolicited byte ends the mode.
++                // Keep the admitted reader live across both ACK and event writes,
++                // so an idle stream or a blocked writer cannot hide departure.
++                let result = until_events_departure(reader.frames(), serving).await;
+                 // Clean up the client's claims regardless of how the stream
+                 // ended.
+                 //
+@@ -1406,7 +1480,7 @@
+                 // that something else is the shutdown sweep, which does the same
+                 // release with the same handle. Doing nothing here is not
+                 // skipping the work.
+-                if let Some(removed) = state.clients.unregister(client_id) {
++                if let Some(removed) = events_owner.unregister() {
+                     release_owned_registrations(&state, removed).await;
+                 }
+                 result?;
+@@ -1964,7 +2038,13 @@
+             } => {
+                 let owner = ResponseOwner::acquire(&json_lines)
+                     .context("realtime operation result was not admitted")?;
+-                let (variable, provisional) = dispatch::realtime::flow_open(
++                // Commands use separate sockets, but a pending open and its ACK
++                // still belong to this exact Events owner. Revocation cancels
++                // the open; any installed flow is covered by the same registry
++                // seam and exact handoff rollback as a failed response write.
++                let operation_cancel =
++                    ConnectionCancel::authenticated(&state.clients, client_id, &client_capability);
++                let opening = dispatch::realtime::flow_open(
+                     &state,
+                     owner,
+                     dispatch::realtime::FlowOpen {
+@@ -1979,13 +2059,18 @@
+                     },
+                     client_id,
+                     client_capability,
+-                )
+-                .await;
++                );
++                let (variable, provisional) = tokio::select! {
++                    biased;
++                    () = operation_cancel.cancelled() => break,
++                    result = opening => result,
++                };
+                 let mut provisional = handoff::HandoffGuard::new(provisional);
+-                // The capability naming this flow is the client's only copy, so
+-                // the flow is not this daemon's until the line carrying it has
+-                // actually been written.
+-                let wrote = write_variable(&mut writer, &json_lines, &cancel, variable).await;
++                // Sent means written and flushed by the server, not received by
++                // the caller. An unknown ACK outcome requires ending the owner
++                // or using a known exact capability, never retrying by label.
++                let wrote =
++                    write_variable(&mut writer, &json_lines, &operation_cancel, variable).await;
+                 settle_provisional_handoff(&state, &mut provisional, &wrote).await;
+                 match wrote.context("realtime response line was not admitted")? {
+                     Wrote::Sent => continue,
+@@ -1999,15 +2084,24 @@
+             } => {
+                 let owner = ResponseOwner::acquire(&json_lines)
+                     .context("realtime operation result was not admitted")?;
+-                let variable = dispatch::realtime::flow_close(
++                let operation_cancel =
++                    ConnectionCancel::authenticated(&state.clients, client_id, &client_capability);
++                // Dispatch takes the exact F before awaiting retirement. If
++                // owner revocation cancels that await, the move-only flow's
++                // existing Drop path still retires it; F is never reinstalled.
++                let closing = dispatch::realtime::flow_close(
+                     &state,
+                     owner,
+                     client_id,
+                     client_capability,
+                     flow_capability,
+-                )
+-                .await;
+-                match write_variable(&mut writer, &json_lines, &cancel, variable)
++                );
++                let variable = tokio::select! {
++                    biased;
++                    () = operation_cancel.cancelled() => break,
++                    result = closing => result,
++                };
++                match write_variable(&mut writer, &json_lines, &operation_cancel, variable)
+                     .await
+                     .context("realtime response line was not admitted")?
+                 {
+diff --git a/crates/myownmesh/src/control/handoff.rs b/crates/myownmesh/src/control/handoff.rs
+index 1db48d34a46dae6482e5dd207da3fec3026cc3f1..f6580ed4ae708630f328f5573a7edd6c296b2f45 100644
+--- a/crates/myownmesh/src/control/handoff.rs
++++ b/crates/myownmesh/src/control/handoff.rs
+@@ -1,16 +1,22 @@
+-//! State that is not this daemon's until the client has been told about it.
++//! Exact provisional ownership across a server response write.
+ //!
+ //! Realtime and RPC operations answer with the caller's *only* copy of a
+ //! capability or stream coordinate. If the response line is refused, or the
+ //! socket ends before it is written, the daemon releases only the exact local
+ //! handle. Queryable and idempotent domain operations do not use this local
+ //! handoff.
++//!
++//! A successful server write/flush is not proof that the caller received its
++//! answer. If an open's ACK outcome is unknown, the caller must retire its
++//! Events owner or close a capability it actually learned. Retrying by label,
++//! guessing coordinates, and treating a consumed close as idempotent are not
++//! supported recovery paths.
+
+ use std::sync::Arc;
+
+ use super::ControlState;
+
+-/// One handoff that is not final until the client has the answer.
++/// One handoff that is not final until the server writes the answer.
+ ///
+ /// Move-only and `#[must_use]`: the settle call is the only thing that consumes
+ /// it, so an arm that forgets to settle is a compiler warning rather than a
+@@ -65,6 +71,17 @@
+     }
+
+     pub(in crate::control) async fn settle(&mut self, state: &Arc<ControlState>, sent: bool) {
++        // The write can win its race with owner revocation. Do not commit a
++        // response against a dead or foreign owner; rollback names only the
++        // original handle and F. If revocation follows this check, its drain
++        // owns that same installed flow, so neither order can affect a successor.
++        let sent = sent
++            && match self.handoff.as_ref() {
++                Some(ProvisionalHandoff::RealtimeFlow { client, .. }) => {
++                    state.clients.is_current_owner(client)
++                }
++                _ => true,
++            };
+         if sent {
+             if let Some(handoff) = self.handoff.take() {
+                 handoff.commit();
+@@ -130,18 +147,18 @@
+         }
+     }
+
+-    /// The client has the answer, so the new state is this daemon's to keep.
++    /// The server wrote the answer; this does not establish client receipt.
+     fn commit(self) {
+         match self {
+             Self::None | Self::RealtimeFlow { .. } => {}
+-            // Only now does a task exist to forward into the writer the client
+-            // is reading, and only now does the client hold the coordinate that
+-            // names what it will carry.
++            // Only now does a task exist to forward into the Events writer.
++            // A lost client receipt is resolved by that exact owner's teardown,
++            // not by assuming receipt or replaying a coordinate-based request.
+             Self::RpcStream(pending) => pending.spawn(),
+         }
+     }
+
+-    /// The client does not have the answer, so undo exactly what was made.
++    /// The server did not complete the handoff; undo exactly what was made.
+     async fn roll_back(self, state: &Arc<ControlState>) {
+         match self {
+             Self::None => {}
+diff --git a/crates/myownmesh/src/ipc/clients/registry.rs b/crates/myownmesh/src/ipc/clients/registry.rs
+index 1fecf683a1cb7ef2a68b29f7ca2cdc31a21494de..1d8de9c8381c7b4465563df300882d37b32e905b 100644
+--- a/crates/myownmesh/src/ipc/clients/registry.rs
++++ b/crates/myownmesh/src/ipc/clients/registry.rs
+@@ -693,6 +693,18 @@
+         client.capability.matches(presented).then_some(client)
+     }
+
++    /// Whether this exact handle is still admitted by this registry.
++    ///
++    /// A numeric id alone is insufficient: another registry can issue the same
++    /// number, and a stale handoff must never act on a different owner.
++    pub(crate) fn is_current_owner(&self, owner: &FundedArc<ClientHandle>) -> bool {
++        let tables = self.inner.tables.lock();
++        admitting(&tables).is_ok()
++            && tables.clients.get(&owner.id).is_some_and(|current| {
++                std::ptr::eq(&**current, &**owner) && owner.connected.load(Ordering::Acquire)
++            })
++    }
++
+     /// Install a completed realtime open only while its event-stream owner is
+     /// still registered. This shares the registry table seam with
+     /// [`Self::unregister`]: install-first means the disconnect drain observes
+@@ -841,7 +853,29 @@
+     /// nobody serves — each holding its own retention in the network's gateway
+     /// scope, which is not this registry's to spend.
+     pub fn unregister(&self, id: ClientId) -> Option<UnregisteredClient> {
++        self.unregister_matching(id, |_| true)
++    }
++
++    /// Revoke only the registration held by this exact connection guard.
++    ///
++    /// Check and removal share the install/unregister lock. An old guard or a
++    /// guard from another registry cannot revoke a current owner by id alone.
++    pub(crate) fn unregister_exact(
++        &self,
++        owner: &FundedArc<ClientHandle>,
++    ) -> Option<UnregisteredClient> {
++        self.unregister_matching(owner.id, |current| std::ptr::eq(&**current, &**owner))
++    }
++
++    fn unregister_matching(
++        &self,
++        id: ClientId,
++        matches: impl FnOnce(&FundedArc<ClientHandle>) -> bool,
++    ) -> Option<UnregisteredClient> {
+         let mut tables = self.inner.tables.lock();
++        if !matches(tables.clients.get(&id)?) {
++            return None;
++        }
+         let handle = tables.clients.remove(&id)?;
+         handle.connected.store(false, Ordering::Release);
+         handle.disconnected.notify_waiters();
