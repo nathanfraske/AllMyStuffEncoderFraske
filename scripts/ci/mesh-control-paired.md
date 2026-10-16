@@ -276,3 +276,93 @@ line, bounded streaming, complete EOF drain and sole final reap. Record actual
 nested target OS/toolchain/source identities. An online catalog entry alone is
 not native execution. Inspect any `outcome_unknown` target receipt before another
 start; never replay it or signal an unrelated process group.
+
+The actual paired-media gate remains **failed as of 2026-10-16** at candidate
+`db7818e09fedd98899490347b86ac9bc9f97b59b`. Preserve these primary Windows runs
+and their separate failure boundaries. The evidence directories below are under
+the manager's retained `target/mesh03-realtime/`; each contains `receipt.json`
+and complete child streams.
+
+| Durable run | Application source | Evidence directory | Observed boundary |
+| --- | --- | --- | --- |
+| `fd99fee5-3c94-495f-8d44-ad87f717c218` | `479025b529d122a6af6b86f4743458bda2058b96` | `pair-transport-direct-479025b` | Original policy rejected during A's semantic startup, before B, FlowOpen or media |
+| `cb8e4886-ecb9-4f15-a8e1-de558a16336f` | `949aa96ca54273132c8466edefb6392304c8b44d` | `pair-transport-direct-e6729ca6` | Startup passed; strict Opus comparison received exact packet 1 while expecting packet 0; phase not established by this log |
+| `5ebcdcde-f129-4c19-971f-18f81bdc98c0` | `8a59dce9d277f205410d0c4066a5bd00bfd8bf87` | `pair-transport-direct-e6729ca6-backtrace` | Same comparison failure; `RUST_BACKTRACE=1` produced a header without caller frames, so phase remained unproved |
+| `904b694b-cd73-49d5-9a7d-4b87270973ee` | `823c99fde9c160b11b932e6f7664081796d14c8c` | `pair-transport-direct-823c99f-phase` | Safe diagnostics establish the first receive in `initial_forward` as packet 1 instead of expected packet 0 |
+
+The first run used original policy LF SHA256
+`0e8b132f6373c771eb3bdcfea9e2d95d541fcc9c533c1aa8674858288d3755c7`.
+The owner then selected only three lower values: retained WAL frames 64 to 48,
+checkpoint threshold 263712 to 197792 bytes, and admitted bytes 4194304 to
+1769472. The corrected policy is the `e6729ca6...` LF identity above; all other
+ceilings remain unchanged. Windows receipts retain raw CRLF file hashes
+(`85e2aaea...` originally, `45ad0d80...` corrected); their parsed JSON matches
+the respective LF policy. The invalid-policy run remains a startup failure,
+not media-delivery evidence.
+
+In `904b694b`, source audio 0 (371 bytes, SHA256
+`f05fbbb5c94e59cdcf0114e1f521db4df0760a279d4d19b88813f46478c6149e`)
+and the next paced audio 1 (297 bytes, SHA256
+`8a44f9f6c7774f8f87f2ee4ebde2304f57dc8f31e8cc0a766c791394df92246c`)
+both completed local writes. The first receive had the expected audio label,
+`expected_index:0` and `prior_units_verified:0`, but its entire payload matched
+audio 1. No phase completed. This proves a strict initial-order failure; it
+does not establish whether packet 0 was lost or delayed, nor prove video
+delivery or received software decode. `paired.stdout` is 2002 bytes, SHA256
+`a5d4e18831fee3471bdccea704f0b1e9baa1bb4f57d05584463cc0a17688a78f`.
+Both peers reported ACTIVE, but that is not a flow readiness result. The run
+selected `--mode direct`; actual host/host pair assertions occur after the
+initial batch and were not reached.
+
+[Hosted run 38947043848](https://github.com/nathanfraske/AllMyStuffEncoderFraske/actions/runs/38947043848)
+used application `8a59dce9d277f205410d0c4066a5bd00bfd8bf87` and the same exact
+candidate and corrected policy. Its native Windows AMD64 and Intel macOS
+Darwin 24.6.0/x86_64 transport pairs each failed the strict Opus comparison.
+Each received byte array matches that host's generated `audio-1.opus`, while
+the expected array matches its `audio-0.opus`; these are not universal codec
+goldens. Their earlier logs do not independently establish the exact phase.
+Artifacts are retained in `ci-38947043848/mesh03-native-{windows-latest,macos-15-intel}-38947043848-1/`,
+with the comparison streams in `transport-pair/` and actual source files in
+`vectors/`. Both native vector generators and reference software decode passed
+for three H264 AUs with AMS identity SEI and six Opus packets; this does not
+qualify received-stream decode. The original Ubuntu job stopped at the earlier
+portable fixture (21/22 passed), before an actual pair. Its corrected fixture
+has not yet been executed on native Linux at this checkpoint.
+
+The four primary Windows pair receipts and both hosted pair receipts record
+all owned children reaped, private roots removed and no cleanup errors. Hosted
+Mac records `normal_shutdown:true`; Windows records forced owned termination
+and `normal_shutdown:false`. Cleanup success does not change the media failure.
+
+The source handoff is **MESH03-UP-READY-04**, independently derived in A2's
+retained `target/mesh03-fixtures/readiness-contract-analysis.json` (SHA256
+`56faba8870271bdfc1bb7d4f21e39267a043e4b81de63191065474fcfefb5667`).
+At the exact candidate, FlowOpen/pipe acknowledgements, ACTIVE, current flow
+identity and the Status profile advert do not establish native readiness for
+that newly opened flow. The fresh-sender
+[add_track path](https://github.com/nathanfraske/MyOwnMeshSecurityReview/blob/db7818e09fedd98899490347b86ac9bc9f97b59b/vendor/webrtc-0.13.0/src/peer_connection/mod.rs#L1713)
+creates a transceiver and schedules negotiation without awaiting later track
+binding; a reused sender can perform binding work, so this is not a universal
+binding barrier. The vendored
+[sample writer](https://github.com/nathanfraske/MyOwnMeshSecurityReview/blob/db7818e09fedd98899490347b86ac9bc9f97b59b/vendor/webrtc-0.13.0/src/track/track_local/track_local_static_sample.rs#L87)
+returns success without emitting RTP while its packetizer/sequencer is absent.
+Conversely, the receiver's initial
+[peek](https://github.com/nathanfraske/MyOwnMeshSecurityReview/blob/db7818e09fedd98899490347b86ac9bc9f97b59b/vendor/webrtc-0.13.0/src/track/track_remote/mod.rs#L280)
+requeues its packet; an asynchronous receive hook alone does not prove it
+discarded the first packet. These sources support a possible startup window,
+not a proved cause of the observed mismatch.
+
+The concrete upstream need is an exact-owner, flow-specific readiness contract
+that establishes the applicable native sender binding before claiming readiness
+to send, with bounded failure/refusal and lifecycle semantics. No public such
+barrier was identified in the reviewed daemon/core contract. Existing session,
+profile or current-identity checks cannot supply it. This is an upstream handoff,
+not an upstream patch or issue submission; no hidden warm-up, sleep, packet
+discard, retry or relaxed comparator has been added.
+
+The initial transport failure leaves full AV delivery, received video/SEI/clock
+and software-decode checks, later independent-lifetime/refusal/pressure/cancel/
+restart scenarios, the actual node consumer pair and measured host/host path
+gates unmet. The separately built transport-lab artifact has no actual relay
+pair pass. Native Linux paired delivery, hardware capture/render/playback,
+installed service behavior and product V1 activation remain unqualified.
