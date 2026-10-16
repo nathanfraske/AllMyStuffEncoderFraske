@@ -117,7 +117,7 @@ Reset recovery) before hashing; it checks reference software decode. Those
 source timestamps/key classifications are provenance, not invented wire fields.
 
 Use the unchanged explicit TEST input [mesh-control-paired-policy.json](mesh-control-paired-policy.json),
-SHA256 `0e8b132f6373c771eb3bdcfea9e2d95d541fcc9c533c1aa8674858288d3755c7`.
+SHA256 `e6729ca6d0887ec0b4ef2cd91da404ffb477b251e00a5a8c1381254c1a9a9fe6`.
 The owner selected all eleven finite resource dimensions, network semantic,
 scheduler/signaling/history/profile and client/time ceilings. These are test
 inputs, not application defaults or a guarantee of admission. Refusal never
