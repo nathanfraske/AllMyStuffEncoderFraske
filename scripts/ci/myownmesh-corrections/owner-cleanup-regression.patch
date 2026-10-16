@@ -1,9 +1,9 @@
 diff --git a/crates/myownmesh/src/control/owner_cleanup_regression.rs b/crates/myownmesh/src/control/owner_cleanup_regression.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..62e96de69fe867d51cd15fedc1f7c4c1ecf52b06
+index 0000000000000000000000000000000000000000..9c6677d6e402cf794a17ab414f887ef71e9880cd
 --- /dev/null
 +++ b/crates/myownmesh/src/control/owner_cleanup_regression.rs
-@@ -0,0 +1,541 @@
+@@ -0,0 +1,572 @@
 +//! Owner/ACK controls using production registry, write and handoff paths.
 +//!
 +//! The installed handles are already retired transport-lab handles. These
@@ -264,7 +264,9 @@ index 0000000000000000000000000000000000000000..62e96de69fe867d51cd15fedc1f7c4c1
 +            assert_pending(connection.as_mut());
 +            assert!(accepted.load(Ordering::SeqCst) == 8);
 +            departed.store(true, Ordering::SeqCst);
-+            connection.await.expect("departure terminates one-way Events");
++            connection
++                .await
++                .expect("departure terminates one-way Events");
 +            drop(owner);
 +            assert!(!state.clients.is_current_owner(&retained_client));
 +            assert!(!contains(&retained_client, &capability));
@@ -327,7 +329,10 @@ index 0000000000000000000000000000000000000000..62e96de69fe867d51cd15fedc1f7c4c1
 +        let capability = installed(&state, &current, b"current");
 +        let (foreign, _foreign_rx) = registered(&foreign_registry);
 +        let _foreign_owner = EventsOwner::new(&foreign_registry, &foreign);
-+        assert!(foreign.id == current.id, "independent registries start at the same id");
++        assert!(
++            foreign.id == current.id,
++            "independent registries start at the same id"
++        );
 +        assert!(!state.clients.is_current_owner(&foreign));
 +        assert!(state.clients.unregister_exact(&foreign).is_none());
 +        let rejected = state.clients.install_realtime_flow(
@@ -354,7 +359,10 @@ index 0000000000000000000000000000000000000000..62e96de69fe867d51cd15fedc1f7c4c1
 +        });
 +        // Hold the removed record alive, as an in-progress normal cleanup can.
 +        // An unconditional Sent commit would strand F until those clones drop.
-+        let removed = state.clients.unregister_exact(&client).expect("remove exact owner");
++        let removed = state
++            .clients
++            .unregister_exact(&client)
++            .expect("remove exact owner");
 +        assert!(contains(&client, &capability));
 +        let (successor, _successor_rx) = registered(&state.clients);
 +        let _successor_owner = EventsOwner::new(&state.clients, &successor);
@@ -386,10 +394,14 @@ index 0000000000000000000000000000000000000000..62e96de69fe867d51cd15fedc1f7c4c1
 +            let frames = admission();
 +            let cancel = ConnectionCancel::owned_by(&state.clients, &client);
 +            let (mut writer, accepted) = CountWriter::new(mode);
-+            let wrote =
-+                write_variable(&mut writer, &frames, &cancel, open_reply(&frames, &capability))
-+                    .await
-+                    .expect("fixture encoding succeeds before the write fails");
++            let wrote = write_variable(
++                &mut writer,
++                &frames,
++                &cancel,
++                open_reply(&frames, &capability),
++            )
++            .await
++            .expect("fixture encoding succeeds before the write fails");
 +            assert!(wrote == Wrote::Ended);
 +            assert!(accepted.load(Ordering::SeqCst) > 0);
 +            handoff.settle(&state, false).await;
@@ -415,9 +427,16 @@ index 0000000000000000000000000000000000000000..62e96de69fe867d51cd15fedc1f7c4c1
 +                capability: capability.clone(),
 +            });
 +            let cancel = ConnectionCancel::owned_by(&state.clients, &client);
-+            let wrote =
-+                write_variable(&mut writer, &frames, &cancel, open_reply(&frames, &capability)).await;
-+            handoff.settle(&state, matches!(wrote, Ok(Wrote::Sent))).await;
++            let wrote = write_variable(
++                &mut writer,
++                &frames,
++                &cancel,
++                open_reply(&frames, &capability),
++            )
++            .await;
++            handoff
++                .settle(&state, matches!(wrote, Ok(Wrote::Sent)))
++                .await;
 +        });
 +        assert_pending(connection.as_mut());
 +        assert!(accepted.load(Ordering::SeqCst) == 8);
@@ -472,9 +491,14 @@ index 0000000000000000000000000000000000000000..62e96de69fe867d51cd15fedc1f7c4c1
 +        let frames = admission();
 +        let cancel = ConnectionCancel::owned_by(&state.clients, &client);
 +        let (mut writer, accepted) = CountWriter::new(WriteMode::Sent);
-+        let wrote = write_variable(&mut writer, &frames, &cancel, open_reply(&frames, &capability))
-+            .await
-+            .expect("fixture server accepts and flushes the whole ACK");
++        let wrote = write_variable(
++            &mut writer,
++            &frames,
++            &cancel,
++            open_reply(&frames, &capability),
++        )
++        .await
++        .expect("fixture server accepts and flushes the whole ACK");
 +        assert!(wrote == Wrote::Sent && accepted.load(Ordering::SeqCst) > 8);
 +        // This writer has no receiving client. Sent alone cannot distinguish
 +        // delivered ACK from lost receipt, and must not undo a live owner's F.
@@ -494,7 +518,11 @@ index 0000000000000000000000000000000000000000..62e96de69fe867d51cd15fedc1f7c4c1
 +        let _bystander_owner = EventsOwner::new(&state.clients, &bystander);
 +        let other = installed(&state, &bystander, b"untouched");
 +        let frames = admission();
-+        for mode in [WriteMode::PrefixError, WriteMode::FlushError, WriteMode::Sent] {
++        for mode in [
++            WriteMode::PrefixError,
++            WriteMode::FlushError,
++            WriteMode::Sent,
++        ] {
 +            let capability = installed(&state, &client, b"one-close");
 +            for (id, presented) in [
 +                (client.id, "not-a-client-capability"),
@@ -522,7 +550,10 @@ index 0000000000000000000000000000000000000000..62e96de69fe867d51cd15fedc1f7c4c1
 +            // successful native close: removal precedes the network lookup.
 +            assert!(!contains(&client, &capability));
 +            let line = encoded_reply(reply, &frames);
-+            assert!(line_has_error(&line, "unknown network: owner-regression-net"));
++            assert!(line_has_error(
++                &line,
++                "unknown network: owner-regression-net"
++            ));
 +            let cancel = ConnectionCancel::owned_by(&state.clients, &client);
 +            let (mut writer, accepted) = CountWriter::new(mode);
 +            let wrote = write_admitted_line(&mut writer, &cancel, line)
@@ -537,8 +568,8 @@ index 0000000000000000000000000000000000000000..62e96de69fe867d51cd15fedc1f7c4c1
 +            assert!(wrote == expected);
 +            // This second exact close observes the consumed token. It is an
 +            // assertion of refusal, not an automatic recovery/reopen attempt.
-+            let repeated = close_reply(&state, &frames, client.id, client.capability(), &capability)
-+                .await;
++            let repeated =
++                close_reply(&state, &frames, client.id, client.capability(), &capability).await;
 +            assert!(has_error(repeated, &frames, UNKNOWN_FLOW));
 +            assert!(contains(&bystander, &other));
 +            assert!(state.clients.is_current_owner(&bystander));

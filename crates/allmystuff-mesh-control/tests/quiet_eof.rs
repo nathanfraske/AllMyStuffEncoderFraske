@@ -351,8 +351,7 @@ fn isolated_owner_revocation() {
                     capability: subject_owner.capability.clone(),
                 };
                 assert!(
-                    close_never_issued(&endpoint, &stale, true).await
-                        == "invalid_local_authority"
+                    close_never_issued(&endpoint, &stale, true).await == "invalid_local_authority"
                 );
 
                 // Same explicit quiet measurement as the failing baseline,
