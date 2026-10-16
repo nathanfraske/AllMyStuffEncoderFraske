@@ -15,6 +15,9 @@ pub mod contract;
 mod session;
 pub mod transport;
 
+#[cfg(feature = "realtime")]
+pub mod realtime;
+
 pub use allmystuff_protocol::{ClientId, Request, Response};
 pub use client::{ControlClient, StatusGuard, StatusProbe};
 pub use session::{ConnectionGeneration, EventContract, EventRegistration, EventSession};

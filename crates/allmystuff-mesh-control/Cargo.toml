@@ -11,6 +11,10 @@ repository.workspace = true
 [lints.rust]
 unsafe_code = "forbid"
 
+[features]
+default = []
+realtime = []
+
 [dependencies]
 allmystuff-protocol = { workspace = true }
 anyhow = "1"
@@ -23,4 +27,13 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 getrandom = "0.2"
+sha2 = "0.10"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
+
+[[test]]
+name = "realtime_contract"
+required-features = ["realtime"]
+
+[[test]]
+name = "realtime_paired"
+required-features = ["realtime"]
