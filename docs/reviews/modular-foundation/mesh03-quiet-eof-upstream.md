@@ -1,9 +1,10 @@
 This handoff characterizes `MESH03-UP-EOF-01` in draft MyOwnMesh PR135 at
 `db7818e09fedd98899490347b86ac9bc9f97b59b` (tree
 `5492d1845e15dbc067acec3ec592bb9500b9e21d`). The AllMyStuff preparation base is
-`41ff847d2397af12da33750d02daaaff4a74e6a1`. Source inspection supports the gap;
-native reproduction is pending. This is an issue packet for review, with no
-upstream posting or upstream implementation change.
+`41ff847d2397af12da33750d02daaaff4a74e6a1`. Native Windows reproduction confirmed
+retained client authority at the bounded quiet observation described below.
+This is an issue packet for review, with no upstream posting or upstream
+implementation change.
 
 An Events connection is the lifetime owner of its daemon-issued client ID and
 capability C. On a quiet daemon, closing that connection should make its
@@ -157,8 +158,63 @@ ACK ambiguity separately needs a supported reconciliation/retirement contract
 or an honest uncertain outcome. This packet changes neither upstream behavior
 nor AllMyStuff's application authorization, consent or ownership decisions.
 
-Actual native result and durable run IDs are pending manager execution. A2's
-Oct16 source packet reverified PR135/tree identity and the source chain; C1
-independently read the relevant immutable sources and prepared this diagnostic.
-No published release, successful native reproduction, missing-flow cleanup or
-unbounded-leak claim follows from the source review alone.
+On 2026-10-16, manager-owned native Windows run
+`f76bb5d6-607b-4798-b229-b0f07e41e3ca` completed with exit zero in 3.840 seconds,
+with complete untruncated stdout/stderr (1917/0 bytes). It ran the accepted raw
+probe at AllMyStuff `001102ed452b9e1c4bd81ee4e4677fa4b804a302` against the
+stock candidate. This records the expected defect observation selected by
+`--expect retained`, rather than a pass for disconnect cleanup.
+
+| Recorded native observation | Actual result |
+| --- | --- |
+| Wrong C, before closing subject Events | `invalid_local_authority` |
+| Real C + never-issued F, before close | `unknown_flow_capability` |
+| Real C + never-issued F, immediately after whole-stream close | `unknown_flow_capability` |
+| Real C + never-issued F, after quiet interval | `unknown_flow_capability`, sampled 2006 ms after local close |
+| Explicit observer interval | 2000 ms; observer remained connected and silent |
+| Open operations | `flow_open_requests=0`; no network, peer, media pipe or real flow |
+| Probe | One test passed; zero failed/ignored/measured/filtered; 564-byte stdout, empty stderr |
+| Controller | `expected_observation_recorded`, `gap_reproduced=true`, empty cleanup errors |
+| Final process cleanup | Only owned daemon forcibly terminated/reaped on Windows; `normal_shutdown=false`; private root removed after all children were reaped |
+
+The native host was Windows 11/AMD64 (`10.0.26300`, `DESKTOP-TMT37GF`) with
+Python 3.13.6. Stock build `1d4c4f38-4cd9-4776-a4b0-386107104f84` used Rust/Cargo
+1.88.0, `--locked --release --no-default-features`, and exact upstream
+`db7818e09fedd98899490347b86ac9bc9f97b59b`. Its source status was clean and
+Cargo.lock hash unchanged. The 15,236,096-byte daemon SHA256 was
+`d48a228f42a7da3813dd38e4e0292ceb5bb651d443e44e697b3f5d287e9c6047`.
+The raw probe was selected from Cargo JSON in successful build
+`4e49c4bf-d209-403e-9223-b140e1d83777` (24.445 seconds); its 1,935,872-byte
+executable SHA256 was
+`2ddf1f7032bf29d58a591bfd1cc841a64c412a53e54be40a6518f415e2bb0b63`.
+Both original executable hashes were independently rechecked after the run.
+
+The initial scoped formatting check
+`769bd592-7d3b-427f-85f9-de5cfd013ea4` failed on three wraps. Exact retained
+formatter changes, including one optional parameter comma, were committed as
+`0ade49b2acd9ba3d3214b6d48666750ec49a7dda`; inverse reconstruction restores the
+entire executed probe source. Corrected formatting run
+`674820ce-fc2c-4535-acd5-3c06c3df1d6f` passed with empty streams at manager
+`86d75806ba45d52e352cc42038f89dd868e1344a`. The native observation remains
+qualified to the original `001102e` executable, without claiming another run
+after that formatting-only change.
+
+Manager evidence is retained under
+`target/mesh03-realtime/quiet-eof-windows-001102e/`: `receipt.json` SHA256
+`3b6a27b1a87b09661cf9813a7b678c6955e933d25f3bc23814a1c7396a108787` and
+`probe.stdout` SHA256
+`113e702636f3f77915c92724f9caf48fd96a615da8840326acb0626e74dd6569`.
+Sibling `upstream-windows-stock-build.json` and `quiet-eof-probe-build.json`
+retain the build/source mapping and artifact selection. C1 read the complete
+four successful durable records and actual receipt, rehashed all four captured
+streams and both original executables, and confirmed the private root's absence.
+C2's original exact source acceptance remains separate from review of these
+changed native facts.
+
+This proves retained client authority at that finite quiet observation in a
+private same-account Windows infrastructure process. It does not establish an
+unbounded leak, actual media-flow retention, a successful lost-FlowOpen-ACK
+reproduction, graceful Windows shutdown or another platform's behavior.
+ACK-loss remains the unexecuted source limitation described above. A2's Oct16
+source packet and the independent immutable-source read support the causal
+explanation; no upstream posting, fix or installed-service change occurred.
