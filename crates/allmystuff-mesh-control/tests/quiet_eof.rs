@@ -261,3 +261,154 @@ fn isolated_quiet_events_eof() {
             .expect("private quiet-EOF diagnostic total deadline");
         });
 }
+
+/// Corrected-owner regression. The historical retained-authority diagnostic
+/// above remains available as the baseline characterization, not a green gate.
+#[test]
+#[ignore = "requires corrected checksum-pinned private daemon under mesh03_quiet_eof.py"]
+fn isolated_owner_revocation() {
+    let root = PathBuf::from(required("AMS_QUIET_EOF_ROOT"));
+    let owner = required("AMS_QUIET_EOF_OWNER");
+    assert!(root.is_absolute());
+    assert!(root.is_dir() && !root.is_symlink());
+    let custody: Value = serde_json::from_slice(
+        &std::fs::read(root.join("custody.json")).expect("read private custody marker"),
+    )
+    .unwrap_or_else(|_| panic!("parse private custody marker"));
+    assert!(custody.get("owner").and_then(Value::as_str) == Some(owner.as_str()));
+    assert!(custody.get("root").and_then(Value::as_str) == root.to_str());
+    let endpoint = PrivateEndpoint(required("AMS_QUIET_EOF_ENDPOINT"));
+    #[cfg(unix)]
+    assert!(PathBuf::from(&endpoint.0) == root.join("state").join("control.sock"));
+    #[cfg(not(unix))]
+    assert!(endpoint.0 == format!("ams-eof-{owner}"));
+    let quiet_ms: u64 = required("AMS_QUIET_EOF_QUIET_MS")
+        .parse()
+        .expect("private quiet duration");
+    assert!((100..=10_000).contains(&quiet_ms));
+
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            tokio::time::timeout(TOTAL_WAIT, async {
+                let startup = Instant::now();
+                loop {
+                    match tokio::time::timeout(REQUEST_WAIT, endpoint.connect()).await {
+                        Ok(Ok(stream)) => {
+                            check_status(
+                                exchange(&mut BufReader::new(stream), json!({"op": "status"}))
+                                    .await,
+                            );
+                            break;
+                        }
+                        _ => {
+                            assert!(
+                                startup.elapsed() < Duration::from_secs(30),
+                                "private daemon startup deadline"
+                            );
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                    }
+                }
+                let (subject, subject_owner) = events(&endpoint).await;
+                let (mut observer, observer_owner) = events(&endpoint).await;
+                assert!(subject_owner.id != observer_owner.id);
+                assert!(subject_owner.capability != observer_owner.capability);
+                assert!(
+                    close_never_issued(&endpoint, &subject_owner, false).await
+                        == "invalid_local_authority"
+                );
+                assert!(
+                    close_never_issued(&endpoint, &subject_owner, true).await
+                        == "unknown_flow_capability"
+                );
+                let foreign = Owner {
+                    id: subject_owner.id.clone(),
+                    capability: observer_owner.capability.clone(),
+                };
+                assert!(
+                    close_never_issued(&endpoint, &foreign, true).await
+                        == "invalid_local_authority"
+                );
+
+                // No data is sent to provoke the old writer into discovering
+                // EOF. Creating a fresh Events owner is a distinct connection,
+                // not a retry of any operation with an unknown outcome.
+                drop(subject);
+                let closed_at = Instant::now();
+                let (successor, successor_owner) = events(&endpoint).await;
+                assert!(successor_owner.id != subject_owner.id);
+                assert!(successor_owner.capability != subject_owner.capability);
+                let immediate = close_never_issued(&endpoint, &subject_owner, true).await;
+                assert!(
+                    close_never_issued(&endpoint, &successor_owner, true).await
+                        == "unknown_flow_capability"
+                );
+                let stale = Owner {
+                    id: successor_owner.id.clone(),
+                    capability: subject_owner.capability.clone(),
+                };
+                assert!(
+                    close_never_issued(&endpoint, &stale, true).await
+                        == "invalid_local_authority"
+                );
+
+                // Same explicit quiet measurement as the failing baseline,
+                // not a raised budget, traffic warmup or repeated open.
+                let mut byte = [0_u8; 1];
+                assert!(
+                    tokio::time::timeout(
+                        Duration::from_millis(quiet_ms),
+                        observer.read(&mut byte),
+                    )
+                    .await
+                    .is_err(),
+                    "unrelated observer must remain connected and silent"
+                );
+                let after_quiet = close_never_issued(&endpoint, &subject_owner, true).await;
+                let sampled_after_close_ms = closed_at.elapsed().as_millis();
+                assert!(
+                    close_never_issued(&endpoint, &observer_owner, true).await
+                        == "unknown_flow_capability",
+                    "quiet EOF must preserve the unrelated observer owner"
+                );
+                assert!(
+                    close_never_issued(&endpoint, &successor_owner, true).await
+                        == "unknown_flow_capability",
+                    "late old-owner cleanup must preserve the fresh owner"
+                );
+                check_status(command(&endpoint, json!({"op": "status"})).await);
+                drop(observer);
+                drop(successor);
+
+                println!(
+                    "MESH04_OWNER_REVOCATION {}",
+                    json!({
+                        "upstream_base": SOURCE,
+                        "wrong_c_control": "invalid_local_authority",
+                        "foreign_owner_refused": true,
+                        "before_close": "unknown_flow_capability",
+                        "immediate_after_close": immediate,
+                        "after_quiet": after_quiet,
+                        "owner_revoked": after_quiet == "invalid_local_authority",
+                        "quiet_ms": quiet_ms,
+                        "sampled_after_close_ms": sampled_after_close_ms,
+                        "quiet_observer": true,
+                        "observer_survived": true,
+                        "successor_survived": true,
+                        "flow_open_requests": 0,
+                        "native_flow_retirement": "not_executed_no_real_flow",
+                        "ack_loss_flow_open": "not_executed_requires_real_flow",
+                    })
+                );
+                assert!(
+                    after_quiet == "invalid_local_authority",
+                    "quiet EOF must retire the exact subject authority"
+                );
+            })
+            .await
+            .expect("private owner-revocation total deadline");
+        });
+}

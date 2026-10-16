@@ -1,0 +1,547 @@
+diff --git a/crates/myownmesh/src/control/owner_cleanup_regression.rs b/crates/myownmesh/src/control/owner_cleanup_regression.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..62e96de69fe867d51cd15fedc1f7c4c1ecf52b06
+--- /dev/null
++++ b/crates/myownmesh/src/control/owner_cleanup_regression.rs
+@@ -0,0 +1,541 @@
++//! Owner/ACK controls using production registry, write and handoff paths.
++//!
++//! The installed handles are already retired transport-lab handles. These
++//! controls prove exact table/authority/cancellation outcomes, not retirement
++//! of a live native flow. The separate private daemon/paired gates own that
++//! qualification. No capability is included in an assertion message or Debug.
++
++use std::future::Future;
++use std::io;
++use std::pin::Pin;
++use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
++use std::sync::Arc;
++use std::task::{Context, Poll, Wake, Waker};
++use std::time::Duration;
++
++use myownmesh_core::FundedArc;
++use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
++
++use super::handoff::{HandoffGuard, ProvisionalHandoff};
++use super::reply::OperationReplyData;
++use super::{
++    dispatch, joinless_control_state, until_events_departure, write_admitted_line, write_variable,
++    AdmittedLineOut, ConnectionCancel, ControlOut, ControlState, EventsOwner, FrameAdmission,
++    FundedVariableReply, PreparedReply, ResponseOwner, Wrote,
++};
++use crate::ipc::{ClientHandle, ClientId, ClientRegistry, ServerOut};
++
++const NETWORK: &str = "owner-regression-net";
++const UNKNOWN_FLOW: &str = "unknown flow_capability: it was never issued to this client, or the flow it named has already been closed";
++
++fn run_case<F, Fut>(case: F)
++where
++    F: FnOnce(Arc<ControlState>) -> Fut,
++    Fut: Future<Output = ()>,
++{
++    crate::services::with_service_cleanup(
++        crate::services::test_cleanup_scope(),
++        |cleanup_port| async move {
++            let state = joinless_control_state(cleanup_port).await;
++            // Only a hang detector. State transitions below are driven by
++            // explicit poll/read/write outcomes, never by this deadline.
++            tokio::time::timeout(Duration::from_secs(10), case(state))
++                .await
++                .expect("owner regression must not hang");
++        },
++    );
++}
++
++fn registered(
++    clients: &ClientRegistry,
++) -> (
++    FundedArc<ClientHandle>,
++    myownmesh_core::ResourceMailboxReceiver<ServerOut>,
++) {
++    let (tx, rx) = myownmesh_core::resource_mailbox(crate::test_application_scope())
++        .expect("existing daemon test grant funds a client mailbox");
++    let client = clients.register(tx).expect("fixture client is admitted");
++    (client, rx)
++}
++
++fn installed(state: &ControlState, client: &FundedArc<ClientHandle>, label: &[u8]) -> String {
++    match state.clients.install_realtime_flow(
++        client,
++        NETWORK.to_owned(),
++        myownmesh_core::realtime::transport_lab_retired_flow_handle("fixture-peer", label),
++    ) {
++        Ok(capability) => capability.expose().to_owned(),
++        Err(_) => panic!("fixture flow admission failed"),
++    }
++}
++
++fn contains(client: &ClientHandle, capability: &str) -> bool {
++    client
++        .with_realtime_flow(capability, NETWORK, |_| ())
++        .is_some()
++}
++
++fn admission() -> FrameAdmission {
++    FrameAdmission::new(crate::test_application_scope(), None)
++}
++
++fn open_reply(frames: &FrameAdmission, capability: &str) -> FundedVariableReply {
++    ResponseOwner::acquire(frames)
++        .expect("fixture response owner is funded")
++        .finish(Ok(OperationReplyData::RealtimeOpened {
++            flow_label: "fixture-label".to_owned(),
++            capability: capability.to_owned(),
++        }))
++}
++
++fn ack_line(frames: &FrameAdmission, client: &FundedArc<ClientHandle>) -> AdmittedLineOut {
++    let ack = PreparedReply::EventsSubscribed(client.clone());
++    AdmittedLineOut::encode(ControlOut::Prepared(&ack), frames)
++        .expect("fixture Events ACK is funded")
++}
++
++fn encoded_reply(reply: FundedVariableReply, frames: &FrameAdmission) -> AdmittedLineOut {
++    let reply = PreparedReply::Variable(reply);
++    AdmittedLineOut::encode(ControlOut::Prepared(&reply), frames)
++        .expect("fixture response line is funded")
++}
++
++fn line_has_error(line: &AdmittedLineOut, expected: &str) -> bool {
++    let value: serde_json::Value =
++        serde_json::from_slice(line.bytes()).expect("fixture refusal is JSON");
++    value.get("ok").and_then(serde_json::Value::as_bool) == Some(false)
++        && value.get("error").and_then(serde_json::Value::as_str) == Some(expected)
++}
++
++fn has_error(reply: FundedVariableReply, frames: &FrameAdmission, expected: &str) -> bool {
++    line_has_error(&encoded_reply(reply, frames), expected)
++}
++
++async fn close_reply(
++    state: &Arc<ControlState>,
++    frames: &FrameAdmission,
++    id: ClientId,
++    client_capability: &str,
++    flow_capability: &str,
++) -> FundedVariableReply {
++    dispatch::realtime::flow_close(
++        state,
++        ResponseOwner::acquire(frames).expect("fixture close reply is funded"),
++        id,
++        client_capability.to_owned(),
++        flow_capability.to_owned(),
++    )
++    .await
++}
++
++#[derive(Clone, Copy)]
++enum WriteMode {
++    Sent,
++    PrefixError,
++    PrefixPending,
++    FlushError,
++}
++
++struct CountWriter {
++    accepted: Arc<AtomicUsize>,
++    mode: WriteMode,
++}
++
++impl CountWriter {
++    fn new(mode: WriteMode) -> (Self, Arc<AtomicUsize>) {
++        let accepted = Arc::new(AtomicUsize::new(0));
++        (
++            Self {
++                accepted: accepted.clone(),
++                mode,
++            },
++            accepted,
++        )
++    }
++}
++
++impl AsyncWrite for CountWriter {
++    fn poll_write(
++        self: Pin<&mut Self>,
++        _cx: &mut Context<'_>,
++        data: &[u8],
++    ) -> Poll<io::Result<usize>> {
++        let accepted = self.accepted.load(Ordering::SeqCst);
++        let count = match self.mode {
++            WriteMode::PrefixError | WriteMode::PrefixPending if accepted >= 8 => {
++                return match self.mode {
++                    WriteMode::PrefixError => Poll::Ready(Err(io::ErrorKind::BrokenPipe.into())),
++                    _ => Poll::Pending,
++                };
++            }
++            WriteMode::PrefixError | WriteMode::PrefixPending => data.len().min(8 - accepted),
++            _ => data.len(),
++        };
++        self.accepted.fetch_add(count, Ordering::SeqCst);
++        Poll::Ready(Ok(count))
++    }
++
++    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
++        Poll::Ready(match self.mode {
++            WriteMode::FlushError => Err(io::ErrorKind::BrokenPipe.into()),
++            _ => Ok(()),
++        })
++    }
++
++    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
++        Poll::Ready(Ok(()))
++    }
++}
++
++#[derive(Clone, Copy)]
++enum Departure {
++    Eof,
++    Error,
++    StrayByte,
++}
++
++struct ControlledReader {
++    departed: Arc<AtomicBool>,
++    kind: Departure,
++}
++
++impl AsyncRead for ControlledReader {
++    fn poll_read(
++        self: Pin<&mut Self>,
++        _cx: &mut Context<'_>,
++        buffer: &mut ReadBuf<'_>,
++    ) -> Poll<io::Result<()>> {
++        if !self.departed.load(Ordering::SeqCst) {
++            return Poll::Pending;
++        }
++        match self.kind {
++            Departure::Eof => Poll::Ready(Ok(())),
++            Departure::Error => Poll::Ready(Err(io::ErrorKind::ConnectionReset.into())),
++            Departure::StrayByte => {
++                buffer.put_slice(&[0]);
++                Poll::Ready(Ok(()))
++            }
++        }
++    }
++}
++
++struct NoopWake;
++
++impl Wake for NoopWake {
++    fn wake(self: Arc<Self>) {}
++}
++
++fn assert_pending<F: Future>(future: Pin<&mut F>) {
++    let waker = Waker::from(Arc::new(NoopWake));
++    assert!(future.poll(&mut Context::from_waker(&waker)).is_pending());
++}
++
++#[test]
++fn events_departure_interrupts_partial_ack_and_revokes_only_its_owner() {
++    run_case(|state| async move {
++        let (bystander, _bystander_rx) = registered(&state.clients);
++        let _bystander_owner = EventsOwner::new(&state.clients, &bystander);
++        let bystander_flow = installed(&state, &bystander, b"bystander");
++        for kind in [Departure::Eof, Departure::Error, Departure::StrayByte] {
++            let (client, _rx) = registered(&state.clients);
++            let retained_client = client.clone();
++            let capability = installed(&state, &client, b"departing");
++            let owner = EventsOwner::new(&state.clients, &client);
++            let cancel = ConnectionCancel::owned_by(&state.clients, &client);
++            let frames = admission();
++            let line = ack_line(&frames, &client);
++            let (mut writer, accepted) = CountWriter::new(WriteMode::PrefixPending);
++            let departed = Arc::new(AtomicBool::new(false));
++            let mut reader = ControlledReader {
++                departed: departed.clone(),
++                kind,
++            };
++            let serving = async {
++                write_admitted_line(&mut writer, &cancel, line).await?;
++                Ok(())
++            };
++            let mut connection = Box::pin(until_events_departure(&mut reader, serving));
++            assert_pending(connection.as_mut());
++            assert!(accepted.load(Ordering::SeqCst) == 8);
++            departed.store(true, Ordering::SeqCst);
++            connection.await.expect("departure terminates one-way Events");
++            drop(owner);
++            assert!(!state.clients.is_current_owner(&retained_client));
++            assert!(!contains(&retained_client, &capability));
++            assert!(state.clients.is_current_owner(&bystander));
++            assert!(contains(&bystander, &bystander_flow));
++        }
++    });
++}
++
++#[test]
++fn events_serving_error_and_task_drop_revoke_despite_retained_client_clones() {
++    run_case(|state| async move {
++        let (client, _rx) = registered(&state.clients);
++        let capability = installed(&state, &client, b"error");
++        let owner = EventsOwner::new(&state.clients, &client);
++        let mut reader = ControlledReader {
++            departed: Arc::new(AtomicBool::new(false)),
++            kind: Departure::Eof,
++        };
++        assert!(until_events_departure(&mut reader, async {
++            Err(anyhow::anyhow!("fixture serving failure"))
++        })
++        .await
++        .is_err());
++        drop(owner);
++        assert!(!state.clients.is_current_owner(&client));
++        assert!(!contains(&client, &capability));
++
++        let (successor, _successor_rx) = registered(&state.clients);
++        let successor_capability = installed(&state, &successor, b"successor");
++        let frames = admission();
++        let line = ack_line(&frames, &successor);
++        let (mut writer, accepted) = CountWriter::new(WriteMode::PrefixPending);
++        let mut connection = Box::pin(async {
++            // As in production, the owner guard is outside the helper future,
++            // but inside the connection task that can itself be cancelled.
++            let _owner = EventsOwner::new(&state.clients, &successor);
++            let cancel = ConnectionCancel::owned_by(&state.clients, &successor);
++            until_events_departure(&mut reader, async {
++                write_admitted_line(&mut writer, &cancel, line).await?;
++                Ok(())
++            })
++            .await
++        });
++        assert_pending(connection.as_mut());
++        assert!(accepted.load(Ordering::SeqCst) == 8);
++        drop(connection);
++        assert!(!state.clients.is_current_owner(&successor));
++        assert!(!contains(&successor, &successor_capability));
++    });
++}
++
++#[test]
++fn foreign_handle_with_equal_numeric_id_cannot_revoke_or_install_on_current_owner() {
++    run_case(|state| async move {
++        let foreign_registry = ClientRegistry::new(crate::test_application_scope())
++            .expect("existing fixture scope funds an independent registry");
++        let (current, _rx) = registered(&state.clients);
++        let _current_owner = EventsOwner::new(&state.clients, &current);
++        let capability = installed(&state, &current, b"current");
++        let (foreign, _foreign_rx) = registered(&foreign_registry);
++        let _foreign_owner = EventsOwner::new(&foreign_registry, &foreign);
++        assert!(foreign.id == current.id, "independent registries start at the same id");
++        assert!(!state.clients.is_current_owner(&foreign));
++        assert!(state.clients.unregister_exact(&foreign).is_none());
++        let rejected = state.clients.install_realtime_flow(
++            &foreign,
++            NETWORK.to_owned(),
++            myownmesh_core::realtime::transport_lab_retired_flow_handle("fixture-peer", b"foreign"),
++        );
++        assert!(rejected.is_err());
++        drop(rejected);
++        assert!(state.clients.is_current_owner(&current));
++        assert!(contains(&current, &capability));
++    });
++}
++
++#[test]
++fn sent_open_with_revoked_owner_rolls_back_exact_flow_and_spares_successor() {
++    run_case(|state| async move {
++        let (client, _rx) = registered(&state.clients);
++        let old_owner = EventsOwner::new(&state.clients, &client);
++        let capability = installed(&state, &client, b"stale-open");
++        let mut handoff = HandoffGuard::new(ProvisionalHandoff::RealtimeFlow {
++            client: client.clone(),
++            capability: capability.clone(),
++        });
++        // Hold the removed record alive, as an in-progress normal cleanup can.
++        // An unconditional Sent commit would strand F until those clones drop.
++        let removed = state.clients.unregister_exact(&client).expect("remove exact owner");
++        assert!(contains(&client, &capability));
++        let (successor, _successor_rx) = registered(&state.clients);
++        let _successor_owner = EventsOwner::new(&state.clients, &successor);
++        let successor_capability = installed(&state, &successor, b"new-owner");
++        handoff.settle(&state, true).await;
++        assert!(!contains(&client, &capability));
++        drop(old_owner);
++        assert!(contains(&successor, &successor_capability));
++        assert!(state.clients.is_current_owner(&successor));
++        drop(removed);
++    });
++}
++
++#[test]
++fn failed_or_unflushed_open_ack_rolls_back_only_its_exact_flow() {
++    run_case(|state| async move {
++        let (client, _rx) = registered(&state.clients);
++        let _owner = EventsOwner::new(&state.clients, &client);
++        let (bystander, _bystander_rx) = registered(&state.clients);
++        let _bystander_owner = EventsOwner::new(&state.clients, &bystander);
++        let keep = installed(&state, &client, b"same-owner-kept");
++        let other = installed(&state, &bystander, b"other-owner-kept");
++        for mode in [WriteMode::PrefixError, WriteMode::FlushError] {
++            let capability = installed(&state, &client, b"failed-open");
++            let mut handoff = HandoffGuard::new(ProvisionalHandoff::RealtimeFlow {
++                client: client.clone(),
++                capability: capability.clone(),
++            });
++            let frames = admission();
++            let cancel = ConnectionCancel::owned_by(&state.clients, &client);
++            let (mut writer, accepted) = CountWriter::new(mode);
++            let wrote =
++                write_variable(&mut writer, &frames, &cancel, open_reply(&frames, &capability))
++                    .await
++                    .expect("fixture encoding succeeds before the write fails");
++            assert!(wrote == Wrote::Ended);
++            assert!(accepted.load(Ordering::SeqCst) > 0);
++            handoff.settle(&state, false).await;
++            assert!(!contains(&client, &capability));
++            assert!(contains(&client, &keep));
++            assert!(contains(&bystander, &other));
++        }
++    });
++}
++
++#[test]
++fn cancellation_after_partial_open_ack_withdraws_only_the_provisional_flow() {
++    run_case(|state| async move {
++        let (client, _rx) = registered(&state.clients);
++        let _owner = EventsOwner::new(&state.clients, &client);
++        let capability = installed(&state, &client, b"cancelled-open");
++        let keep = installed(&state, &client, b"same-owner-kept");
++        let frames = admission();
++        let (mut writer, accepted) = CountWriter::new(WriteMode::PrefixPending);
++        let mut connection = Box::pin(async {
++            let mut handoff = HandoffGuard::new(ProvisionalHandoff::RealtimeFlow {
++                client: client.clone(),
++                capability: capability.clone(),
++            });
++            let cancel = ConnectionCancel::owned_by(&state.clients, &client);
++            let wrote =
++                write_variable(&mut writer, &frames, &cancel, open_reply(&frames, &capability)).await;
++            handoff.settle(&state, matches!(wrote, Ok(Wrote::Sent))).await;
++        });
++        assert_pending(connection.as_mut());
++        assert!(accepted.load(Ordering::SeqCst) == 8);
++        drop(connection);
++        assert!(state.clients.is_current_owner(&client));
++        assert!(!contains(&client, &capability));
++        assert!(contains(&client, &keep));
++    });
++}
++
++#[test]
++fn authenticated_owner_revocation_ends_partial_reply_but_not_another_owner() {
++    run_case(|state| async move {
++        let (client, _rx) = registered(&state.clients);
++        let owner = EventsOwner::new(&state.clients, &client);
++        let (bystander, _bystander_rx) = registered(&state.clients);
++        let _bystander_owner = EventsOwner::new(&state.clients, &bystander);
++        let capability = installed(&state, &client, b"owner-cancelled");
++        let other = installed(&state, &bystander, b"not-cancelled");
++        let cancel =
++            ConnectionCancel::authenticated(&state.clients, client.id, client.capability());
++        let other_cancel =
++            ConnectionCancel::authenticated(&state.clients, bystander.id, bystander.capability());
++        let frames = admission();
++        let (mut writer, accepted) = CountWriter::new(WriteMode::PrefixPending);
++        let mut writing = Box::pin(write_variable(
++            &mut writer,
++            &frames,
++            &cancel,
++            open_reply(&frames, &capability),
++        ));
++        assert_pending(writing.as_mut());
++        assert!(accepted.load(Ordering::SeqCst) == 8);
++        drop(owner);
++        assert!(writing.await.expect("owner cancellation ends the reply") == Wrote::Ended);
++        assert!(!contains(&client, &capability));
++        assert_pending(Box::pin(other_cancel.cancelled()).as_mut());
++        assert!(contains(&bystander, &other));
++    });
++}
++
++#[test]
++fn server_sent_without_client_receipt_retains_flow_until_exact_owner_teardown() {
++    run_case(|state| async move {
++        let (client, _rx) = registered(&state.clients);
++        let owner = EventsOwner::new(&state.clients, &client);
++        let capability = installed(&state, &client, b"sent-not-observed");
++        let mut handoff = HandoffGuard::new(ProvisionalHandoff::RealtimeFlow {
++            client: client.clone(),
++            capability: capability.clone(),
++        });
++        let frames = admission();
++        let cancel = ConnectionCancel::owned_by(&state.clients, &client);
++        let (mut writer, accepted) = CountWriter::new(WriteMode::Sent);
++        let wrote = write_variable(&mut writer, &frames, &cancel, open_reply(&frames, &capability))
++            .await
++            .expect("fixture server accepts and flushes the whole ACK");
++        assert!(wrote == Wrote::Sent && accepted.load(Ordering::SeqCst) > 8);
++        // This writer has no receiving client. Sent alone cannot distinguish
++        // delivered ACK from lost receipt, and must not undo a live owner's F.
++        handoff.settle(&state, true).await;
++        assert!(contains(&client, &capability));
++        drop(owner);
++        assert!(!contains(&client, &capability));
++    });
++}
++
++#[test]
++fn wrong_or_foreign_authority_cannot_consume_known_flow_and_close_ack_outcomes_do_not_restore_it() {
++    run_case(|state| async move {
++        let (client, _rx) = registered(&state.clients);
++        let _owner = EventsOwner::new(&state.clients, &client);
++        let (bystander, _bystander_rx) = registered(&state.clients);
++        let _bystander_owner = EventsOwner::new(&state.clients, &bystander);
++        let other = installed(&state, &bystander, b"untouched");
++        let frames = admission();
++        for mode in [WriteMode::PrefixError, WriteMode::FlushError, WriteMode::Sent] {
++            let capability = installed(&state, &client, b"one-close");
++            for (id, presented) in [
++                (client.id, "not-a-client-capability"),
++                (client.id, bystander.capability()),
++                (bystander.id, client.capability()),
++            ] {
++                let reply = close_reply(&state, &frames, id, presented, &capability).await;
++                assert!(has_error(reply, &frames, "invalid local client authority"));
++                assert!(contains(&client, &capability));
++            }
++            let reply = close_reply(
++                &state,
++                &frames,
++                bystander.id,
++                bystander.capability(),
++                &capability,
++            )
++            .await;
++            assert!(has_error(reply, &frames, UNKNOWN_FLOW));
++            assert!(contains(&client, &capability));
++
++            let reply =
++                close_reply(&state, &frames, client.id, client.capability(), &capability).await;
++            // No network is joined. This is a consumed-F close refusal, not a
++            // successful native close: removal precedes the network lookup.
++            assert!(!contains(&client, &capability));
++            let line = encoded_reply(reply, &frames);
++            assert!(line_has_error(&line, "unknown network: owner-regression-net"));
++            let cancel = ConnectionCancel::owned_by(&state.clients, &client);
++            let (mut writer, accepted) = CountWriter::new(mode);
++            let wrote = write_admitted_line(&mut writer, &cancel, line)
++                .await
++                .expect("fixture close refusal is encodable");
++            assert!(accepted.load(Ordering::SeqCst) > 0);
++            let expected = if matches!(mode, WriteMode::Sent) {
++                Wrote::Sent
++            } else {
++                Wrote::Ended
++            };
++            assert!(wrote == expected);
++            // This second exact close observes the consumed token. It is an
++            // assertion of refusal, not an automatic recovery/reopen attempt.
++            let repeated = close_reply(&state, &frames, client.id, client.capability(), &capability)
++                .await;
++            assert!(has_error(repeated, &frames, UNKNOWN_FLOW));
++            assert!(contains(&bystander, &other));
++            assert!(state.clients.is_current_owner(&bystander));
++        }
++    });
++}
