@@ -94,7 +94,9 @@ fn check_status(reply: Value) {
         .get("joined_networks")
         .and_then(Value::as_array)
         .is_some_and(Vec::is_empty));
-    let realtime = data.get("realtime").expect("private Status realtime advert");
+    let realtime = data
+        .get("realtime")
+        .expect("private Status realtime advert");
     assert!(realtime.get("supported").and_then(Value::as_bool) == Some(false));
     assert!(realtime
         .get("encodings")
@@ -135,7 +137,11 @@ async fn events(endpoint: &PrivateEndpoint) -> (BufReader<LocalSocketStream>, Ow
     )
 }
 
-async fn close_never_issued(endpoint: &PrivateEndpoint, owner: &Owner, valid: bool) -> &'static str {
+async fn close_never_issued(
+    endpoint: &PrivateEndpoint,
+    owner: &Owner,
+    valid: bool,
+) -> &'static str {
     // No flow-open operation exists in this diagnostic. F cannot name a flow.
     let reply = command(
         endpoint,
@@ -190,7 +196,8 @@ fn isolated_quiet_events_eof() {
                     match tokio::time::timeout(REQUEST_WAIT, endpoint.connect()).await {
                         Ok(Ok(stream)) => {
                             check_status(
-                                exchange(&mut BufReader::new(stream), json!({"op": "status"})).await,
+                                exchange(&mut BufReader::new(stream), json!({"op": "status"}))
+                                    .await,
                             );
                             break;
                         }
