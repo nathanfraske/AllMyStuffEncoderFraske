@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "credential_mode": "fresh_per_owned_root",
+  "service": {
+    "enabled": true,
+    "bind": "127.0.0.1",
+    "port": 18476,
+    "public_ip": "127.0.0.1",
+    "realm": "ams-mesh03-test",
+    "max_bps_per_connection": 1048576,
+    "relay_port_min": 18480,
+    "relay_port_max": 18487,
+    "tcp_enabled": false,
+    "tls_proxy_enabled": false,
+    "tls_proxy_port": 18477,
+    "tcp_max_connections": 8,
+    "tcp_max_connections_per_ip": 8,
+    "tcp_auth_timeout_ms": 10000,
+    "tcp_idle_timeout_ms": 30000
+  }
+}
