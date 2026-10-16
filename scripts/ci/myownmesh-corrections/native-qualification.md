@@ -171,3 +171,130 @@ patch SHA/tree chain and native-driver inputs may enter that corrected job.
 No worker draft or placeholder patch-set is executable qualification input.
 Publishing upstream changes is a separate final concrete-review boundary;
 this recipe neither pushes upstream nor changes main or installed runtimes.
+
+The startup controls now have an observed native failure to discriminate.
+Retained diagnostic run `85ea5484` (receipt SHA256
+`b8b19ae1d51221b1ab69eb24ce9a5a5d5dc50afb26cb2b8045a089fe1e80cdce`)
+admits audio unit 0, 371 bytes/SHA `f05fbbb5...`, then reaches the native
+`sample_not_ready` branch with neither packetizer nor sequencer. That original
+branch returns `Ok` before packetization. Unit 1, 297 bytes/SHA `8a44f9f6...`,
+is packetized, written and retained by the receiver peek; it is the first
+**audio** received when index 0 was expected. The first overall received unit
+was video. This establishes that run's prebind loss, not a later sender reuse
+failure. The retained stock and earlier diagnostic failures remain failures.
+
+`startup-regression.json` is an executable preparation manifest of kind
+`diagnostic` for the baseline negative control: exact db plus only the test
+patch, tree `9f096b27d5edc934b21e29bfe62284297f5e622f`. It cannot qualify a
+corrected binary. `patch-set.json` instead orders the accepted owner cleanup
+fix and its regression, the startup fix, then the identical startup regression
+patch. Its exact tree is `bdbf1b96c7809107bd3a151b2ccf9bcad9ace73a`, and its
+raw LF SHA256 is
+`4cb553e829e61dab2858357b1a2c031a2cf5995d0e49eaa9770517c345a497e6`.
+The regression patch's raw SHA256 is
+`da7afd74b297aae0215789206ec429cf2d09c1154addf4be4c514ada2f8c6cf1`.
+All include declarations are test-only; no application media comparator,
+policy, vector, pace or product pin changes. Preparation uses new baseline and
+corrected raw LF checkouts and the existing helper's exact manifest SHA input.
+
+The four full names and their actual packages are recorded in
+`startup-regression.json`. Both targets are **library unit tests**, with two
+new names each:
+
+| Package | Full test name |
+| --- | --- |
+| `webrtc` 0.13.0 | `track::track_local::startup_regression::mesh04_prebind_sample_waits_then_emits_first_once_in_order` |
+| `webrtc` 0.13.0 | `track::track_local::startup_regression::mesh04_cancelled_prebind_sample_is_never_emitted_after_bind` |
+| `myownmesh-core` | `transport::webrtc::tests::startup_regression::mesh04_prebind_queue_keeps_first_payload_funded_until_finite_close` |
+| `myownmesh-core` | `transport::webrtc::tests::startup_regression::mesh04_connector_retirement_detaches_unbound_idle_sender_before_queue_close` |
+
+The vendor cases use the existing `write_sample` API, actual `TrackLocal.bind`
+and packetizer with a bounded capture writer. They prove pending first-sample
+custody, exact once/order/clock on bind, and no emission from a cancelled
+pending caller. They do not decode or establish network delivery. The core
+cases call the existing `attach_outbound` entry with an actual unbound native
+sender, the existing funded queue and cleanup owner. They check payload leases,
+flow-close ACK after native detachment, quiescence and task joining, plus
+connector retirement while the queue remains alive. A current-thread ownership
+observation proves the unchanged pump has started; actual funding, detachment
+and ACK are the behavior assertions. Finite five-second test bounds and
+`yield_now` observations add no media delay, sleep, warm-up or retry. Expected
+baseline assertion failures are checked after owned core cleanup, rather than
+leaving a baseline's idle pump alive.
+
+The vendor crate is excluded from the upstream workspace. Its **existing**
+`env_logger` and `tokio-test` dev dependencies are absent from canonical lock
+`8f5a30ce...`. The manager selected separate vendor unit copies and one explicit
+test-only lock. Never resolve those dependencies into the official core or
+daemon source. Use the unmodified vendored `Cargo.toml`; no new manifest,
+dependency declaration, production patch override or package installation is
+part of the unit recipe. The standalone graph uses registry dependencies in
+place of the root workspace's local `[patch.crates-io]` overrides. Record that
+distinction: these primitive controls do not qualify the canonical daemon graph.
+
+With fresh owned unit directories outside every Cargo workspace, extract
+each exact prepared vendor subtree. `$mesh04_base_tree` and
+`$mesh04_fixed_tree` are the verified receipt trees stated above, and every
+archive/directory named here must be new:
+
+```sh
+git -C "$mesh04_base_source" archive --format=tar --output "$mesh04_base_archive" "$mesh04_base_tree:vendor/webrtc-0.13.0"
+git -C "$mesh04_fixed_source" archive --format=tar --output "$mesh04_fixed_archive" "$mesh04_fixed_tree:vendor/webrtc-0.13.0"
+mkdir "$mesh04_vendor_base" "$mesh04_vendor_fixed"
+tar -xf "$mesh04_base_archive" -C "$mesh04_vendor_base"
+tar -xf "$mesh04_fixed_archive" -C "$mesh04_vendor_fixed"
+cp "$mesh04_base_source/Cargo.lock" "$mesh04_vendor_base/Cargo.lock"
+cargo +1.88.0 metadata --manifest-path "$mesh04_vendor_base/Cargo.toml" --format-version 1
+```
+
+The copied canonical lock is an explicit seed. That sole metadata command may
+resolve the standalone test-only lock; it is not a compiler or daemon pass.
+Retain its complete JSON/stdout/stderr and exit state. Before building, record
+the actual package IDs, all lock records added/removed/changed versus the seed,
+manifest/source hashes and resulting test-lock SHA. Compare these generated
+records narrowly against the reviewed existing manifest; stop on a manifest
+change or unexpected source input. Copy the resolved unit lock byte-exact to
+the fixed unit copy, then verify it with:
+
+```sh
+cp "$mesh04_vendor_base/Cargo.lock" "$mesh04_vendor_fixed/Cargo.lock"
+cargo +1.88.0 metadata --locked --manifest-path "$mesh04_vendor_fixed/Cargo.toml" --format-version 1
+```
+
+Both official core/daemon locks must still hash to `8f5a30ce...`, and both unit
+locks must have the same recorded test-only SHA. No later test command may
+resolve or update a lock. Select a separate owned `CARGO_TARGET_DIR` for each
+baseline/fixed build. For each vendor copy the actual build command is:
+
+```sh
+cargo +1.88.0 test --locked --manifest-path "$mesh04_vendor_source/Cargo.toml" --lib --no-run --message-format json
+```
+
+For each official baseline/fixed core source, retaining its canonical lock:
+
+```sh
+cargo +1.88.0 test --locked --no-default-features -p myownmesh-core --lib --no-run --message-format json
+```
+
+Parse complete Cargo JSON and select only the actual named package's `lib` test
+artifact with its executable present; retain the package ID, target/source,
+executable SHA/bytes and native provenance. A binary target or a compiler
+failure is not a negative-control result. For **each** of those four executables
+first run the inventory, compare exact names against the two appropriate rows
+above, then execute the same filtered cases:
+
+```sh
+"$mesh04_actual_test_executable" startup_regression::mesh04_ --list
+"$mesh04_actual_test_executable" startup_regression::mesh04_ --nocapture --test-threads=1
+```
+
+Require exactly two listed/executed tests per executable and no ignored cases.
+Preserve baseline runtime failures with their exact expected assertion stage;
+zero matches, a linker error or an unrelated timeout is not proof of the old
+defect. Require the corrected executables to pass all four source-qualified
+cases. Retain complete command EOF, statuses and source/lock/artifact hashes;
+then reverify both official source receipts. These controls precede the
+unchanged strict real transport and node AV probes on native Windows, Intel
+macOS and non-WSL Linux. Sender close/reopen, received software decode, peer
+restart, direct/relay paths and hardware/product gates remain separate actual
+evidence; the startup patch or primitive controls alone do not qualify them.

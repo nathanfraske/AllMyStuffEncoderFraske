@@ -1,0 +1,454 @@
+diff --git a/crates/myownmesh-core/src/transport/webrtc.rs b/crates/myownmesh-core/src/transport/webrtc.rs
+index 53b0af55838790a07cd6cf5c62d07e71aa2099b4..3a3998c972966661b78b2e4944c92709b44454f8 100644
+--- a/crates/myownmesh-core/src/transport/webrtc.rs
++++ b/crates/myownmesh-core/src/transport/webrtc.rs
+@@ -10407,6 +10407,8 @@
+ 
+ #[cfg(test)]
+ mod tests {
++    mod startup_regression;
++
+     use super::*;
+     use crate::resource::{
+         FiniteResourceProvider, ProcessResourceRoot, ResourceFamilyReport, ResourceProviderPort,
+diff --git a/crates/myownmesh-core/src/transport/webrtc/tests/startup_regression.rs b/crates/myownmesh-core/src/transport/webrtc/tests/startup_regression.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..fa3ee5c1db99359e3fddcd3b79f8b0dc39399a31
+--- /dev/null
++++ b/crates/myownmesh-core/src/transport/webrtc/tests/startup_regression.rs
+@@ -0,0 +1,242 @@
++//! Real unbound native sender, existing funded flow queue and actual pump.
++//! No signaling/remote peer or received-media claim is part of these controls.
++
++use super::*;
++
++const STARTUP_TEST_BOUND: Duration = Duration::from_secs(5);
++const STARTUP_UNIT: &[u8] = b"mesh04-owned-first-unit";
++
++struct StartupPumpFixture {
++    registry: Arc<RealtimeFlowRegistry>,
++    flows: SessionRealtimeFlows,
++    session: FlowFixtureSession,
++    name: RealtimeFlowName,
++    incarnation: Arc<WebRtcConnectorIncarnation>,
++    native: Arc<TrackLocalStaticSample>,
++    sender: Arc<RTCRtpSender>,
++    pc: Arc<RTCPeerConnection>,
++    close_owner: Arc<ConnectorCloseOwner>,
++    _attempt: AttemptLifetime,
++    _resource_owner: MeshConnectorResourceScope,
++}
++
++impl StartupPumpFixture {
++    async fn new() -> Self {
++        let codec = webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability {
++            mime_type: "audio/opus".to_owned(),
++            clock_rate: 48_000,
++            channels: 2,
++            ..Default::default()
++        };
++        let mut media = webrtc::api::media_engine::MediaEngine::default();
++        media
++            .register_codec(
++                webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecParameters {
++                    capability: codec.clone(),
++                    payload_type: 111,
++                    ..Default::default()
++                },
++                webrtc::rtp_transceiver::rtp_codec::RTPCodecType::Audio,
++            )
++            .unwrap();
++        let pc = Arc::new(
++            webrtc::api::APIBuilder::new()
++                .with_media_engine(media)
++                .build()
++                .new_peer_connection(
++                    webrtc::peer_connection::configuration::RTCConfiguration::default(),
++                )
++                .await
++                .unwrap(),
++        );
++        let native = Arc::new(TrackLocalStaticSample::new(
++            codec,
++            "mesh04-prebind".to_owned(),
++            "mesh04-private-regression".to_owned(),
++        ));
++        let sender = pc
++            .add_track(Arc::clone(&native)
++                as Arc<dyn webrtc::track::track_local::TrackLocal + Send + Sync>)
++            .await
++            .unwrap();
++        assert!(sender.track().await.is_some());
++
++        let resource_owner = test_resource_owner(1, NATIVE_LOOPBACK_CALLBACK_CAPACITY);
++        let (close_owner, attempt) = close_owner_fixture(&resource_owner);
++        assert!(close_owner.attach_native(Arc::clone(&pc)));
++        let registry = test_realtime_registry(explicit_realtime_workload(
++            STARTUP_UNIT.len(),
++            1,
++            1,
++            STARTUP_UNIT.len(),
++            1,
++        ));
++        let incarnation = Arc::clone(&close_owner.ownership.incarnation);
++        let session = FlowFixtureSession {
++            incarnation: Arc::clone(incarnation.generic()),
++        };
++        let name = fixture_flow_name();
++        let mut flows = SessionRealtimeFlows::new(
++            Arc::clone(&registry),
++            Some(session_flow::leased_control_profile(&registry)),
++        );
++        flows
++            .open(
++                &session,
++                Some(incarnation.generic()),
++                RealtimeFlowSpec {
++                    name: name.clone(),
++                    direction: RealtimeDirection::Outbound,
++                    encoding: RealtimeEncoding::new(WebRtcRtpKind::Audio, "audio/opus", 48_000, 2)
++                        .unwrap(),
++                },
++            )
++            .unwrap();
++        Self {
++            registry,
++            flows,
++            session,
++            name,
++            incarnation,
++            native,
++            sender,
++            pc,
++            close_owner,
++            _attempt: attempt,
++            _resource_owner: resource_owner,
++        }
++    }
++
++    fn enqueue(&mut self) {
++        self.flows
++            .send(
++                &self.session,
++                Some(self.incarnation.generic()),
++                &self.name,
++                RealtimeSendUnit {
++                    data: Bytes::from_static(STARTUP_UNIT),
++                    pace: Duration::from_millis(20),
++                },
++            )
++            .unwrap();
++    }
++
++    fn retained_payload_bytes(&self) -> usize {
++        retained_realtime_bytes(&self.registry.state.lock())
++    }
++
++    fn attach(&mut self) -> usize {
++        let track = RealtimeOutboundTrack {
++            track: Arc::clone(&self.native),
++            sender: Arc::clone(&self.sender),
++            pc: Arc::clone(&self.pc),
++            incarnation: Arc::clone(&self.incarnation),
++            close_owner: Arc::clone(&self.close_owner),
++        };
++        // On this current-thread runtime no spawned task can poll before this
++        // synchronous call returns. The unchanged pump clones the native track
++        // on entry. That observable ownership is only a start barrier: payload
++        // funding, actual sender detachment and terminal ACK are the assertions.
++        let before = Arc::strong_count(&self.native);
++        if let Err((error, _track)) = self.flows.attach_outbound(
++            &self.session,
++            Some(self.incarnation.generic()),
++            &self.name,
++            track,
++        ) {
++            panic!("finite startup fixture could not attach its native track: {error:?}");
++        }
++        before
++    }
++
++    async fn observe_started(&self, before: usize) -> bool {
++        tokio::time::timeout(STARTUP_TEST_BOUND, async {
++            while Arc::strong_count(&self.native) <= before {
++                tokio::task::yield_now().await;
++            }
++        })
++        .await
++        .is_ok()
++    }
++
++    async fn close_and_join(mut self) {
++        let remains = self
++            .flows
++            .close(&self.session, Some(self.incarnation.generic()), &self.name)
++            .unwrap();
++        let RealtimeFlowRemains::Outbound(retired) = remains else {
++            panic!("the attached native pump must return its exact retirement ACK");
++        };
++        tokio::time::timeout(STARTUP_TEST_BOUND, retired)
++            .await
++            .expect("closing an unbound flow must finish without a future bind")
++            .expect("native retirement must acknowledge, not drop its sender");
++        assert!(
++            self.sender.track().await.is_none(),
++            "retirement ACK follows actual native sender detachment"
++        );
++        assert_eq!(self.retained_payload_bytes(), 0);
++        assert!(realtime_accounting_is_clean(&self.registry.state.lock()));
++        assert!(
++            self.flows.is_quiescent(),
++            "no native tail remains after ACK"
++        );
++        self.close_owner.seal_transport_tasks();
++        tokio::time::timeout(STARTUP_TEST_BOUND, self.close_owner.wait())
++            .await
++            .expect("the cleanup owner must join its actual pump and native close")
++            .unwrap();
++    }
++}
++
++#[tokio::test(flavor = "current_thread")]
++async fn mesh04_prebind_queue_keeps_first_payload_funded_until_finite_close() {
++    let mut fixture = tokio::time::timeout(STARTUP_TEST_BOUND, StartupPumpFixture::new())
++        .await
++        .expect("native startup fixture must finish within its test bound");
++    fixture.enqueue();
++    let funded = fixture.retained_payload_bytes();
++    assert!(
++        funded > 0,
++        "the first queued payload must hold a real lease"
++    );
++    let before = fixture.attach();
++    let began = fixture.observe_started(before).await;
++    let waiting_funding = fixture.retained_payload_bytes();
++    // Clean up even on the pristine baseline's expected accounting failure.
++    fixture.close_and_join().await;
++    assert!(
++        began,
++        "the actual pump must have started before observation"
++    );
++    assert_eq!(
++        waiting_funding, funded,
++        "prebind waiting must not dequeue the first unit or release its payload lease"
++    );
++}
++
++#[tokio::test(flavor = "current_thread")]
++async fn mesh04_connector_retirement_detaches_unbound_idle_sender_before_queue_close() {
++    let mut fixture = tokio::time::timeout(STARTUP_TEST_BOUND, StartupPumpFixture::new())
++        .await
++        .expect("native startup fixture must finish within its test bound");
++    let before = fixture.attach();
++    let began = fixture.observe_started(before).await;
++    // Keep the flow and its empty queue alive. Only this exact connector's
++    // retirement can finish the pending initial bind wait at this point.
++    fixture.incarnation.retire();
++    let detached_before_close = tokio::time::timeout(STARTUP_TEST_BOUND, async {
++        while fixture.sender.track().await.is_some() {
++            tokio::task::yield_now().await;
++        }
++    })
++    .await
++    .is_ok();
++    // Baseline still gets a queue close and owned cleanup before failing.
++    fixture.close_and_join().await;
++    assert!(began);
++    assert!(
++        detached_before_close,
++        "connector retirement must end the unbound idle pump without queue close or bind"
++    );
++}
+diff --git a/vendor/webrtc-0.13.0/src/track/track_local/mod.rs b/vendor/webrtc-0.13.0/src/track/track_local/mod.rs
+index 9963e491ae1a0b82b7a3dfd3f3dcbdd3fe5817c9..2c5ea8bf8da8636e3d8f4486551d7636828aec51 100644
+--- a/vendor/webrtc-0.13.0/src/track/track_local/mod.rs
++++ b/vendor/webrtc-0.13.0/src/track/track_local/mod.rs
+@@ -1,3 +1,6 @@
++#[cfg(test)]
++mod startup_regression;
++
+ #[cfg(test)]
+ mod track_local_static_test;
+ 
+diff --git a/vendor/webrtc-0.13.0/src/track/track_local/startup_regression.rs b/vendor/webrtc-0.13.0/src/track/track_local/startup_regression.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..0d13362fc6ccdd1b7c0f1541e46d3eed89bcc76b
+--- /dev/null
++++ b/vendor/webrtc-0.13.0/src/track/track_local/startup_regression.rs
+@@ -0,0 +1,176 @@
++//! Regression at the native sample/bind boundary. The real packetizer writes
++//! into a capture writer; this does not establish delivery to a remote peer.
++
++use std::future::{poll_fn, Future};
++use std::pin::pin;
++use std::sync::{Arc, Mutex};
++use std::task::Poll;
++use std::time::Duration;
++
++use async_trait::async_trait;
++use bytes::Bytes;
++use interceptor::Attributes;
++use media::Sample;
++use portable_atomic::AtomicBool;
++use rtp::packet::Packet;
++
++use super::track_local_static_sample::TrackLocalStaticSample;
++use super::{TrackLocal, TrackLocalContext, TrackLocalWriter};
++use crate::error::Result;
++use crate::rtp_transceiver::rtp_codec::{
++    RTCRtpCodecCapability, RTCRtpCodecParameters, RTCRtpParameters,
++};
++
++const TEST_DEADLINE: Duration = Duration::from_secs(5);
++// Distinct opaque sample bodies test packetization and custody, not decoding.
++const FIRST: &[u8] = b"mesh04-first-owned-sample";
++const SECOND: &[u8] = b"mesh04-second-owned-sample";
++
++#[derive(Debug, Default)]
++struct CapturedPackets {
++    packets: Mutex<Vec<Packet>>,
++}
++
++impl CapturedPackets {
++    fn snapshot(&self) -> Vec<Packet> {
++        self.packets.lock().unwrap().clone()
++    }
++}
++
++#[async_trait]
++impl TrackLocalWriter for CapturedPackets {
++    async fn write_rtp_with_attributes(
++        &self,
++        packet: &Packet,
++        _attributes: &Attributes,
++    ) -> Result<usize> {
++        let mut packets = self.packets.lock().unwrap();
++        assert!(packets.len() < 3, "unexpected duplicate native packet");
++        packets.push(packet.clone());
++        Ok(packet.payload.len())
++    }
++}
++
++fn fixture() -> (
++    TrackLocalStaticSample,
++    TrackLocalContext,
++    Arc<CapturedPackets>,
++) {
++    let codec = RTCRtpCodecCapability {
++        mime_type: "audio/opus".to_owned(),
++        clock_rate: 48000,
++        channels: 2,
++        ..Default::default()
++    };
++    let track = TrackLocalStaticSample::new(
++        codec.clone(),
++        "mesh04-startup".to_owned(),
++        "mesh04-private-test".to_owned(),
++    );
++    let writer = Arc::new(CapturedPackets::default());
++    let context = TrackLocalContext {
++        id: "mesh04-bound-sender".to_owned(),
++        params: RTCRtpParameters {
++            codecs: vec![RTCRtpCodecParameters {
++                capability: codec,
++                payload_type: 111,
++                ..Default::default()
++            }],
++            ..Default::default()
++        },
++        ssrc: 0x4d_45_53_48,
++        write_stream: writer.clone(),
++        paused: Arc::new(AtomicBool::new(false)),
++        mid: None,
++    };
++    (track, context, writer)
++}
++
++fn sample(data: &'static [u8]) -> Sample {
++    Sample {
++        data: Bytes::from_static(data),
++        duration: Duration::from_millis(20),
++        ..Default::default()
++    }
++}
++
++async fn bounded<T>(work: impl Future<Output = T>) -> T {
++    tokio::time::timeout(TEST_DEADLINE, work)
++        .await
++        .expect("native regression operation must finish within its test bound")
++}
++
++#[tokio::test]
++async fn mesh04_prebind_sample_waits_then_emits_first_once_in_order() {
++    let (track, context, writer) = fixture();
++    let first = sample(FIRST);
++    let mut pending = pin!(track.write_sample(&first));
++    poll_fn(|cx| match pending.as_mut().poll(cx) {
++        Poll::Pending => Poll::Ready(()),
++        Poll::Ready(result) => {
++            panic!("unbound first sample must remain pending, not complete: {result:?}")
++        }
++    })
++    .await;
++    assert!(writer.snapshot().is_empty());
++
++    bounded(track.bind(&context)).await.unwrap();
++    bounded(pending).await.unwrap();
++    let first_packets = writer.snapshot();
++    assert_eq!(
++        first_packets.len(),
++        1,
++        "first sample must emit exactly once"
++    );
++    assert_eq!(first_packets[0].payload.as_ref(), FIRST);
++    assert_eq!(first_packets[0].header.payload_type, 111);
++    assert_eq!(first_packets[0].header.ssrc, context.ssrc);
++
++    bounded(track.write_sample(&sample(SECOND))).await.unwrap();
++    let packets = writer.snapshot();
++    assert_eq!(packets.len(), 2, "no duplicate or lost native sample");
++    assert_eq!(packets[0].payload.as_ref(), FIRST);
++    assert_eq!(packets[1].payload.as_ref(), SECOND);
++    assert_eq!(
++        packets[1].header.sequence_number,
++        packets[0].header.sequence_number.wrapping_add(1)
++    );
++    assert_eq!(
++        packets[1]
++            .header
++            .timestamp
++            .wrapping_sub(packets[0].header.timestamp),
++        960,
++        "twenty milliseconds at the registered 48 kHz clock"
++    );
++    bounded(track.unbind(&context)).await.unwrap();
++}
++
++#[tokio::test]
++async fn mesh04_cancelled_prebind_sample_is_never_emitted_after_bind() {
++    let (track, context, writer) = fixture();
++    let first = sample(FIRST);
++    {
++        let mut cancelled = pin!(track.write_sample(&first));
++        poll_fn(|cx| match cancelled.as_mut().poll(cx) {
++            Poll::Pending => Poll::Ready(()),
++            Poll::Ready(result) => {
++                panic!("cancellation must exercise a polled pending write: {result:?}")
++            }
++        })
++        .await;
++        assert!(writer.snapshot().is_empty());
++        // The future is dropped here after it has actually waited for bind.
++    }
++
++    bounded(track.bind(&context)).await.unwrap();
++    assert!(
++        writer.snapshot().is_empty(),
++        "bind must not replay a cancelled caller's sample"
++    );
++    bounded(track.write_sample(&sample(SECOND))).await.unwrap();
++    let packets = writer.snapshot();
++    assert_eq!(packets.len(), 1, "only the current caller owns a sample");
++    assert_eq!(packets[0].payload.as_ref(), SECOND);
++    bounded(track.unbind(&context)).await.unwrap();
++}
