@@ -366,3 +366,53 @@ restart scenarios, the actual node consumer pair and measured host/host path
 gates unmet. The separately built transport-lab artifact has no actual relay
 pair pass. Native Linux paired delivery, hardware capture/render/playback,
 installed service behavior and product V1 activation remain unqualified.
+
+The final native checkpoint is
+[run 38952708616](https://github.com/nathanfraske/AllMyStuffEncoderFraske/actions/runs/38952708616)
+at exact application `733c7889bfd5150a220b2047372a7d684d17d273`, candidate
+`db7818e09fedd98899490347b86ac9bc9f97b59b` and the same corrected TEST policy.
+It advances the earlier pending Linux checkpoint; the original four primary
+runs and run 38947043848 remain separate failed evidence above.
+
+All three native jobs passed the same 22 portable contract tests and four node
+route tests. This includes the corrected cancelled-partial-receive fixture on
+native Linux, resolving that earlier fixture failure. Minimal builds with the
+optional realtime feature off/on, dependency metadata checks, both probe builds,
+the stock candidate daemon build and native codec-vector/reference decode gates
+passed. Each job retained identical before/after hashes for all five application
+and minimal-consumer lockfiles. These passes qualify those bounded gates;
+the overall workflow still failed at actual media delivery.
+
+| Native target | Contract / route tests | Actual pair | `normal_shutdown` |
+| --- | --- | --- | --- |
+| Windows Server 2025 / AMD64 | 22 / 4 passed | First `initial_forward` receive equals own audio 1; expected own audio 0 | `false` (forced owned cleanup) |
+| Intel macOS, Darwin 24.6.0 / x86_64 | 22 / 4 passed | First `initial_forward` receive equals own audio 1; expected own audio 0 | `true` |
+| Native Ubuntu 24.04, Linux 6.17.0-1022-azure / x86_64 | 22 / 4 passed | First `initial_forward` receive equals own audio 1; expected own audio 0 | `true` |
+
+Every pair now has phase diagnostics: audio 0 and the next paced audio 1
+completed local writes; the first receive has `expected_index:0`,
+`prior_units_verified:0` and `label_matches_expected:true`. Its complete payload
+matches that runner's `audio-1.opus`, while the expected bytes match its
+`audio-0.opus`. No phase completed. This extends the observed first-receive
+failure to native Linux as well as Windows and Intel Mac; it does not prove
+loss versus delay or the native binding cause. All owned pair children were
+reaped, private roots removed and cleanup error lists empty.
+
+Retained artifacts are under the manager's
+`target/mesh03-realtime/ci-38952708616/mesh03-native-{windows-latest,macos-15-intel,ubuntu-24.04}-38952708616-1/`.
+Each has complete command receipts/streams, source vector files and
+`transport-pair/receipt.json`. The three `transport-pair/paired.stdout` identities
+are Windows 2003 bytes/SHA256
+`f9f914ae12930e1731e2647e5994fd23a8179bcf501c83afff55bf0e33015ec3`,
+Intel Mac 2003 bytes/SHA256
+`8e64d2f01fa655a2c28d47f81ef52ff870f7b71475999fadf2169bdfd3cdd602`,
+and native Linux 2002 bytes/SHA256
+`a62cb8163d8ccf0c477f0fc361e66910ecf3c4c6cf4c645012b0538b0ae093d7`.
+
+The strict media predicate, vectors and pacing were preserved. Received video,
+AMS SEI/clock checks, received software decode, a complete AV phase, later
+lifetime/refusal/pressure/cancel/restart scenarios, measured selected paths,
+the actual node consumer pair and forced-relay delivery remain unmet. The
+source-supported readiness risk and unproved causality qualifications above
+still apply. This documentation checkpoint leaves the tested code unchanged
+and does not request another identical CI run or activate candidate product use.
