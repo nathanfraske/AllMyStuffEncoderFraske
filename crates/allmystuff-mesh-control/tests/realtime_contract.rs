@@ -663,7 +663,14 @@ async fn cancelled_partial_receive_closes_the_socket_and_cannot_reuse_a_prefix()
     })
     .await;
     drop(receiving);
-    remote.eof().await;
+    // Linux can report reset after this partial-prefix cancellation. Require
+    // terminal closure here; positive bytes and every other error still fail.
+    let mut byte = [0_u8; 1];
+    match bounded(remote.reader.read(&mut byte)).await {
+        Ok(0) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+        result => panic!("cancelled receive left data or unexpected socket result: {result:?}"),
+    }
     assert!(matches!(
         failure(bounded(pipe.recv()).await),
         RealtimeError::PipeEnded(_)
