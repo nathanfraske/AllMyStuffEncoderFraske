@@ -298,3 +298,117 @@ unchanged strict real transport and node AV probes on native Windows, Intel
 macOS and non-WSL Linux. Sender close/reopen, received software decode, peer
 restart, direct/relay paths and hardware/product gates remain separate actual
 evidence; the startup patch or primitive controls alone do not qualify them.
+
+The first standalone vendor build exposed a recipe API mismatch. Run
+`0908ec6a`, audit SHA256
+`1fccbfd211ac2d6ef4568735eee668e4e81674ddad66a0bd2525e1b82d3a658a`,
+failed Rust compilation with exactly two `E0277` diagnostics at unchanged
+`src/ice_transport/mod.rs:270` and `:288`. Both await
+`agent.add_remote_candidate(&c)`. Registry `webrtc-ice` 0.13.0 makes that method
+synchronous; the exact-db vendored API is async. There was no test executable
+or runtime negative-control result. Preserve the complete failed build and
+the earlier generated lock `aa288ed5...` and record check `c1f20648...`.
+That earlier acceptance covered the actual input records, not compatibility
+with this source or a successful build.
+
+For this failed criterion only, the following explicit test config supersedes
+the earlier vendor metadata/build invocations. The existing root
+`[patch.crates-io]` already maps `webrtc-ice` to
+`vendor/webrtc-ice-0.13.0`. Select **only that override** with
+`vendor-unit-ice-config.toml`, an explicitly passed Cargo config, without
+changing either existing Cargo.toml. The selected common dependency is the
+already verified canonical baseline source at
+`C:/ams-mesh04-vendor-baseline-0b4ac426/vendor/webrtc-ice-0.13.0`:
+
+| Input | Exact identity |
+| --- | --- |
+| Upstream commit | `db7818e09fedd98899490347b86ac9bc9f97b59b` |
+| ICE subtree | `19ff26c90544c3dfe97986ade93598cf94ee7d0f`, 62 files |
+| ICE Cargo.toml blob | `cc64b4cbfd728d51af1e8b40e3d5f5165aff1d78` |
+| ICE Cargo.toml SHA256 | `97822d89789682b6d0cf9bec2637a6fd5f9215dfec0bd60360dcd3f1f602a74a` |
+| Cargo config SHA256 | `ddd9953d330206b9854c744308bbcd47a8eab1d08b46de812a7450cb598c5dc4` |
+
+The ICE manifest is byte-identical to the existing registry manifest.
+Compared with that registry source, its non-test Rust changes are confined to
+`agent/mod.rs` and `agent/agent_internal.rs`; they implement its async
+candidate and owned-task API using already declared dependencies. Other
+production files, including TURN gather/client-close/error calls, are exact.
+The vendored ICE tests do use additional vendored TURN test APIs, but ICE is a
+dependency here: root `webrtc --lib` does not select ICE's test or example
+targets. Adding TURN for those unselected tests, or copying all root overrides,
+would enlarge this repair beyond the observed mismatch. Keep TURN,
+interceptor and SCTP on the previous registry graph. Do not remove either
+await or change production code to fit the wrong dependency API. Central
+resolution and compilation must still prove this minimal selection.
+
+Use **new** private unit and target directories outside every Cargo workspace;
+do not overwrite the old graph, failed build, unit copies or targets. Extract
+the same reviewed baseline/corrected vendor subtrees into these new copies,
+preserving each archived original vendored lock. Recheck the existing
+93-file inventories and unchanged root `webrtc` manifest `12dbdf3e...`.
+Verify all 62 shared ICE working files against the exact subtree above, with
+no extra source/manifests or symlinks, before and after commands. The common
+dependency source and all four official root locks remain unchanged.
+
+The following manager-owned names are new inputs; fail if any already exists:
+
+| Purpose | Path |
+| --- | --- |
+| New baseline unit | `C:/ams-mesh04-vendor-api-baseline-unit-0b4ac426` |
+| New fixed unit | `C:/ams-mesh04-vendor-api-corrected-unit-0b4ac426` |
+| New baseline target | `C:/ams-mesh04-vendor-api-baseline-target-0b4ac426` |
+| New fixed target | `C:/ams-mesh04-vendor-api-corrected-target-0b4ac426` |
+
+`$mesh04_vendor_unit_config` must be the absolute path of the exact reviewed
+`scripts/ci/myownmesh-corrections/vendor-unit-ice-config.toml`. Record its raw
+SHA256 and use the same file for **both** sources and **every** command below.
+Its absolute ICE path prevents dependence on config-file-relative lookup or
+the current working directory. Do not add default config, environment patch
+overrides, another Cargo manifest, or another source/package acquisition.
+
+Copy the retained lock from the failed standalone graph, SHA256
+`aa288ed53273a6f307335698e86842da487419994c81681a1295ea33468acaff`,
+into only the new baseline unit copy as the explicit forward seed. Retain the
+seed separately. Resolve exactly once with the changed config:
+
+```sh
+cp "$mesh04_retained_aa_lock" "$mesh04_vendor_api_base/Cargo.lock"
+cargo +1.88.0 --config "$mesh04_vendor_unit_config" metadata --manifest-path "$mesh04_vendor_api_base/Cargo.toml" --format-version 1
+```
+
+Retain complete command streams, actual package/source/feature records and all
+forward-lock additions/removals/changes versus that seed. Record the actual
+new lock SHA only after resolution; no unresolved hash is a build-ready input.
+Require the exact shared vendored ICE path and manifest above, while the root
+baseline/fixed source distinction remains the reviewed startup patch. Other
+dependencies keep the previous registry selection unless actual records
+establish a necessary difference for the existing manifest. Stop for narrow
+review on any unexplained source, version, feature or manifest change. No
+crate's own dev tests become new qualification targets. This mixed graph is
+still a standalone primitive-test graph, not the canonical daemon graph.
+
+For the paired graph check, copy that one new lock byte-exact to the fresh
+fixed unit copy and check it without resolution:
+
+```sh
+cp "$mesh04_vendor_api_base/Cargo.lock" "$mesh04_vendor_api_fixed/Cargo.lock"
+cargo +1.88.0 --config "$mesh04_vendor_unit_config" metadata --locked --manifest-path "$mesh04_vendor_api_fixed/Cargo.toml" --format-version 1
+```
+
+Both forward locks must have the same recorded SHA and both config inputs
+must have the same raw SHA. Verify those actual generated records before
+compilation. Then, with distinct new owned target paths, build each vendor
+root with the exact same explicit config:
+
+```sh
+cargo +1.88.0 --config "$mesh04_vendor_unit_config" test --locked --manifest-path "$mesh04_vendor_api_source/Cargo.toml" --lib --no-run --message-format json
+```
+
+The exact library artifact selection, two-name inventory and semantic
+baseline-negative/corrected-pass requirements above remain unchanged. Recheck
+both 93-file unit inventories except their selected test locks, the 62-file
+shared ICE input, config hash, forward locks and all four canonical `8f5a...`
+root locks after the commands. The regression patch, all four test bodies,
+corrected source manifest `4cb553e8...`, daemon build and strict AV predicates
+are unchanged. The canonical core controls already have their separate
+before/after result; this recipe correction requests no repeat of those tests.

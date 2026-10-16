@@ -1,0 +1,9 @@
+# TEST-ONLY Cargo configuration for the isolated sample/bind primitive controls.
+# Select explicitly with --config; this is never a default/product manifest.
+# Existing exact-db root override only, no edited dependency declarations.
+# Base: db7818e09fedd98899490347b86ac9bc9f97b59b
+# ICE subtree: 19ff26c90544c3dfe97986ade93598cf94ee7d0f (62 exact files)
+# ICE Cargo.toml SHA256:
+# 97822d89789682b6d0cf9bec2637a6fd5f9215dfec0bd60360dcd3f1f602a74a
+[patch.crates-io]
+webrtc-ice = { path = "C:/ams-mesh04-vendor-baseline-0b4ac426/vendor/webrtc-ice-0.13.0" }
