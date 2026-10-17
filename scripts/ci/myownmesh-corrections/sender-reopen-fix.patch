@@ -1,0 +1,13 @@
+diff --git a/vendor/webrtc-0.13.0/src/peer_connection/mod.rs b/vendor/webrtc-0.13.0/src/peer_connection/mod.rs
+index a748cec32067a2154c1f749668dfbe98bb04cf78..18473c6d45201747efe66abf03a39901d686f9a5 100644
+--- a/vendor/webrtc-0.13.0/src/peer_connection/mod.rs
++++ b/vendor/webrtc-0.13.0/src/peer_connection/mod.rs
+@@ -1729,7 +1729,7 @@ impl RTCPeerConnection {
+                         .is_some_and(|id| id == track.id())
+                 {
+                     let sender = t.sender().await;
+-                    if sender.track().await.is_none() {
++                    if !sender.has_stopped().await && sender.track().await.is_none() {
+                         if let Err(err) = sender.replace_track(Some(track)).await {
+                             let _ = sender.stop().await;
+                             return Err(err);
