@@ -4,7 +4,9 @@
 //! only its private flow primitive so it can retain the actual reader before the
 //! unchanged monitor is spawned. It never fabricates Transport or calls IoGuard.
 
-use super::{spawn_monitor, FlowState, Life, RealtimeFlow, RealtimeSession};
+use super::{
+    outbound_read_error_end, spawn_monitor, FlowState, Life, RealtimeFlow, RealtimeSession,
+};
 use crate::realtime::{
     Encoding, FlowDirection, FlowSpec, PipeEnd, RealtimeError, RealtimePolicy,
     Result as RealtimeResult, RtpKind,
@@ -18,6 +20,7 @@ use interprocess::local_socket::GenericNamespaced;
 use interprocess::local_socket::ListenerOptions;
 use serde_json::{json, Value};
 use std::future::{poll_fn, Future};
+use std::io::ErrorKind;
 use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
@@ -328,6 +331,31 @@ fn assert_cleanup(cleanup: &Cleanup) {
         cleanup.private_endpoint_removed,
         "private endpoint must be removed"
     );
+}
+
+#[test]
+fn outbound_monitor_connection_reset_is_remote_closed() {
+    assert_eq!(
+        outbound_read_error_end(ErrorKind::ConnectionReset),
+        PipeEnd::RemoteClosed,
+    );
+}
+
+#[test]
+fn outbound_monitor_other_read_errors_are_not_remote_close() {
+    for error_kind in [
+        ErrorKind::PermissionDenied,
+        ErrorKind::Other,
+        ErrorKind::BrokenPipe,
+        ErrorKind::ConnectionAborted,
+        ErrorKind::UnexpectedEof,
+    ] {
+        assert_eq!(
+            outbound_read_error_end(error_kind),
+            PipeEnd::IoFailure,
+            "unrelated read error {error_kind:?} must remain an IO failure",
+        );
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]

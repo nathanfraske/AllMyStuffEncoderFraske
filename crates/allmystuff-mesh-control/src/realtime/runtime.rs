@@ -513,6 +513,13 @@ async fn close_exact(shared: &Arc<Shared>, flow: &Arc<FlowState>) -> Result<()> 
     outcome
 }
 
+fn outbound_read_error_end(error_kind: std::io::ErrorKind) -> PipeEnd {
+    match error_kind {
+        std::io::ErrorKind::ConnectionReset => PipeEnd::RemoteClosed,
+        _ => PipeEnd::IoFailure,
+    }
+}
+
 fn spawn_monitor(
     shared: &Arc<Shared>,
     flow: &Arc<FlowState>,
@@ -533,8 +540,8 @@ fn spawn_monitor(
                 Ok(0) => PipeEnd::RemoteClosed,
                 Ok(_) => PipeEnd::InvalidData,
                 Err(error) => {
+                    let error_kind = error.kind();
                     if failure_diagnostics_enabled() {
-                        let error_kind = error.kind();
                         let _ = std::io::Write::write_fmt(
                             &mut std::io::stderr(),
                             format_args!(
@@ -543,7 +550,7 @@ fn spawn_monitor(
                             ),
                         );
                     }
-                    PipeEnd::IoFailure
+                    outbound_read_error_end(error_kind)
                 },
             },
         };
