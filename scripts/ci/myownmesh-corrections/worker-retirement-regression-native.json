@@ -1,0 +1,464 @@
+{
+  "schema": "mesh04-worker-retirement-regression-native-recipe-v1",
+  "kind": "test-only-native",
+  "qualification": "Exact SAME50B declaration and SAME44a1/691e real-IPC test exported after meaningful280cf baseline101 and actuala719 SAME-case PASS. Only the reproduced primitive is qualified; actualf02 cause/daemon reconnect/full AV, relay and f76 remain unproved.",
+  "selected_manifest": {
+    "path": "scripts/ci/myownmesh-corrections/worker-retirement-regression-provenance.json",
+    "bytes": 3291,
+    "sha256": "485137dbaed85b551f69ef5cf8340d395aa2575bd4f44e299c0ce6166ba02f24",
+    "git_blob": "a6c8873193b071247a985c3478ea8391b53398a9"
+  },
+  "source_base_commit": "db7818e09fedd98899490347b86ac9bc9f97b59b",
+  "source_base_tree": "5492d1845e15dbc067acec3ec592bb9500b9e21d",
+  "source_expected_tree": "0635829ed4f9318100a62de9bebb89aad418fd43",
+  "source_records": 767,
+  "source_commit": null,
+  "cargo_lock_sha256": "8f5a30ce863c43b0a8c5225f74d7446aed7656cd7032f47e70030526381930c6",
+  "ordered_patch_count": 9,
+  "frozen_actual_stock8_prefix": {
+    "source_path": "scripts/ci/myownmesh-corrections/worker-retirement-stock-provenance.json",
+    "bytes": 2928,
+    "sha256": "5de332dd5676f420ca9ab5a150e780dbf85944ecffbc726c131d44a1c91a2cb7",
+    "git_blob": "c26f965f7875680fb16672a989b32cc4bd97574c",
+    "frozen_ready": {
+      "path": "C:/Users/Admin/AppData/Roaming/AllMyAgents/data/worktrees/4b7b28ed/target/mesh04-startup/worker-retirement-stock-inputs-source-ready.json",
+      "bytes": 22851,
+      "sha256": "c917dabf91f8da6f814ae51b4182b30b2b7dc5b27f0183337ac45c174fcab3c8",
+      "git_blob": "c1c7f412a25cb99265eea215202ace0f6547cf0a"
+    },
+    "expected_tree": "e865a7bc9f446feaeb2e7d244a7b1a211c22d5b9",
+    "records_raw_byte_exact": true,
+    "input_acceptance_rule": "The actual immutable stock8 input packet and this regression9 packet each require their reserved input-only acceptance; never infer acceptance from a filename or source/native pass."
+  },
+  "same_test_inputs": {
+    "declaration_utf8": "\n#[cfg(test)]\nmod realtime_retirement_regression;\n",
+    "declaration_bytes": 50,
+    "production_parent": {
+      "bytes": 245311,
+      "sha256": "c0024d46602ead7e76a08d1ce0ce51fed82fd43da524784ac67e3f2f18c8a678",
+      "git_blob": "dfc08d43f558237a6beec6b2cc5933f137b64ae0"
+    },
+    "test_parent": {
+      "bytes": 245361,
+      "sha256": "579722e89c4a600145556e8cb4378d40ece3b4312c00ade0499e54ffe788a4e0",
+      "git_blob": "88ee266706334d9d8b3452f6e459a1e46912b8de"
+    },
+    "child": {
+      "bytes": 32792,
+      "sha256": "691e803178023dc6db8900c23a06304456de4afd2b6deccb2dab8ac922b2b95e",
+      "git_blob": "44a1931dc58df6176effa0659fbd13339896da16"
+    },
+    "test_patch": {
+      "bytes": 34318,
+      "sha256": "ca2ad6df5ff3b5dbbf43243ed6aac2db6567b2f0bf694f21e1d2daf19b19ef2c",
+      "git_blob": "4b89376c2d7193795fa9db79169d19d13affcaea"
+    },
+    "two_file_full_forward_inverse_exact": true
+  },
+  "current_execution_selection": "No new native execution is requested merely to publish these byte-identical exported test inputs. Retain actuala719 SAME-test PASS and280cf meaningful negative. Commands below are reproducibility only for a separately selected central gate; do not replay unchanged passing controls.",
+  "new_source": "C:/ams-mesh04-worker-retirement-regression-0b4ac426",
+  "new_cargo_target_dir": "C:/ams-mesh04-worker-retirement-regression-target-0b4ac426",
+  "new_native_evidence": "C:/Users/Admin/AppData/Roaming/AllMyAgents/data/worktrees/1503a621/target/mesh04-correctness/worker-retirement-regression-native",
+  "new_input_layer": "C:/Users/Admin/AppData/Roaming/AllMyAgents/data/worktrees/1503a621/target/mesh04-correctness/worker-retirement-regression-inputs",
+  "new_durable_run_evidence_paths": {
+    "preparation": "C:/Users/Admin/AppData/Roaming/AllMyAgents/data/worktrees/1503a621/target/mesh04-correctness/worker-retirement-regression-preparation-run",
+    "compile": "C:/Users/Admin/AppData/Roaming/AllMyAgents/data/worktrees/1503a621/target/mesh04-correctness/worker-retirement-regression-compile-run",
+    "runtime": "C:/Users/Admin/AppData/Roaming/AllMyAgents/data/worktrees/1503a621/target/mesh04-correctness/worker-retirement-regression-runtime-run"
+  },
+  "application_cwd_for_source_preparation_and_helper": "C:/Users/Admin/AppData/Roaming/AllMyAgents/data/worktrees/1503a621",
+  "preconditions": [
+    "Manager-only execution after exact input acceptance. Actual immutable integrated application HEAD must contain this exact manifest/recipe, ALL NINE canonical LF basename patches and reviewed helper. Author branches are partial; retain actual integration identity.",
+    "Require all seven selected source/target/evidence/input/run roots still absent. Preserve every old source, target, test, binary, negative/positive receipt and tracked export. Inspect ambiguous outcomes; never blindly replay.",
+    "Materialize the Git LF execution layer and helper copy below from immutable integrated Git bytes. Preserve tracked CRLF bytes and use these actual new paths; no tracked normalization or helper edits.",
+    "If a new gate is selected, start with pristine canonical LF db/5492/762/8f5, prepare exactly ONCE for all9 patches, verify, compile/list/ONLY same case, and verify source before/after each gate. Never prepare an already patched source."
+  ],
+  "canonical_source_preparation_commands": [
+    [
+      "git",
+      "-c",
+      "core.autocrlf=false",
+      "clone",
+      "--no-hardlinks",
+      "--no-checkout",
+      "--depth",
+      "1",
+      "file:///C:/ams-mesh04-sender-reuse-corrected-0b4ac426",
+      "C:/ams-mesh04-worker-retirement-regression-0b4ac426"
+    ],
+    [
+      "git",
+      "--no-optional-locks",
+      "-C",
+      "C:/ams-mesh04-worker-retirement-regression-0b4ac426",
+      "config",
+      "core.autocrlf",
+      "false"
+    ],
+    [
+      "git",
+      "--no-optional-locks",
+      "-C",
+      "C:/ams-mesh04-worker-retirement-regression-0b4ac426",
+      "config",
+      "core.eol",
+      "lf"
+    ],
+    [
+      "git",
+      "--no-optional-locks",
+      "-C",
+      "C:/ams-mesh04-worker-retirement-regression-0b4ac426",
+      "checkout",
+      "--detach",
+      "db7818e09fedd98899490347b86ac9bc9f97b59b"
+    ]
+  ],
+  "source_preparation_rule": "Verify pristine db781/5492/762 raw Git files/clean index/8f5 after LF configuration and checkout. Use the nine-record diagnostic manifest once. No dirty donor copy, stock8 reprepare, dependency/manifest/lock changes, bootstrap or temporary diagnostics.",
+  "canonical_git_lf_execution_layer": {
+    "new_directory": "C:/Users/Admin/AppData/Roaming/AllMyAgents/data/worktrees/1503a621/target/mesh04-correctness/worker-retirement-regression-inputs",
+    "rule": "From actual immutable accepted integration HEAD copy exact raw Git bytes into NEW regular files only; all nine sibling basenames must be in the SAME directory as the copied manifest. Preserve command/stdout/stderr/hash/length/fullEOF/HEAD evidence.",
+    "manifest": {
+      "source_path": "scripts/ci/myownmesh-corrections/worker-retirement-regression-provenance.json",
+      "output_path": "C:/Users/Admin/AppData/Roaming/AllMyAgents/data/worktrees/1503a621/target/mesh04-correctness/worker-retirement-regression-inputs/worker-retirement-regression-provenance.json",
+      "bytes": 3291,
+      "sha256": "485137dbaed85b551f69ef5cf8340d395aa2575bd4f44e299c0ce6166ba02f24",
+      "git_blob": "a6c8873193b071247a985c3478ea8391b53398a9"
+    },
+    "recipe": {
+      "source_path": "scripts/ci/myownmesh-corrections/worker-retirement-regression-native.json",
+      "output_path": "C:/Users/Admin/AppData/Roaming/AllMyAgents/data/worktrees/1503a621/target/mesh04-correctness/worker-retirement-regression-inputs/worker-retirement-regression-native.json",
+      "identity_rule": "Derive exact accepted recipe blob/SHA/length from immutable integration receipt; do not embed a self-referential recipe hash."
+    },
+    "sibling_patches": [
+      {
+        "source_path": "scripts/ci/myownmesh-corrections/owner-cleanup-fix.patch",
+        "output_name": "owner-cleanup-fix.patch",
+        "bytes": 17394,
+        "sha256": "6f8c1da2070208c159c663df3d6a67120558aeddb2b20b6b78c17a787e42caaf",
+        "git_blob": "7b5897c5f0353d08059ad7fa9ba76544fed0daee"
+      },
+      {
+        "source_path": "scripts/ci/myownmesh-corrections/owner-cleanup-regression.patch",
+        "output_name": "owner-cleanup-regression.patch",
+        "bytes": 23587,
+        "sha256": "1a5f193bc89766d47a53d5ebe76e75f72331e0d55bff39ceac42242e1b3068e5",
+        "git_blob": "3bc56af01b604960ccceb54da462ad938984e1b7"
+      },
+      {
+        "source_path": "scripts/ci/myownmesh-corrections/startup-fix.patch",
+        "output_name": "startup-fix.patch",
+        "bytes": 6043,
+        "sha256": "74a666370dec84650bd1975a52e0a21fb87c721479b2ed33671b3f67ef4e4eb4",
+        "git_blob": "df6973dc16e57ab7ad3d28b0eb72e38f01fcea01"
+      },
+      {
+        "source_path": "scripts/ci/myownmesh-corrections/startup-regression.patch",
+        "output_name": "startup-regression.patch",
+        "bytes": 16613,
+        "sha256": "da7afd74b297aae0215789206ec429cf2d09c1154addf4be4c514ada2f8c6cf1",
+        "git_blob": "6ead7e518c344f7f67086e30f3a81e870712ebb7"
+      },
+      {
+        "source_path": "scripts/ci/myownmesh-corrections/sender-reopen-fix.patch",
+        "output_name": "sender-reopen-fix.patch",
+        "bytes": 828,
+        "sha256": "4e93bbc7e96ae871fd53b40b1eeaf4204e162116c4c0ff9582ab07de4017e012",
+        "git_blob": "696ae50e684bed48dc516399cda656ba80236289"
+      },
+      {
+        "source_path": "scripts/ci/myownmesh-corrections/sender-reopen-regression.patch",
+        "output_name": "sender-reopen-regression.patch",
+        "bytes": 7327,
+        "sha256": "978d54016c38e318043eaf4bb03dc28eb0146dca665ef2a7442ccab301650173",
+        "git_blob": "b03673c617a030398361a029e41f0abf709264ac"
+      },
+      {
+        "source_path": "scripts/ci/myownmesh-corrections/sendonly-fix.patch",
+        "output_name": "sendonly-fix.patch",
+        "bytes": 1313,
+        "sha256": "cfe69e048186331d623789eb0a31882b65d01ec511a9fcadf461420229f63797",
+        "git_blob": "ecbaa482018e9f1b8481558ba3563ed709c4efb0"
+      },
+      {
+        "source_path": "scripts/ci/myownmesh-corrections/worker-retirement-fix.patch",
+        "output_name": "worker-retirement-fix.patch",
+        "bytes": 13049,
+        "sha256": "808325ce95d8d5e29d424828ebb7e2b25e5351ddc2c54982348e69e7a1d6e712",
+        "git_blob": "f3ce3fa3761d1dd120eed7a2854f095f4b1eb10b"
+      },
+      {
+        "source_path": "scripts/ci/myownmesh-corrections/worker-retirement-regression.patch",
+        "output_name": "worker-retirement-regression.patch",
+        "bytes": 34318,
+        "sha256": "ca2ad6df5ff3b5dbbf43243ed6aac2db6567b2f0bf694f21e1d2daf19b19ef2c",
+        "git_blob": "4b89376c2d7193795fa9db79169d19d13affcaea"
+      }
+    ],
+    "helper": {
+      "source_path": "scripts/ci/myownmesh-corrections/prepare-candidate.py",
+      "output_path": "C:/Users/Admin/AppData/Roaming/AllMyAgents/data/worktrees/1503a621/target/mesh04-correctness/worker-retirement-regression-native/prepare-candidate.py",
+      "bytes": 17074,
+      "sha256": "f698d79e564feb88294156b16f131ac0e10a5bb20ccd640c7550af7301ba2a20",
+      "git_blob": "1c0707e4d0aa5aa335de1b560262c0a7e1c9c090"
+    },
+    "only_helper_path_and_patch_set_path_substitutions": true
+  },
+  "helper_identity": {
+    "path": "scripts/ci/myownmesh-corrections/prepare-candidate.py",
+    "bytes": 17074,
+    "sha256": "f698d79e564feb88294156b16f131ac0e10a5bb20ccd640c7550af7301ba2a20",
+    "git_blob": "1c0707e4d0aa5aa335de1b560262c0a7e1c9c090"
+  },
+  "prepare_once_argv": [
+    "C:/Python313/python.exe",
+    "C:/Users/Admin/AppData/Roaming/AllMyAgents/data/worktrees/1503a621/target/mesh04-correctness/worker-retirement-regression-native/prepare-candidate.py",
+    "prepare",
+    "--upstream",
+    "C:/ams-mesh04-worker-retirement-regression-0b4ac426",
+    "--patch-set",
+    "C:/Users/Admin/AppData/Roaming/AllMyAgents/data/worktrees/1503a621/target/mesh04-correctness/worker-retirement-regression-inputs/worker-retirement-regression-provenance.json",
+    "--patch-set-sha256",
+    "485137dbaed85b551f69ef5cf8340d395aa2575bd4f44e299c0ce6166ba02f24",
+    "--output",
+    "C:/Users/Admin/AppData/Roaming/AllMyAgents/data/worktrees/1503a621/target/mesh04-correctness/worker-retirement-regression-native/candidate-source.json"
+  ],
+  "verify_before_after_compile_list_and_runtime_argv": [
+    "C:/Python313/python.exe",
+    "C:/Users/Admin/AppData/Roaming/AllMyAgents/data/worktrees/1503a621/target/mesh04-correctness/worker-retirement-regression-native/prepare-candidate.py",
+    "verify",
+    "--upstream",
+    "C:/ams-mesh04-worker-retirement-regression-0b4ac426",
+    "--source-receipt",
+    "C:/Users/Admin/AppData/Roaming/AllMyAgents/data/worktrees/1503a621/target/mesh04-correctness/worker-retirement-regression-native/candidate-source.json",
+    "--source-receipt-sha256",
+    {
+      "derive_sha256_of_file": "C:/Users/Admin/AppData/Roaming/AllMyAgents/data/worktrees/1503a621/target/mesh04-correctness/worker-retirement-regression-native/candidate-source.json"
+    }
+  ],
+  "source_custody": "Receipt must identify patched-candidate/source_commit:null, kind diagnostic, exact manifest SHA/0635829e/767/8f5. Retain every actual mode/blob/raw inventory before and after preparation, compile, list and any selected runtime, plus actual argv/cwd/env/toolchain/artifact identity and full EOF streams. SAME test bytes are mandatory.",
+  "established_build_environment": {
+    "provenance": {
+      "path": "C:/Users/Admin/AppData/Roaming/AllMyAgents/data/worktrees/1503a621/target/mesh04-correctness/real-ipc-retirement-baseline-build/compile-audit.json",
+      "sha256": "080f92def385c6283d6969e1fa7a4d32d5f6d166b0aab738933ab6a898a25b0c",
+      "blob": "6e151d2261923f44ac9b10dec9721c5dcc64c5bd",
+      "bytes": 219132,
+      "CR_bytes": 0,
+      "ends_in_LF": true
+    },
+    "environment_overrides": {
+      "CARGO_TARGET_DIR": "C:/ams-mesh04-worker-retirement-regression-target-0b4ac426",
+      "RUST_TEST_THREADS": "1",
+      "CARGO_BUILD_JOBS": "4",
+      "CMAKE_POLICY_VERSION_MINIMUM": "3.5",
+      "PYTHONDONTWRITEBYTECODE": "1",
+      "GIT_OPTIONAL_LOCKS": "0"
+    },
+    "PATH_prefixes_in_order": [
+      "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\Common7\\IDE\\CommonExtensions\\Microsoft\\CMake\\CMake\\bin",
+      "C:\\Users\\Admin\\.cargo\\bin"
+    ],
+    "PATH_rule": "Prepend only these established CMake and Cargo directories to existing PATH; record actual inherited/overridden environment. No setup/install/version expansion.",
+    "CMake_probe_argv": [
+      "C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin/cmake.exe",
+      "--version"
+    ]
+  },
+  "workspace": {
+    "package": "myownmesh",
+    "target_name": "myownmesh",
+    "target_kind": "lib",
+    "source_entry": "C:/ams-mesh04-worker-retirement-regression-0b4ac426/crates/myownmesh/src/lib.rs",
+    "edition": "2021",
+    "rust": "1.88.0",
+    "cargo_lock_sha256": "8f5a30ce863c43b0a8c5225f74d7446aed7656cd7032f47e70030526381930c6",
+    "new_library_manifest_dependency_feature_or_resolution": false
+  },
+  "compile": {
+    "cwd": "C:/ams-mesh04-worker-retirement-regression-0b4ac426",
+    "environment": {
+      "CARGO_TARGET_DIR": "C:/ams-mesh04-worker-retirement-regression-target-0b4ac426",
+      "RUST_TEST_THREADS": "1",
+      "CARGO_BUILD_JOBS": "4",
+      "CMAKE_POLICY_VERSION_MINIMUM": "3.5",
+      "PYTHONDONTWRITEBYTECODE": "1",
+      "GIT_OPTIONAL_LOCKS": "0"
+    },
+    "toolchain_pins": [
+      {
+        "argv": [
+          "rustc",
+          "+1.88.0",
+          "--version",
+          "--verbose"
+        ]
+      },
+      {
+        "argv": [
+          "cargo",
+          "+1.88.0",
+          "--version",
+          "--verbose"
+        ]
+      }
+    ],
+    "argv": [
+      "cargo",
+      "+1.88.0",
+      "test",
+      "--locked",
+      "-p",
+      "myownmesh",
+      "--no-default-features",
+      "--lib",
+      "--no-run",
+      "--message-format=json"
+    ],
+    "required_exit_code": 0,
+    "must_retain": "Entire terminal and every stdout/stderr stream with exact argv/cwd/env/start/end/exit, SHA256/byte counts/full EOF; compile warnings/errors and actual toolchain versions are evidence, not truncated summaries.",
+    "artifact_selection": {
+      "reason": "compiler-artifact",
+      "package": "myownmesh",
+      "target_name": "myownmesh",
+      "target_kind": [
+        "lib"
+      ],
+      "profile_test": true,
+      "src_path": "C:/ams-mesh04-worker-retirement-regression-0b4ac426/crates/myownmesh/src/lib.rs",
+      "executable": "Mandatory future-derived actual successful CargoJSON executable, SHA256/bytes and exact source/build correspondence; no guessed filename, old native identity or reused baseline artifact."
+    },
+    "PATH_prefixes_in_order": [
+      "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\Common7\\IDE\\CommonExtensions\\Microsoft\\CMake\\CMake\\bin",
+      "C:\\Users\\Admin\\.cargo\\bin"
+    ],
+    "before_and_after_custody": "Capture and compare all767 actual mode/blob/raw records and canonical8f5 before build, after build, after exact inventory and before/after native execution; retain stdout/stderr full EOF and actual source/build/toolchain/artifact/argv/cwd/env bindings.",
+    "complete_command_receipt": "C:/Users/Admin/AppData/Roaming/AllMyAgents/data/worktrees/1503a621/target/mesh04-correctness/worker-retirement-regression-native/compile.complete.json"
+  },
+  "executable_selection": "Derive exactly one nonnull executable from the successful full CargoJSON compiler-artifact: package myownmesh, target.name myownmesh, target.kind lib, target.src_path C:/ams-mesh04-worker-retirement-regression-0b4ac426/crates/myownmesh/src/lib.rs, profile.test true. Record actual path/bytes/SHA with this NEW source/target and actual versions. No guessed filename or old artifact relabel.",
+  "artifact_binding": "Only actual future CargoJSON unit executable and its path/bytes/SHA after successful compile; never reuse historical110677 or invent a daemon record-build identity. This unit gate has no daemon record-build command.",
+  "inventory": {
+    "argv": [
+      "<actual CargoJSON executable>",
+      "--list",
+      "--ignored",
+      "--exact",
+      "control::realtime_retirement_regression::retired_exact_session_closes_idle_outbound_pipe_before_events_departure"
+    ],
+    "required_exact_new_ignored_test_names": [
+      "control::realtime_retirement_regression::retired_exact_session_closes_idle_outbound_pipe_before_events_departure"
+    ],
+    "required_matching_count": 1,
+    "note": "Retain the actual complete test inventory/output and filtered counts; the global library count is not guessed."
+  },
+  "runtime": {
+    "cwd": "C:/ams-mesh04-worker-retirement-regression-0b4ac426",
+    "environment": {
+      "CARGO_TARGET_DIR": "C:/ams-mesh04-worker-retirement-regression-target-0b4ac426",
+      "RUST_TEST_THREADS": "1",
+      "CARGO_BUILD_JOBS": "4",
+      "CMAKE_POLICY_VERSION_MINIMUM": "3.5",
+      "PYTHONDONTWRITEBYTECODE": "1",
+      "GIT_OPTIONAL_LOCKS": "0"
+    },
+    "argv": [
+      "<same actual CargoJSON executable>",
+      "--ignored",
+      "--exact",
+      "control::realtime_retirement_regression::retired_exact_session_closes_idle_outbound_pipe_before_events_departure",
+      "--nocapture",
+      "--test-threads=1"
+    ],
+    "only_selector": "control::realtime_retirement_regression::retired_exact_session_closes_idle_outbound_pipe_before_events_departure",
+    "future_fixed_qualification": "Run SAME immutable50B declaration and44a1/691e child/selector against accepted candidate only. Native exit0 and every existing control+exact provider cleanup must pass; no test/predicate/category weakening or baseline replay.",
+    "before_and_after_source_custody": "Reverify all 767 actual source mode/blob/raw records and canonical lock before execution and after terminal cleanup. All native fixture results remain pending until central receipt.",
+    "candidate_expected_result": {
+      "pending": true,
+      "required_actual_exit": 0,
+      "required_actual_result": "1 passed,0 failed,0 ignored; derive actual filtered count from actual exact library inventory",
+      "required_control_marker": "real_ipc_retirement_controls_and_cleanup_passed",
+      "required_final_assertion": "exact native session retirement must close the idle outbound pipe while its Events owner and client socket are still alive",
+      "required_idle_observation": "ExternalEnd::Eof captured before client/Events cleanup; completed stale-frame control also Eof; SAME full provider/baseline cleanup before marker/assertion",
+      "nonmandatory_fixed_scalar": "Candidate may close/remove old flow before canonical stale-frame write; no requirement for SessionNotCurrent, successful stale write, or held registry-row booleans. Do not weaken unchanged final assertion.",
+      "not_a_pass": "Setup/funding/profile/currentness/native-disposal/control/cleanup failure, missing marker, timeout/killed harness, wrong source/target/executable, source drift, or any final assertion failure."
+    }
+  },
+  "same_test_controls_and_lifetime_criteria": [
+    "Initialize only existing permanent ProcessResourceRoot/provider and its existing cleanup executor through public issue_mesh_connector_scope; drop that bootstrap token BEFORE taking one immutable full ResourceClaim plus active-reservation and active-scope baseline. No Mesh warmup or fixture allocation is absorbed in the baseline.",
+    "Hold existing process-wide connector-fixture lock throughout fixture and terminal accounting; run the exact ignored test alone with RUST_TEST_THREADS=1 and --test-threads=1, so unrelated releases cannot offset fixture custody.",
+    "ServiceCleanupOwner is fixture-owned and draws from the SAME global Mesh provider through an existing local application scope; its joining owner is outside runtime. It is never an alternative zero-provider oracle.",
+    "Use two real joined Mesh instances with existing validated H264/Opus profile and actual transport-lab captured-session link. Three real local sockets call production handle_client; each server task and retained join node is funded before spawn and every handle is observed.",
+    "Actual EventsSubscribe/ACK/authentication and real open_webrtc_realtime plus install_realtime_flow provide sole owned flows. Live pipe ACKs/currentness and a real Pending external read precede retirement.",
+    "Retire the exact original captured channels, require >=2 native results and inspect every result; current old-flow use must cease while the same Events owner/socket is kept alive. Replacement ACTIVE/ACK is not used.",
+    "Observe idle external EOF before writing any media to that pipe. Separately send the exact production-decoded canonical 119-byte H264 frame on the second pipe and independently observe EOF; no raw I/O code is reclassified.",
+    "Capture both observations BEFORE local socket close/Events departure/registry closing. Exhaustively drain owned registrations, join all funded IPC handlers/watchdogs, assert empty Closed registry, shut down services and both exact joined drivers, release all handles/scopes, settle native cleanup health and join outside service cleanup owner.",
+    "Existing per-registry final-watchdog observers finish via their production terminal custody; wait boundedly for actual full same-provider disposition, then capture a single final claim/reservation/scope sample. Require EXACT componentwise equality to the immutable prefixture baseline, not <=, tolerance, late rebaseline or global reset.",
+    "All prerequisite controls and cleanup/accounting assertions precede distinct marker and final unchanged normative idle EOF assertion. A deadline only detects an unfinished transition; no sleeps/retries/renegotiation delays or extra production timers/tasks/resources are added."
+  ],
+  "retained_meaningful_baseline": {
+    "audit": {
+      "path": "C:/Users/Admin/AppData/Roaming/AllMyAgents/data/worktrees/1503a621/target/mesh04-correctness/real-ipc-retirement-baseline-runtime/runtime-audit.json",
+      "bytes": 15444,
+      "sha256": "280cf0b5d72a3bbdc337f89c610ba19e5ebda431c8f5a295f59c823bdb07e45e",
+      "git_blob": "e2093abaa43f5f1501c1ed510b6986fb7fa779e1"
+    },
+    "source_tree": "a197a012c31d5f8fdb0d704eb92312e011e5bd92",
+    "actual_native_result": "101/0pass/1fail/0ignored187filtered after all controls and exact same-provider cleanup marker; final idle TimedOut versus Eof only. Separate valid stale-frame EOF passed.",
+    "no_reexecution": true
+  },
+  "retained_same_test_pass": {
+    "central_run_id": "3569ef86-e387-442b-8f6a-3926f4eca947",
+    "audit": {
+      "path": "C:/Users/Admin/AppData/Roaming/AllMyAgents/data/worktrees/1503a621/target/mesh04-correctness/worker-retirement-corrected-runtime/runtime-audit.json",
+      "bytes": 15851,
+      "sha256": "a719f5abd33b89e25c964dd09ae12831ae37b8909d69947dee27ff759c5cd7a0",
+      "git_blob": "2d8ab4f824568891d1c27d4c5a25c294777cae7f"
+    },
+    "compile_audit": {
+      "path": "C:\\Users\\Admin\\AppData\\Roaming\\AllMyAgents\\data\\worktrees\\1503a621\\target\\mesh04-correctness\\worker-retirement-corrected-build\\compile-audit.json",
+      "bytes": 219938,
+      "sha256": "8bc0c5b73d910500b5aa58f397ac2aa59652113f5c3b8f2cdee742820f1bd35e"
+    },
+    "source_tree": "0635829ed4f9318100a62de9bebb89aad418fd43",
+    "source_records": 767,
+    "source_commit": null,
+    "actual_artifact_from_verified_audit": {
+      "path": "C:\\ams-mesh04-worker-retirement-corrected-target-0b4ac426\\debug\\deps\\myownmesh-ed52f3dd389407e7.exe",
+      "bytes": 64205312,
+      "sha256": "1106778169da674539ede5601de1e35a2ea31f560268ee45ec4254e817e5a40e"
+    },
+    "actual_native_result": {
+      "exit_code": 0,
+      "counts": {
+        "status": "ok",
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0,
+        "filtered_out": 187
+      },
+      "controls_cleanup_marker": true,
+      "marker_lines": [
+        "real_ipc_retirement_controls_and_cleanup_passed stale_write_completed=false idle_row_retained_noncurrent=true framed_row_retained_noncurrent=true"
+      ],
+      "observed_control_scalars": {
+        "stale_write_completed": false,
+        "idle_row_retained_noncurrent": true,
+        "framed_row_retained_noncurrent": true
+      },
+      "final_idle_timedout_vs_eof_after_controls_cleanup": false,
+      "passed": true,
+      "candidate_classification": "same_test_candidate_pass"
+    },
+    "actual_runtime_seconds": 0.17023849999532104,
+    "manager_verified_complete_command_count": 9,
+    "manager_verified_stream_count": 18,
+    "manager_verified_stream_bytes": 222301,
+    "provenance_rule": "Retain manager-verified completed result and audit; publication is not a reason to rerun native or re-audit old streams. Test/marker/cleanup semantics and bytes remain unchanged.",
+    "no_reexecution": true
+  },
+  "scope_limits": [
+    "Primitive captured native-worker retirement versus idle external IPC EOF only. A wait observer does not acknowledge successful native cleanup or all individual flow ends; no actualf02 cause/general reconnect/full AV/relay/f76 claim.",
+    "No new source/test/predicate/frame/control/cleanup/API/dependency/grant/budget/timing/role/logging behavior; patch is only SAME50B declaration plus unchanged44a1/691e child after stock8. All existing production source and test gates stay closed.",
+    "Stock8 release/strict-pair recipe is separate and excludes this NEW test child/declaration. Regression9 manifest is diagnostic only for unit qualification; no temporary diagnostic patch or old role input is included.",
+    "No driver/workflow/corrected-default/old manifest/native-qualification docs changes, source staging/integration, push or worker native execution."
+  ]
+}

@@ -1,0 +1,843 @@
+diff --git a/crates/myownmesh/src/control.rs b/crates/myownmesh/src/control.rs
+index dfc08d43f558237a6beec6b2cc5933f137b64ae0..88ee266706334d9d8b3452f6e459a1e46912b8de 100644
+--- a/crates/myownmesh/src/control.rs
++++ b/crates/myownmesh/src/control.rs
+@@ -5234,3 +5234,6 @@
+         );
+     }
+ }
++
++#[cfg(test)]
++mod realtime_retirement_regression;
+diff --git a/crates/myownmesh/src/control/realtime_retirement_regression.rs b/crates/myownmesh/src/control/realtime_retirement_regression.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..44a1931dc58df6176effa0659fbd13339896da16
+--- /dev/null
++++ b/crates/myownmesh/src/control/realtime_retirement_regression.rs
+@@ -0,0 +1,826 @@
++//! Real joined-session retirement must terminate its idle outbound IPC pipes.
++//! This is an exact captured-session/daemon-socket criterion, not a reconnect,
++//! replacement-ACTIVE, media-delivery, decode, relay or application-watcher test.
++
++use super::*;
++use crate::ipc::{ClientHandle, ClientId, ClientRegistry, LeasedList, Lifecycle, RegistryResidue};
++use interprocess::local_socket::{GenericFilePath, GenericNamespaced, ToFsName, ToNsName};
++use myownmesh_core::{
++    ConnectorCallbackPolicy, ConnectorResourceOwnerPort, FiniteResourceProvider, FundedArc,
++    JoinedNetwork, Mesh, MeshConfig, ProcessResourceRoot, ResourceClaim,
++    TransportLabRetirableSession, WebRtcConnectorCapablePolicy, WebRtcConnectorProfile,
++    WebRtcRealtimeCodec, WebRtcRealtimeFlowOpen, WebRtcRealtimeFraming, WebRtcRealtimeProfile,
++    WebRtcRtpKind,
++};
++use std::future::Future;
++use std::task::{Context as TaskContext, Poll, Waker};
++use std::time::Duration;
++use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
++
++type Check<T> = std::result::Result<T, &'static str>;
++type ClientSocket = BufReader<LocalSocketStream>;
++type ConnectionTask = tokio::task::JoinHandle<Result<()>>;
++
++// Existing loopback setup and daemon-test hang bounds. No transition is driven
++// by a sleep, retry or grace interval. A timed-out observation is retained and
++// asserted only after the independent controls and exhaustive owned cleanup.
++const CONNECT_BOUND: Duration = Duration::from_secs(15);
++const STEP_BOUND: Duration = Duration::from_secs(10);
++const NETWORK: &str = "retirement-near";
++const IDLE_LABEL: &[u8] = b"retirement-idle";
++const FRAME_LABEL: &[u8] = b"retirement-frame";
++// The existing native/paired fixture's exact first 119-byte H264 access unit.
++// It is sent only after retirement; no RTP or remote receipt is claimed here.
++const VIDEO: &[u8] = &[
++    0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0xd0, 0x0b, 0x8c, 0x68, 0x42, 0x48, 0x07, 0x84, 0x42, 0x35,
++    0x00, 0x00, 0x00, 0x01, 0x68, 0xce, 0x3c, 0x80, 0x00, 0x00, 0x00, 0x01, 0x06, 0x05, 0x21, 0x41,
++    0x4d, 0x53, 0x2d, 0x41, 0x55, 0x2d, 0x53, 0x45, 0x51, 0x2d, 0x56, 0x32, 0x21, 0x21, 0x21, 0x52,
++    0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x33, 0x65, 0x38,
++    0x80, 0x00, 0x00, 0x00, 0x01, 0x65, 0xb8, 0x00, 0x04, 0x09, 0xff, 0xff, 0xf8, 0x7a, 0x28, 0x00,
++    0x08, 0x1b, 0xf9, 0x3f, 0x0f, 0xff, 0xc3, 0xd1, 0x40, 0x00, 0x40, 0x6b, 0xc9, 0xd7, 0x5d, 0x75,
++    0xf1, 0xff, 0xfe, 0x1e, 0x8a, 0x00, 0x02, 0x0d, 0x5e, 0xfc, 0x61, 0xff, 0xf8, 0x7a, 0x28, 0x00,
++    0x08, 0x03, 0x7b, 0xea, 0x4a, 0xeb, 0xaf,
++];
++
++async fn bounded<F: Future>(why: &'static str, future: F) -> Check<F::Output> {
++    tokio::time::timeout(STEP_BOUND, future)
++        .await
++        .map_err(|_| why)
++}
++
++// Preserve the fixture owner after an unexpected setup panic, so cleanup still
++// runs before that panic is propagated. This wraps Future::poll, never IPC or
++// native outcomes, and introduces no task, dependency or production hook.
++async fn caught<F: Future>(future: F) -> std::thread::Result<F::Output> {
++    let mut future = Box::pin(future);
++    std::future::poll_fn(|cx| {
++        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| future.as_mut().poll(cx))) {
++            Ok(Poll::Ready(value)) => Poll::Ready(Ok(value)),
++            Ok(Poll::Pending) => Poll::Pending,
++            Err(panic) => Poll::Ready(Err(panic)),
++        }
++    })
++    .await
++}
++
++fn connector_policy() -> Check<WebRtcConnectorCapablePolicy> {
++    let realtime = WebRtcRealtimeProfile::new(vec![
++        WebRtcRealtimeCodec {
++            kind: WebRtcRtpKind::Video,
++            payload_type: 96,
++            mime: "video/H264".to_owned(),
++            clock_rate: 90_000,
++            channels: 0,
++            fmtp: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
++                .to_owned(),
++            framing: WebRtcRealtimeFraming::AnnexB,
++            rtcp_feedback: Vec::new(),
++        },
++        WebRtcRealtimeCodec {
++            kind: WebRtcRtpKind::Audio,
++            payload_type: 111,
++            mime: "audio/opus".to_owned(),
++            clock_rate: 48_000,
++            channels: 2,
++            fmtp: "minptime=10;useinbandfec=1".to_owned(),
++            framing: WebRtcRealtimeFraming::Whole,
++            rtcp_feedback: Vec::new(),
++        },
++    ])
++    .map_err(|_| "fixture codec profile")?;
++    let profile = WebRtcConnectorProfile::new(ConnectorCallbackPolicy::elastic_realtime())
++        .with_realtime_profile(realtime)
++        .map_err(|_| "fixture realtime profile")?;
++    Ok(WebRtcConnectorCapablePolicy::new(
++        crate::test_resource_provider(),
++        profile,
++    ))
++}
++
++fn flow_open(label: &[u8], video: bool) -> WebRtcRealtimeFlowOpen {
++    WebRtcRealtimeFlowOpen {
++        label: label.to_vec(),
++        direction: myownmesh_core::realtime::RealtimeFlowDirection::Outbound,
++        kind: if video {
++            WebRtcRtpKind::Video
++        } else {
++            WebRtcRtpKind::Audio
++        },
++        mime: if video { "video/H264" } else { "audio/opus" }.to_owned(),
++        clock_rate: if video { 90_000 } else { 48_000 },
++        channels: if video { 0 } else { 2 },
++    }
++}
++
++fn advert() -> RealtimeAdvert {
++    RealtimeAdvert::registered(vec![
++        RealtimeEncoding {
++            kind: "video".to_owned(),
++            mime: "video/H264".to_owned(),
++            clock_rate: 90_000,
++            channels: 0,
++        },
++        RealtimeEncoding {
++            kind: "audio".to_owned(),
++            mime: "audio/opus".to_owned(),
++            clock_rate: 48_000,
++            channels: 2,
++        },
++    ])
++}
++
++async fn local_pair(
++    listener: &LocalSocketListener,
++    target: &listener::SocketTarget,
++) -> Check<(LocalSocketStream, LocalSocketStream)> {
++    let name = match target {
++        listener::SocketTarget::Path(path) => path
++            .as_path()
++            .to_fs_name::<GenericFilePath>()
++            .map_err(|_| "fixture local socket path")?,
++        listener::SocketTarget::Name(name) => name
++            .clone()
++            .to_ns_name::<GenericNamespaced>()
++            .map_err(|_| "fixture local socket name")?,
++    };
++    let (client, server) = tokio::join!(LocalSocketStream::connect(name), listener.accept());
++    Ok((
++        client.map_err(|_| "fixture local connect")?,
++        server.map_err(|_| "fixture local accept")?,
++    ))
++}
++
++async fn exchange(socket: &mut ClientSocket, request: &Request) -> Check<serde_json::Value> {
++    let mut encoded = serde_json::to_vec(request).map_err(|_| "fixture request encoding")?;
++    encoded.push(b'\n');
++    bounded("fixture request write bound", socket.write_all(&encoded))
++        .await?
++        .map_err(|_| "fixture request write")?;
++    bounded("fixture request flush bound", socket.flush())
++        .await?
++        .map_err(|_| "fixture request flush")?;
++    let mut line = String::new();
++    let bytes = bounded("fixture ACK read bound", socket.read_line(&mut line))
++        .await?
++        .map_err(|_| "fixture ACK read")?;
++    if bytes == 0 {
++        return Err("fixture ACK was EOF");
++    }
++    let response: Response = serde_json::from_str(&line).map_err(|_| "fixture ACK JSON")?;
++    if !response.ok {
++        return Err("fixture request refused");
++    }
++    response.data.ok_or("fixture ACK omitted data")
++}
++
++fn read_is_pending(socket: &mut ClientSocket) -> bool {
++    let mut byte = [0u8; 1];
++    let mut read = Box::pin(socket.read(&mut byte));
++    read.as_mut()
++        .poll(&mut TaskContext::from_waker(Waker::noop()))
++        .is_pending()
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++enum ExternalEnd {
++    Eof,
++    UnexpectedByte,
++    ReadError,
++    TimedOut,
++}
++
++async fn external_end(socket: &mut ClientSocket) -> ExternalEnd {
++    let mut byte = [0u8; 1];
++    match tokio::time::timeout(STEP_BOUND, socket.read(&mut byte)).await {
++        Ok(Ok(0)) => ExternalEnd::Eof,
++        Ok(Ok(_)) => ExternalEnd::UnexpectedByte,
++        Ok(Err(_)) => ExternalEnd::ReadError,
++        Err(_) => ExternalEnd::TimedOut,
++    }
++}
++
++fn canonical_frame() -> Check<Vec<u8>> {
++    let mut body = Vec::new();
++    body.push(u8::try_from(FRAME_LABEL.len()).map_err(|_| "fixture label size")?);
++    body.push(0);
++    body.extend_from_slice(&40_000u32.to_le_bytes());
++    body.extend_from_slice(&(VIDEO.len() as u32).to_le_bytes());
++    body.extend_from_slice(FRAME_LABEL);
++    body.extend_from_slice(VIDEO);
++    // Use the production parser to rule out a malformed-frame control.
++    let parsed = decode_realtime_send_unit(&body).ok_or("fixture canonical frame decode")?;
++    if parsed.flow_label != FRAME_LABEL || parsed.payload != VIDEO || parsed.duration_us != 40_000 {
++        return Err("fixture canonical frame differs");
++    }
++    let mut frame = Vec::new();
++    frame.extend_from_slice(&(body.len() as u32).to_le_bytes());
++    frame.extend_from_slice(&body);
++    Ok(frame)
++}
++
++#[derive(Debug)]
++struct Observation {
++    idle: ExternalEnd,
++    framed: ExternalEnd,
++    stale_write_completed: bool,
++    idle_row_retained_noncurrent: bool,
++    framed_row_retained_noncurrent: bool,
++}
++
++struct Fixture {
++    meshes: [Option<MeshHandle>; 2],
++    networks: Arc<NetworkRegistry>,
++    loose_near: Option<JoinedNetwork>,
++    near: Option<Arc<JoinedNetwork>>,
++    far: Option<JoinedNetwork>,
++    link: Option<TransportLabRetirableSession>,
++    state: Option<Arc<ControlState>>,
++    owner: Option<FundedArc<ClientHandle>>,
++    loose_flow: Option<myownmesh_core::realtime::RealtimeFlowHandle>,
++    capabilities: [Option<String>; 2],
++    events: Option<ClientSocket>,
++    pipes: [Option<ClientSocket>; 2],
++    tasks: LeasedList<ConnectionTask>,
++    listener: Option<LocalSocketListener>,
++    target: Option<listener::SocketTarget>,
++    directory: Option<tempfile::TempDir>,
++}
++
++impl Fixture {
++    fn new() -> Self {
++        Self {
++            meshes: [None, None],
++            networks: NetworkRegistry::new(),
++            loose_near: None,
++            near: None,
++            far: None,
++            link: None,
++            state: None,
++            owner: None,
++            loose_flow: None,
++            capabilities: [None, None],
++            events: None,
++            pipes: [None, None],
++            tasks: LeasedList::new(),
++            listener: None,
++            target: None,
++            directory: None,
++        }
++    }
++
++    async fn connection(&mut self) -> Check<ClientSocket> {
++        let state = self.state.as_ref().ok_or("fixture state missing")?;
++        // Admit BOTH the task and retained join node before accepting/spawning.
++        // No task is detached; cleanup pops and awaits every funded handle.
++        let admission = state
++            .clients
++            .lease_task()
++            .map_err(|_| "fixture IPC task funding")?;
++        let node = state
++            .clients
++            .acquire_claim(
++                LeasedList::<ConnectionTask>::node_claim()
++                    .map_err(|_| "fixture join node claim")?,
++            )
++            .map_err(|_| "fixture join node funding")?;
++        let (client, server) = bounded(
++            "fixture local pair bound",
++            local_pair(
++                self.listener.as_ref().ok_or("fixture listener missing")?,
++                self.target
++                    .as_ref()
++                    .ok_or("fixture socket target missing")?,
++            ),
++        )
++        .await??;
++        let state = Arc::clone(state);
++        let task = tokio::spawn(async move {
++            let _admission = admission;
++            handle_client(server, state).await
++        });
++        self.tasks.push(task, node);
++        Ok(BufReader::new(client))
++    }
++
++    async fn observe(
++        &mut self,
++        cleanup: myownmesh_services::ServiceCleanupPort,
++    ) -> Check<Observation> {
++        for index in 0..2 {
++            self.meshes[index] = Some(
++                Mesh::open_connector_capable_with_identity(
++                    MeshConfig::default(),
++                    Arc::new(myownmesh_core::Identity::ephemeral()),
++                    connector_policy()?,
++                )
++                .await
++                .map_err(|_| "fixture connector Mesh")?,
++            );
++        }
++        self.loose_near = Some(
++            self.meshes[0]
++                .as_ref()
++                .ok_or("fixture near Mesh")?
++                .join(crate::test_link::fresh_network(
++                    NETWORK,
++                    "real-ipc-retirement-mesh",
++                ))
++                .await
++                .map_err(|_| "fixture near join")?,
++        );
++        self.far = Some(
++            self.meshes[1]
++                .as_ref()
++                .ok_or("fixture far Mesh")?
++                .join(crate::test_link::fresh_network(
++                    "retirement-far",
++                    "real-ipc-retirement-mesh",
++                ))
++                .await
++                .map_err(|_| "fixture far join")?,
++        );
++        if let Some(refused) = self
++            .networks
++            .insert(
++                self.loose_near.take().ok_or("fixture near join absent")?,
++                None,
++            )
++            .into_refusal()
++        {
++            self.loose_near = Some(refused.joined);
++            return Err("fixture network registry insert");
++        }
++        self.near = self.networks.get(NETWORK);
++        let near = Arc::clone(
++            self.near
++                .as_ref()
++                .ok_or("fixture registered near network")?,
++        );
++        self.link = Some(
++            tokio::time::timeout(
++                CONNECT_BOUND,
++                near.install_retirable_session_over_real_link(
++                    self.far.as_ref().ok_or("fixture far network")?,
++                ),
++            )
++            .await
++            .map_err(|_| "fixture real native link bound")?,
++        );
++        let peer = self
++            .link
++            .as_ref()
++            .ok_or("fixture captured link missing")?
++            .peer_device_id()
++            .to_owned();
++        let mesh = self.meshes[0]
++            .as_ref()
++            .ok_or("fixture near Mesh missing")?
++            .clone();
++        let clients = ClientRegistry::new(
++            mesh.local_application_resource_scope()
++                .map_err(|_| "fixture registry scope")?,
++        )
++        .map_err(|_| "fixture real registry funding")?;
++        let services = ServiceManager::new(mesh.clone(), Arc::clone(&self.networks), cleanup);
++        self.state = Some(Arc::new(ControlState {
++            finished: tokio::sync::Notify::new(),
++            ended: std::sync::atomic::AtomicUsize::new(0),
++            abnormal_connections: std::sync::atomic::AtomicUsize::new(0),
++            mesh,
++            registry: Arc::clone(&self.networks),
++            services,
++            clients,
++            realtime: advert(),
++            supervisor: RuntimeSupervisor::new(),
++            json_line_bytes: None,
++            realtime_frame_bytes: None,
++            before_events_subscribe_commit: None,
++            at_events_stream_entry: None,
++            before_rpc_call: None,
++            before_begin_closing: None,
++            before_provisional_settle: None,
++            before_mfa_response_write: None,
++            #[cfg(feature = "transport-lab")]
++            mfa_transport_lab_barrier: None,
++        }));
++        self.directory = Some(tempfile::tempdir().map_err(|_| "fixture private socket directory")?);
++        let directory = self.directory.as_ref().ok_or("fixture directory missing")?;
++        #[cfg(unix)]
++        let target =
++            listener::SocketTarget::Path(directory.path().join("private").join("control.sock"));
++        #[cfg(not(unix))]
++        let target = listener::SocketTarget::Name(format!(
++            "myownmesh-retirement-{}",
++            directory
++                .path()
++                .file_name()
++                .and_then(|part| part.to_str())
++                .ok_or("fixture unique socket name")?
++        ));
++        self.listener =
++            Some(bind_listener(&target).map_err(|_| "fixture owner-only listener bind")?);
++        self.target = Some(target);
++
++        let mut events = self.connection().await?;
++        let data = exchange(&mut events, &Request::EventsSubscribe).await?;
++        let id: ClientId =
++            serde_json::from_value(data.get("client_id").ok_or("fixture Events id")?.clone())
++                .map_err(|_| "fixture Events id decode")?;
++        let capability = data
++            .get("client_capability")
++            .and_then(serde_json::Value::as_str)
++            .ok_or("fixture Events capability")?;
++        let state = Arc::clone(self.state.as_ref().ok_or("fixture state absent")?);
++        self.owner = state.clients.authenticate(id, capability);
++        self.events = Some(events);
++        let owner = self
++            .owner
++            .as_ref()
++            .ok_or("fixture real Events authentication")?
++            .clone();
++        for (index, label, video) in [(0, IDLE_LABEL, false), (1, FRAME_LABEL, true)] {
++            self.loose_flow = Some(
++                bounded(
++                    "fixture flow open bound",
++                    near.open_webrtc_realtime(&peer, flow_open(label, video)),
++                )
++                .await?
++                .map_err(|_| "fixture real flow open")?,
++            );
++            let capability = match state.clients.install_realtime_flow(
++                &owner,
++                NETWORK.to_owned(),
++                self.loose_flow.take().ok_or("fixture opened flow absent")?,
++            ) {
++                Ok(capability) => capability.expose().to_owned(),
++                Err(refused) => {
++                    self.loose_flow = Some(refused.flow);
++                    return Err("fixture real flow registration");
++                }
++            };
++            self.capabilities[index] = Some(capability.clone());
++            if owner.with_realtime_flow(&capability, NETWORK, |flow| near.realtime_is_current(flow))
++                != Some(true)
++            {
++                return Err("fixture captured flow was not current before retirement");
++            }
++            let mut socket = self.connection().await?;
++            let ack = exchange(
++                &mut socket,
++                &Request::RealtimePipe {
++                    direction: RealtimePipeDirection::Outbound,
++                    network: NETWORK.to_owned(),
++                    peer: None,
++                    client_id: Some(id),
++                    client_capability: Some(owner.capability().to_owned()),
++                    flow_capability: Some(capability),
++                },
++            )
++            .await?;
++            if ack
++                .get("realtime_pipe")
++                .and_then(serde_json::Value::as_bool)
++                != Some(true)
++            {
++                return Err("fixture outbound pipe ACK missing");
++            }
++            if !read_is_pending(&mut socket) {
++                return Err("fixture live-idle pipe did not stay open");
++            }
++            self.pipes[index] = Some(socket);
++        }
++        if !state.clients.is_current_owner(&owner) {
++            return Err("fixture Events owner ended early");
++        }
++        // This API consumes the ORIGINAL captured channel/session witnesses. It
++        // synchronously revokes both before its native await, then joins both
++        // event pumps and retired workers. ACK or replacement ACTIVE is no oracle.
++        let outcomes = bounded(
++            "fixture exact session retirement bound",
++            self.link
++                .take()
++                .ok_or("fixture original link missing")?
++                .retire_sessions(),
++        )
++        .await?;
++        if outcomes.len() < 2 || outcomes.iter().any(std::result::Result::is_err) {
++            return Err("fixture original native retirement failed");
++        }
++        let after = [0, 1].map(|index| {
++            owner.with_realtime_flow(
++                self.capabilities[index].as_deref().unwrap_or(""),
++                NETWORK,
++                |flow| near.realtime_is_current(flow),
++            )
++        });
++        // A future close may legitimately consume a row. Neither an absent row
++        // nor a held/noncurrent handle may become current again under a label.
++        if after.iter().any(|current| *current == Some(true)) {
++            return Err("fixture captured flow stayed current after native retirement");
++        }
++        if !state.clients.is_current_owner(&owner) {
++            return Err("fixture retirement revoked Events owner");
++        }
++        let idle = external_end(self.pipes[0].as_mut().ok_or("fixture idle socket absent")?).await;
++        let frame = canonical_frame()?;
++        let framed = self.pipes[1]
++            .as_mut()
++            .ok_or("fixture stale-frame socket absent")?;
++        // A future fix may have closed before this write. A write error is not
++        // itself EOF evidence; the independent external read below must be EOF.
++        let stale_write_completed = bounded(
++            "fixture canonical stale-frame write bound",
++            framed.write_all(&frame),
++        )
++        .await?
++        .is_ok();
++        let framed = external_end(framed).await;
++        if !state.clients.is_current_owner(&owner) {
++            return Err("fixture Events owner ended during observations");
++        }
++        Ok(Observation {
++            idle,
++            framed,
++            stale_write_completed,
++            idle_row_retained_noncurrent: after[0] == Some(false),
++            framed_row_retained_noncurrent: after[1] == Some(false),
++        })
++    }
++
++    async fn cleanup(&mut self) -> Vec<&'static str> {
++        let mut errors = Vec::new();
++        // All observations precede client close, registry drain and shutdown.
++        self.pipes = [None, None];
++        self.events = None;
++        self.listener = None;
++        self.target = None;
++        if let Some(link) = self.link.take() {
++            match bounded("cleanup original session bound", link.retire_sessions()).await {
++                Ok(outcomes)
++                    if outcomes.len() >= 2 && outcomes.iter().all(std::result::Result::is_ok) => {}
++                _ => errors.push("cleanup original native session"),
++            }
++        }
++        if let Some(flow) = self.loose_flow.take() {
++            if let Some(near) = self.near.as_ref() {
++                match bounded("cleanup uninstalled flow bound", near.close_realtime(flow)).await {
++                    Ok(Ok(()))
++                    | Ok(Err(myownmesh_core::realtime::RealtimeRefusal::SessionNotCurrent)) => {}
++                    _ => errors.push("cleanup uninstalled flow"),
++                }
++            } else {
++                drop(flow);
++                errors.push("cleanup uninstalled flow lacked its network");
++            }
++        }
++        if let Some(state) = self.state.as_ref() {
++            state.clients.begin_closing();
++            while let Some(id) = state.clients.shutdown_next() {
++                if let Some(removed) = state.clients.unregister(id) {
++                    if bounded(
++                        "cleanup owned registrations bound",
++                        release_owned_registrations(state, removed),
++                    )
++                    .await
++                    .is_err()
++                    {
++                        errors.push("cleanup owned registrations");
++                    }
++                }
++            }
++            state.clients.shutdown_settle_pending();
++        }
++        while let Some(mut task) = self.tasks.pop() {
++            match tokio::time::timeout(STEP_BOUND, &mut task).await {
++                Ok(Ok(Ok(()))) => {}
++                Ok(_) => errors.push("cleanup IPC handler result"),
++                Err(_) => {
++                    errors.push("cleanup IPC handler bound");
++                    task.abort();
++                    // Abort is a failed setup/cleanup outcome, never a passing
++                    // regression control. Still observe this exact owned handle.
++                    if tokio::time::timeout(STEP_BOUND, &mut task).await.is_err() {
++                        errors.push("cleanup aborted IPC handler join bound");
++                    }
++                }
++            }
++        }
++        self.owner = None;
++        self.capabilities = [None, None];
++        if let Some(state) = self.state.take() {
++            match bounded(
++                "cleanup watchdog joins bound",
++                state.clients.drain_watchdogs(),
++            )
++            .await
++            {
++                Ok(0) => {}
++                _ => errors.push("cleanup watchdog joins"),
++            }
++            if bounded(
++                "cleanup IPC task count bound",
++                state.clients.wait_for_tasks(),
++            )
++            .await
++            .is_err()
++            {
++                errors.push("cleanup IPC task count");
++            }
++            state.clients.finish_closed();
++            if state.clients.residue() != RegistryResidue::empty(Lifecycle::Closed) {
++                errors.push("cleanup IPC registry residue");
++            }
++            if bounded("cleanup services bound", state.services.shutdown())
++                .await
++                .map(|r| r.is_ok())
++                != Ok(true)
++            {
++                errors.push("cleanup services");
++            }
++            drop(state);
++        }
++        let near_shutdown = self.networks.shutdown_all();
++        let far_shutdown = async {
++            match self.far.as_ref() {
++                Some(far) => far.shutdown().await.map_err(|_| ()),
++                None => Ok(()),
++            }
++        };
++        match bounded("cleanup joined drivers bound", async {
++            tokio::join!(near_shutdown, far_shutdown)
++        })
++        .await
++        {
++            Ok((near, far)) => {
++                if near.iter().any(std::result::Result::is_err) {
++                    errors.push("cleanup near driver");
++                }
++                if far.is_err() {
++                    errors.push("cleanup far driver");
++                }
++            }
++            Err(_) => errors.push("cleanup joined drivers bound"),
++        }
++        if let Some(near) = self.loose_near.take() {
++            if bounded("cleanup unregistered near driver bound", near.shutdown())
++                .await
++                .map(|r| r.is_ok())
++                != Ok(true)
++            {
++                errors.push("cleanup unregistered near driver");
++            }
++            drop(near);
++        }
++        self.near = None;
++        self.far = None;
++        self.meshes = [None, None];
++        self.directory = None;
++        errors
++    }
++}
++
++async fn settle_connector_cleanup(owner: &ConnectorResourceOwnerPort) -> Check<()> {
++    bounded("fixture connector cleanup settlement bound", async {
++        loop {
++            let report = owner.report();
++            if report.failed_cleanup_candidates != 0
++                || report.accounting_poisoned
++                || report.cleanup.failed_jobs != 0
++                || report.cleanup.executor_failed
++            {
++                return Err("fixture connector cleanup diagnostics failed");
++            }
++            if report.active_candidates == 0
++                && report.cleanup.queued_jobs == 0
++                && report.cleanup.active_jobs == 0
++            {
++                return Ok(());
++            }
++            tokio::task::yield_now().await;
++        }
++    })
++    .await?
++}
++
++#[test]
++#[ignore = "real native IPC retirement; run this exact name alone with one test thread"]
++fn retired_exact_session_closes_idle_outbound_pipe_before_events_departure() {
++    let runtime = tokio::runtime::Builder::new_current_thread()
++        .enable_all()
++        .build()
++        .expect("fixture runtime");
++    let fixture_gate = runtime.block_on(crate::exclusive_connector_fixture());
++    let (port, ledger): (_, FiniteResourceProvider) = crate::test_resource_pair();
++    let root = ProcessResourceRoot::global();
++    let owner = root
++        .install_resource_provider(port)
++        .expect("same permanent process provider");
++    // Only process infrastructure is initialized here. The existing public root
++    // method prepares the permanent cleanup executor; its temporary scope is
++    // dropped BEFORE the immutable baseline. No Mesh/link/State/Events/flow or
++    // local socket exists yet, and no fixture allocation is absorbed later.
++    let bootstrap = root
++        .issue_mesh_connector_scope()
++        .expect("permanent cleanup infrastructure");
++    drop(bootstrap);
++    let report = owner.report();
++    assert_eq!(report.active_candidates, 0, "baseline owns no candidate");
++    assert_eq!(
++        report.failed_cleanup_candidates, 0,
++        "baseline cleanup is healthy"
++    );
++    assert!(
++        !report.accounting_poisoned && !report.cleanup.executor_failed,
++        "baseline owner is healthy"
++    );
++    assert_eq!(
++        (
++            report.cleanup.queued_jobs,
++            report.cleanup.active_jobs,
++            report.cleanup.failed_jobs
++        ),
++        (0, 0, 0),
++        "baseline has no cleanup work"
++    );
++    let baseline: ResourceClaim = ledger.in_use();
++    let baseline_reservations = ledger.active_reservations();
++    let baseline_scopes = ledger.active_scopes();
++
++    // This fixture-owned service root spends from the SAME actual Mesh provider;
++    // its joining owner lives outside the runtime and is released before the
++    // exact baseline check. It does not supply an alternate accounting oracle.
++    let cleanup_scope = root
++        .issue_local_application_scope()
++        .expect("fixture cleanup scope");
++    let cleanup_owner = myownmesh_services::ServiceCleanupOwner::new(cleanup_scope)
++        .expect("existing test grant funds fixture service cleanup");
++    let cleanup_port = cleanup_owner.port();
++    let (observed, cleanup, native_settled) = runtime.block_on(async move {
++        let mut fixture = Fixture::new();
++        let observed = caught(fixture.observe(cleanup_port)).await;
++        let cleanup = fixture.cleanup().await;
++        drop(fixture);
++        let settled = settle_connector_cleanup(&owner).await;
++        (observed, cleanup, settled)
++    });
++    drop(runtime);
++    let service_cleanup = cleanup_owner.close_and_join();
++
++    // Registry final-watchdog observers are external owners established by the
++    // production registry. Its Drop closes their channels after all our handler
++    // and watchdog handles were joined. Await their actual funded disposition,
++    // without resetting the provider or taking another baseline. The equality
++    // below is full/componentwise, including scope/reservation bookkeeping.
++    let deadline = std::time::Instant::now() + STEP_BOUND;
++    while ledger.in_use() != baseline
++        || ledger.active_reservations() != baseline_reservations
++        || ledger.active_scopes() != baseline_scopes
++    {
++        if std::time::Instant::now() >= deadline {
++            break;
++        }
++        std::thread::yield_now();
++    }
++    let final_use = ledger.in_use();
++    let final_reservations = ledger.active_reservations();
++    let final_scopes = ledger.active_scopes();
++    drop(fixture_gate);
++
++    // Setup, revocation, native close, socket/task joins and SAME-provider
++    // release are prerequisites. None can count as the selected idle-EOF defect.
++    assert!(cleanup.is_empty(), "fixture cleanup failures: {cleanup:?}");
++    native_settled.expect("fixture native cleanup must settle before semantic assertions");
++    let service_cleanup = service_cleanup.expect("fixture service cleanup worker joined");
++    assert_eq!(
++        (
++            service_cleanup.task_failures,
++            service_cleanup.worker_failures
++        ),
++        (0, 0),
++        "fixture service cleanup outcomes"
++    );
++    assert_eq!(
++        final_use, baseline,
++        "SAME Mesh provider must return exactly to its permanent baseline"
++    );
++    assert_eq!(
++        final_reservations, baseline_reservations,
++        "all fixture reservations released"
++    );
++    assert_eq!(final_scopes, baseline_scopes, "all fixture scopes released");
++    let observed = match observed {
++        Ok(result) => {
++            result.expect("fixture setup/revocation controls, not the idle-EOF criterion")
++        }
++        Err(panic) => std::panic::resume_unwind(panic),
++    };
++    assert_eq!(
++        observed.framed,
++        ExternalEnd::Eof,
++        "canonical stale frame must independently terminate the external pipe"
++    );
++    eprintln!("real_ipc_retirement_controls_and_cleanup_passed stale_write_completed={} idle_row_retained_noncurrent={} framed_row_retained_noncurrent={}",
++        observed.stale_write_completed, observed.idle_row_retained_noncurrent, observed.framed_row_retained_noncurrent);
++    assert_eq!(observed.idle, ExternalEnd::Eof,
++        "exact native session retirement must close the idle outbound pipe while its Events owner and client socket are still alive");
++}
