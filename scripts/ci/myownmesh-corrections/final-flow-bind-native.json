@@ -1,0 +1,236 @@
+{
+  "schema": "mesh04-final-flow-bind-native-recipe-v1",
+  "kind": "diagnostic-only",
+  "selected_manifest": {
+    "path": "scripts/ci/myownmesh-corrections/final-flow-bind-provenance.json",
+    "bytes": 2660,
+    "sha256": "ecbfbf7d6c0f441966ccf92a2840fee81817e71b0941351f42c15e419c39941e",
+    "git_blob": "ccd4ff263bed9ddf174ab05a87a3d70ad77f4575"
+  },
+  "source_base_commit": "db7818e09fedd98899490347b86ac9bc9f97b59b",
+  "source_base_tree": "5492d1845e15dbc067acec3ec592bb9500b9e21d",
+  "source_expected_tree": "2a0d0ebb7bcf2547726933d4538ae0916139b4f0",
+  "cargo_lock_sha256": "8f5a30ce863c43b0a8c5225f74d7446aed7656cd7032f47e70030526381930c6",
+  "new_source": "C:/ams-mesh04-final-bind-diagnostic-0b4ac426",
+  "new_cargo_target_dir": "C:/ams-mesh04-final-bind-diagnostic-target-0b4ac426",
+  "new_native_evidence": "C:\\Users\\Admin\\AppData\\Roaming\\AllMyAgents\\data\\worktrees\\1503a621\\target\\mesh04-correctness\\final-bind-diagnostic-native",
+  "new_pair_evidence": "C:\\Users\\Admin\\AppData\\Roaming\\AllMyAgents\\data\\worktrees\\1503a621\\target\\mesh04-correctness\\final-bind-diagnostic-pair-direct",
+  "preconditions": [
+    "Manager only; use durable granted execution. These four paths were absent at freeze and must still be unused.",
+    "Final integrated application commit must contain this manifest, all seven exact LF patch inputs, and the accepted helper/controller; record actual app HEAD.",
+    "Create only new evidence directories under the existing manager evidence parent. Preserve every old source, target, executable, receipt and installed service.",
+    "Inspect exact failures or ambiguous acknowledgements; never resubmit prepare/build/trace blindly."
+  ],
+  "canonical_source_preparation_commands": [
+    [
+      "git",
+      "-c",
+      "core.autocrlf=false",
+      "clone",
+      "--no-hardlinks",
+      "--no-checkout",
+      "--depth",
+      "1",
+      "file:///C:/ams-mesh04-sender-reuse-corrected-0b4ac426",
+      "C:/ams-mesh04-final-bind-diagnostic-0b4ac426"
+    ],
+    [
+      "git",
+      "-C",
+      "C:/ams-mesh04-final-bind-diagnostic-0b4ac426",
+      "config",
+      "core.autocrlf",
+      "false"
+    ],
+    [
+      "git",
+      "-C",
+      "C:/ams-mesh04-final-bind-diagnostic-0b4ac426",
+      "config",
+      "core.eol",
+      "lf"
+    ],
+    [
+      "git",
+      "-C",
+      "C:/ams-mesh04-final-bind-diagnostic-0b4ac426",
+      "checkout",
+      "--detach",
+      "db7818e09fedd98899490347b86ac9bc9f97b59b"
+    ]
+  ],
+  "source_preparation_rule": "Read-only local source object clone, then canonical pristine db working/index bytes. Verify HEAD/tree/clean index and canonical lock before ONE helper preparation; old working modifications are not copied.",
+  "prepare_once_argv": [
+    "C:/Python313/python.exe",
+    "scripts/ci/myownmesh-corrections/prepare-candidate.py",
+    "prepare",
+    "--upstream",
+    "C:/ams-mesh04-final-bind-diagnostic-0b4ac426",
+    "--patch-set",
+    "scripts/ci/myownmesh-corrections/final-flow-bind-provenance.json",
+    "--patch-set-sha256",
+    "ecbfbf7d6c0f441966ccf92a2840fee81817e71b0941351f42c15e419c39941e",
+    "--output",
+    "C:\\Users\\Admin\\AppData\\Roaming\\AllMyAgents\\data\\worktrees\\1503a621\\target\\mesh04-correctness\\final-bind-diagnostic-native\\candidate-source.json"
+  ],
+  "verify_before_and_after_build_argv": [
+    "C:/Python313/python.exe",
+    "scripts/ci/myownmesh-corrections/prepare-candidate.py",
+    "verify",
+    "--upstream",
+    "C:/ams-mesh04-final-bind-diagnostic-0b4ac426",
+    "--source-receipt",
+    "C:\\Users\\Admin\\AppData\\Roaming\\AllMyAgents\\data\\worktrees\\1503a621\\target\\mesh04-correctness\\final-bind-diagnostic-native\\candidate-source.json",
+    "--source-receipt-sha256",
+    {
+      "derive_sha256_of_file": "C:\\Users\\Admin\\AppData\\Roaming\\AllMyAgents\\data\\worktrees\\1503a621\\target\\mesh04-correctness\\final-bind-diagnostic-native\\candidate-source.json"
+    }
+  ],
+  "helper_identity_at_reviewed_app_base": {
+    "path": "scripts/ci/myownmesh-corrections/prepare-candidate.py",
+    "commit": "4b09a615f2c899a348a81b22e762e1647c572780",
+    "bytes": 17074,
+    "sha256": "f698d79e564feb88294156b16f131ac0e10a5bb20ccd640c7550af7301ba2a20",
+    "git_blob": "1c0707e4d0aa5aa335de1b560262c0a7e1c9c090"
+  },
+  "build": {
+    "cwd": "C:/ams-mesh04-final-bind-diagnostic-0b4ac426",
+    "environment": {
+      "CARGO_TARGET_DIR": "C:/ams-mesh04-final-bind-diagnostic-target-0b4ac426"
+    },
+    "argv": [
+      "cargo",
+      "+1.88.0",
+      "build",
+      "--locked",
+      "--release",
+      "--no-default-features",
+      "-p",
+      "myownmesh",
+      "--bin",
+      "myownmesh"
+    ],
+    "complete_command_receipt": "C:\\Users\\Admin\\AppData\\Roaming\\AllMyAgents\\data\\worktrees\\1503a621\\target\\mesh04-correctness\\final-bind-diagnostic-native\\candidate-build.complete.json",
+    "required": "Exit0, complete exact command/cwd/stdout/stderr EOF lengths+hashes, native host and actual toolchain evidence, same canonical lock and source receipt before/after; no test rerun or resolver."
+  },
+  "toolchain_evidence_commands": [
+    [
+      "cargo",
+      "+1.88.0",
+      "-vV"
+    ],
+    [
+      "rustc",
+      "+1.88.0",
+      "-vV"
+    ]
+  ],
+  "record_build_argv": [
+    "C:/Python313/python.exe",
+    "scripts/ci/myownmesh-corrections/prepare-candidate.py",
+    "record-build",
+    "--upstream",
+    "C:/ams-mesh04-final-bind-diagnostic-0b4ac426",
+    "--source-receipt",
+    "C:\\Users\\Admin\\AppData\\Roaming\\AllMyAgents\\data\\worktrees\\1503a621\\target\\mesh04-correctness\\final-bind-diagnostic-native\\candidate-source.json",
+    "--source-receipt-sha256",
+    {
+      "derive_sha256_of_file": "C:\\Users\\Admin\\AppData\\Roaming\\AllMyAgents\\data\\worktrees\\1503a621\\target\\mesh04-correctness\\final-bind-diagnostic-native\\candidate-source.json"
+    },
+    "--build-command",
+    "C:\\Users\\Admin\\AppData\\Roaming\\AllMyAgents\\data\\worktrees\\1503a621\\target\\mesh04-correctness\\final-bind-diagnostic-native\\candidate-build.complete.json",
+    "--artifact",
+    "C:/ams-mesh04-final-bind-diagnostic-target-0b4ac426/release/myownmesh.exe",
+    "--feature-set",
+    "stock",
+    "--rustc-evidence",
+    "C:\\Users\\Admin\\AppData\\Roaming\\AllMyAgents\\data\\worktrees\\1503a621\\target\\mesh04-correctness\\final-bind-diagnostic-native\\candidate-rustc.stdout",
+    "--cargo-evidence",
+    "C:\\Users\\Admin\\AppData\\Roaming\\AllMyAgents\\data\\worktrees\\1503a621\\target\\mesh04-correctness\\final-bind-diagnostic-native\\candidate-cargo.stdout",
+    "--output",
+    "C:\\Users\\Admin\\AppData\\Roaming\\AllMyAgents\\data\\worktrees\\1503a621\\target\\mesh04-correctness\\final-bind-diagnostic-native\\candidate-build.json"
+  ],
+  "runtime_binding_objects": "Every derive_* object is a mandatory value obtained from the named future retained file/command. Resolve to a string only after that stage succeeds; do not pass objects or guessed/old hashes as argv. No future artifact/build hash is claimed now.",
+  "build_receipt_rule": "Require patched-candidate/source_commit:null, kind diagnostic, this exact seven-record manifest SHA/tree, source receipt SHA and actual binary hash. A stock/corrected/old diagnostic receipt does not substitute.",
+  "single_strict_pair_argv_after_successful_build": [
+    "C:/Python313/python.exe",
+    "scripts/ci/mesh-control-paired.py",
+    "--daemon",
+    "C:/ams-mesh04-final-bind-diagnostic-target-0b4ac426/release/myownmesh.exe",
+    "--daemon-sha256",
+    {
+      "derive_sha256_of_file": "C:/ams-mesh04-final-bind-diagnostic-target-0b4ac426/release/myownmesh.exe"
+    },
+    "--daemon-build-receipt",
+    "C:\\Users\\Admin\\AppData\\Roaming\\AllMyAgents\\data\\worktrees\\1503a621\\target\\mesh04-correctness\\final-bind-diagnostic-native\\candidate-build.json",
+    "--daemon-build-receipt-sha256",
+    {
+      "derive_sha256_of_file": "C:\\Users\\Admin\\AppData\\Roaming\\AllMyAgents\\data\\worktrees\\1503a621\\target\\mesh04-correctness\\final-bind-diagnostic-native\\candidate-build.json"
+    },
+    "--candidate-kind",
+    "diagnostic",
+    "--probe",
+    "C:\\ams-mesh04-observed-end-app-target-0b4ac426\\debug\\deps\\realtime_paired-5dd697a89a20c863.exe",
+    "--probe-sha256",
+    "8cb208ee8e9221a418a9f4fd9cf8d43290ce6bc27c5edec1e136a0bb1dd2c428",
+    "--probe-kind",
+    "transport",
+    "--app-commit",
+    {
+      "derive_from_retained_git_rev_parse_HEAD_at": "manager integrated app checkout"
+    },
+    "--policy",
+    "C:\\Users\\Admin\\AppData\\Roaming\\AllMyAgents\\data\\worktrees\\1503a621\\scripts\\ci\\mesh-control-paired-policy.json",
+    "--vectors",
+    "C:\\ams-mesh03-private-0b4ac426\\vectors-479025b\\vectors.json",
+    "--private-parent",
+    "C:/ams-mesh03-private-0b4ac426",
+    "--output",
+    "C:\\Users\\Admin\\AppData\\Roaming\\AllMyAgents\\data\\worktrees\\1503a621\\target\\mesh04-correctness\\final-bind-diagnostic-pair-direct",
+    "--signaling-port",
+    "18475",
+    "--mode",
+    "direct"
+  ],
+  "pair_identity_and_policy": {
+    "probe_sha256": "8cb208ee8e9221a418a9f4fd9cf8d43290ce6bc27c5edec1e136a0bb1dd2c428",
+    "vectors_manifest_sha256": "098b39d835dce292b0df2a4cf3793007cb3a0c2271d803281aac8ff6a38d0a7c",
+    "policy_raw_sha256": "45ad0d80bafcb6da2e1d14f541fd547ee99bf54401168b8d0a2894402f1e1ed2",
+    "policy_canonical_lf_sha256": "e6729ca6d0887ec0b4ef2cd91da404ffb477b251e00a5a8c1381254c1a9a9fe6",
+    "signaling_port": 18475,
+    "mode": "direct",
+    "features": [],
+    "default_features": false
+  },
+  "diagnostic_child_profile": {
+    "MYOWNMESH_LOG": "warn,mesh_first_unit=debug",
+    "MYOWNMESH_LOG_FORMAT": "json",
+    "rule": "Existing reviewed paired controller sets this fixed A/B child-only profile after validating diagnostic build receipt; do not widen logging or inherit other MYOWNMESH overrides."
+  },
+  "preserved_boundaries": [
+    "No driver/workflow update: diagnostic must remain rejected by corrected qualification.",
+    "No source logging changes; the final seventh patch is byte-identical to accepted 8fbd/8dd2.",
+    "Same exact observed-end probe, vectors, selected policy, caps, pacing, timeouts, predicates and owned cleanup. No warmup, discard, retry, delay, budget increase or installed-service action."
+  ],
+  "limits": [
+    "Existing cap8 per category/process: absent log does not prove an absent event.",
+    "Existing inline usize connector field changes diagnostic struct layout; this was previously reviewed, not zero-footprint instrumentation.",
+    "Ordinals are ephemeral process-local non-authority metadata. Unstamped0 is unknown; no successor lookup/rebinding or liveness guarantee.",
+    "Logging changes scheduling. Bind/admission/local-write observations do not prove remote delivery or fix the f76/aacb timeout.",
+    "Only a new centrally observed trace may identify stages. No actual end enum, cause, native preparation/build pass or AV qualification is claimed now."
+  ],
+  "central_preparation_build_trace_pending": true,
+  "worker_native_source_parser_formatter_compiler_cargo_helper_controller_probe_execution": false,
+  "application_cwd_for_source_preparation_helper_and_controller": "C:\\Users\\Admin\\AppData\\Roaming\\AllMyAgents\\data\\worktrees\\1503a621",
+  "toolchain_stdout_paths": {
+    "rustc": "C:\\Users\\Admin\\AppData\\Roaming\\AllMyAgents\\data\\worktrees\\1503a621\\target\\mesh04-correctness\\final-bind-diagnostic-native\\candidate-rustc.stdout",
+    "cargo": "C:\\Users\\Admin\\AppData\\Roaming\\AllMyAgents\\data\\worktrees\\1503a621\\target\\mesh04-correctness\\final-bind-diagnostic-native\\candidate-cargo.stdout"
+  },
+  "retained_probe_source_identity": {
+    "application_commit": "4b09a615f2c899a348a81b22e762e1647c572780",
+    "fixture_path": "crates/allmystuff-mesh-control/tests/realtime_paired.rs",
+    "fixture_git_blob": "e84b12e2e510117792eac7797790144779a5ab75",
+    "probe_sha256": "8cb208ee8e9221a418a9f4fd9cf8d43290ce6bc27c5edec1e136a0bb1dd2c428",
+    "rule": "Preserve the existing compiled probe and its source receipt; verify the integrated app fixture is still this exact blob. New input-only app commit metadata does not relabel the old probe compilation."
+  }
+}
