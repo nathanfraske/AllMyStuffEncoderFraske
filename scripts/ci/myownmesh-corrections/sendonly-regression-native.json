@@ -1,0 +1,461 @@
+{
+  "schema": "mesh04-sendonly-regression-native-recipe-v1",
+  "kind": "test-only-native",
+  "qualification": "Exact SAME35B declaration and SAME5fd03 child exported after actual49e negative and444d/cb414 SAME-test PASS. Source/test semantics are closed; this input packet does not claim daemon role/cause/AV/f76 qualification.",
+  "selected_manifest": {
+    "path": "scripts/ci/myownmesh-corrections/sendonly-regression-provenance.json",
+    "bytes": 2953,
+    "sha256": "466e5ea662808ceab4dab6f56c0a1e007aba96959113306947af899fa29af317",
+    "git_blob": "e0501e1afc6daebb4db66176e6223caef4eab514"
+  },
+  "source_base_commit": "db7818e09fedd98899490347b86ac9bc9f97b59b",
+  "source_base_tree": "5492d1845e15dbc067acec3ec592bb9500b9e21d",
+  "source_expected_tree": "ec0925de1e91faf6c43b04a7b3fae1c3e350c7f3",
+  "source_records": 767,
+  "source_commit": null,
+  "cargo_lock_sha256": "8f5a30ce863c43b0a8c5225f74d7446aed7656cd7032f47e70030526381930c6",
+  "ordered_patch_count": 8,
+  "accepted_stock7_prefix": {
+    "path": "scripts/ci/myownmesh-corrections/sendonly-stock-provenance.json",
+    "original_commit": "33fed4755d72b518c04e1e8f1df1ab54103ce129",
+    "bytes": 2602,
+    "sha256": "cf473514eed204bc6ef74789004e3f89ec70341a2100267cb22ab12be94b3d56",
+    "git_blob": "a2295e48ed46fab97ce11fee86e7fd4341e73738",
+    "expected_tree": "f386f0f6f8d1d11e471d836ab4d172c9485592da",
+    "records_raw_byte_exact": true,
+    "new_patch": {
+      "bytes": 1313,
+      "sha256": "cfe69e048186331d623789eb0a31882b65d01ec511a9fcadf461420229f63797",
+      "git_blob": "ecbaa482018e9f1b8481558ba3563ed709c4efb0"
+    },
+    "input_review": {
+      "path": "C:\\Users\\Admin\\AppData\\Roaming\\AllMyAgents\\data\\worktrees\\d57054cc\\target\\mesh04-correctness\\b1-sendonly-stock-input-review.json",
+      "bytes": 128503,
+      "sha256": "dd7b0c097ff137a28fbf48f2fd1219c9c3981f0c20f9ac166879b675180d54c1",
+      "git_blob": "8c057f002a0f41ed43ebcb0bd8562237001d0307"
+    }
+  },
+  "same_test_inputs": {
+    "declaration_utf8": "    mod local_identity_regression;\n",
+    "declaration_bytes": 35,
+    "parent": {
+      "bytes": 904571,
+      "sha256": "1dacae5318749b03cb7bd1c9e7edf72470c061e6bb2c5b0f81bd34b1db4ea6a3",
+      "git_blob": "61f4d488ac1e5f480bd75197155b23df76c14abb"
+    },
+    "child": {
+      "bytes": 42048,
+      "sha256": "3cc80d37ab3393cc4fe54824b948ea8d06f79bf98a98f74410e25a7ebe86c74b",
+      "git_blob": "5fd03bbc4141ac36018c535fc64761b0027597ee"
+    },
+    "test_patch": {
+      "bytes": 43958,
+      "sha256": "6877c16f6fd061991b6aa753dc9548cfe5acd150bc9e769cfae3cbae34573a78",
+      "git_blob": "0fd1151d5e9c8555534e8cbf59bb4335e2587c59"
+    },
+    "two_file_full_data_forward_inverse_exact": true
+  },
+  "current_execution_selection": "No new native execution is requested merely to publish these byte-identical exported inputs. Retain actual SAME-test cb414 PASS and meaningful49e negative. The reproducible commands below run only for a separately selected central gate; do not replay unchanged passing controls or relabel their artifacts.",
+  "new_source": "C:/ams-mesh04-sendonly-regression-0b4ac426",
+  "new_cargo_target_dir": "C:/ams-mesh04-sendonly-regression-target-0b4ac426",
+  "new_native_evidence": "C:/Users/Admin/AppData/Roaming/AllMyAgents/data/worktrees/1503a621/target/mesh04-correctness/sendonly-regression-native",
+  "new_input_layer": "C:/Users/Admin/AppData/Roaming/AllMyAgents/data/worktrees/1503a621/target/mesh04-correctness/sendonly-regression-inputs",
+  "new_durable_run_evidence_paths": {
+    "preparation": "C:/Users/Admin/AppData/Roaming/AllMyAgents/data/worktrees/1503a621/target/mesh04-correctness/sendonly-regression-preparation-run",
+    "compile": "C:/Users/Admin/AppData/Roaming/AllMyAgents/data/worktrees/1503a621/target/mesh04-correctness/sendonly-regression-compile-run",
+    "runtime": "C:/Users/Admin/AppData/Roaming/AllMyAgents/data/worktrees/1503a621/target/mesh04-correctness/sendonly-regression-runtime-run"
+  },
+  "application_cwd_for_source_preparation_and_helper": "C:\\Users\\Admin\\AppData\\Roaming\\AllMyAgents\\data\\worktrees\\1503a621",
+  "preconditions": [
+    "Manager-only native execution. Actual accepted integrated application commit must contain this exact manifest/recipe plus ALL EIGHT canonical LF basename patches and reviewed helper. Author branches are partial; retain actual integration HEAD.",
+    "Only fresh unused source/target/evidence/input/run roots; preserve existing negative, positive, old controls, binaries and all source/test snapshots. Never install/restart a service or change dependencies/manifests/lock/policy.",
+    "Materialize the Git LF execution layer and copied helper exactly as below; preserve tracked CRLF exports. Raw/LF/hash/blob/length and actual paths are mandatory before any helper call.",
+    "If a new gate is explicitly selected, pristine db LF checkout and eight-record prepare ONCE precede source verification and the canonical --lib CargoJSON build/list/ONLY selected case. Inspect ambiguous/failing outcomes, never blindly replay."
+  ],
+  "canonical_source_preparation_commands": [
+    [
+      "git",
+      "-c",
+      "core.autocrlf=false",
+      "clone",
+      "--no-hardlinks",
+      "--no-checkout",
+      "--depth",
+      "1",
+      "file:///C:/ams-mesh04-sender-reuse-corrected-0b4ac426",
+      "C:/ams-mesh04-sendonly-regression-0b4ac426"
+    ],
+    [
+      "git",
+      "-C",
+      "C:/ams-mesh04-sendonly-regression-0b4ac426",
+      "config",
+      "core.autocrlf",
+      "false"
+    ],
+    [
+      "git",
+      "-C",
+      "C:/ams-mesh04-sendonly-regression-0b4ac426",
+      "config",
+      "core.eol",
+      "lf"
+    ],
+    [
+      "git",
+      "-C",
+      "C:/ams-mesh04-sendonly-regression-0b4ac426",
+      "checkout",
+      "--detach",
+      "db7818e09fedd98899490347b86ac9bc9f97b59b"
+    ]
+  ],
+  "source_preparation_rule": "Verify exact pristine db/5492/762 raw Git files/clean index/8f5 after configuring LF before checkout. Prepare exactly ONCE with this eight-record test-only diagnostic manifest. Never reprepare patched c87/f386/ec092, copy a dirty donor working tree, or import temporary diagnostics.",
+  "canonical_git_lf_execution_layer": {
+    "new_directory": "C:/Users/Admin/AppData/Roaming/AllMyAgents/data/worktrees/1503a621/target/mesh04-correctness/sendonly-regression-inputs",
+    "rule": "After accepted commits/integration, copy exact raw Git bytes at the actual immutable integrated HEAD into NEW regular files only. Keep command/stream/HEAD and raw identity evidence; do not normalize tracked files.",
+    "manifest": {
+      "source_path": "scripts/ci/myownmesh-corrections/sendonly-regression-provenance.json",
+      "output_path": "C:/Users/Admin/AppData/Roaming/AllMyAgents/data/worktrees/1503a621/target/mesh04-correctness/sendonly-regression-inputs/sendonly-regression-provenance.json",
+      "bytes": 2953,
+      "sha256": "466e5ea662808ceab4dab6f56c0a1e007aba96959113306947af899fa29af317",
+      "git_blob": "e0501e1afc6daebb4db66176e6223caef4eab514"
+    },
+    "recipe": {
+      "source_path": "scripts/ci/myownmesh-corrections/sendonly-regression-native.json",
+      "output_path": "C:/Users/Admin/AppData/Roaming/AllMyAgents/data/worktrees/1503a621/target/mesh04-correctness/sendonly-regression-inputs/sendonly-regression-native.json",
+      "identity_rule": "Use this exact accepted recipe Git blob/SHA/length from the immutable integration receipt; self-referential recipe hash is intentionally not embedded."
+    },
+    "sibling_patches": [
+      {
+        "source_path": "scripts/ci/myownmesh-corrections/owner-cleanup-fix.patch",
+        "output_name": "owner-cleanup-fix.patch",
+        "bytes": 17394,
+        "sha256": "6f8c1da2070208c159c663df3d6a67120558aeddb2b20b6b78c17a787e42caaf",
+        "git_blob": "7b5897c5f0353d08059ad7fa9ba76544fed0daee"
+      },
+      {
+        "source_path": "scripts/ci/myownmesh-corrections/owner-cleanup-regression.patch",
+        "output_name": "owner-cleanup-regression.patch",
+        "bytes": 23587,
+        "sha256": "1a5f193bc89766d47a53d5ebe76e75f72331e0d55bff39ceac42242e1b3068e5",
+        "git_blob": "3bc56af01b604960ccceb54da462ad938984e1b7"
+      },
+      {
+        "source_path": "scripts/ci/myownmesh-corrections/startup-fix.patch",
+        "output_name": "startup-fix.patch",
+        "bytes": 6043,
+        "sha256": "74a666370dec84650bd1975a52e0a21fb87c721479b2ed33671b3f67ef4e4eb4",
+        "git_blob": "df6973dc16e57ab7ad3d28b0eb72e38f01fcea01"
+      },
+      {
+        "source_path": "scripts/ci/myownmesh-corrections/startup-regression.patch",
+        "output_name": "startup-regression.patch",
+        "bytes": 16613,
+        "sha256": "da7afd74b297aae0215789206ec429cf2d09c1154addf4be4c514ada2f8c6cf1",
+        "git_blob": "6ead7e518c344f7f67086e30f3a81e870712ebb7"
+      },
+      {
+        "source_path": "scripts/ci/myownmesh-corrections/sender-reopen-fix.patch",
+        "output_name": "sender-reopen-fix.patch",
+        "bytes": 828,
+        "sha256": "4e93bbc7e96ae871fd53b40b1eeaf4204e162116c4c0ff9582ab07de4017e012",
+        "git_blob": "696ae50e684bed48dc516399cda656ba80236289"
+      },
+      {
+        "source_path": "scripts/ci/myownmesh-corrections/sender-reopen-regression.patch",
+        "output_name": "sender-reopen-regression.patch",
+        "bytes": 7327,
+        "sha256": "978d54016c38e318043eaf4bb03dc28eb0146dca665ef2a7442ccab301650173",
+        "git_blob": "b03673c617a030398361a029e41f0abf709264ac"
+      },
+      {
+        "source_path": "scripts/ci/myownmesh-corrections/sendonly-fix.patch",
+        "output_name": "sendonly-fix.patch",
+        "bytes": 1313,
+        "sha256": "cfe69e048186331d623789eb0a31882b65d01ec511a9fcadf461420229f63797",
+        "git_blob": "ecbaa482018e9f1b8481558ba3563ed709c4efb0"
+      },
+      {
+        "source_path": "scripts/ci/myownmesh-corrections/sendonly-regression.patch",
+        "output_name": "sendonly-regression.patch",
+        "bytes": 43958,
+        "sha256": "6877c16f6fd061991b6aa753dc9548cfe5acd150bc9e769cfae3cbae34573a78",
+        "git_blob": "0fd1151d5e9c8555534e8cbf59bb4335e2587c59"
+      }
+    ],
+    "helper": {
+      "path": "scripts/ci/myownmesh-corrections/prepare-candidate.py",
+      "commit": "4b09a615f2c899a348a81b22e762e1647c572780",
+      "bytes": 17074,
+      "sha256": "f698d79e564feb88294156b16f131ac0e10a5bb20ccd640c7550af7301ba2a20",
+      "git_blob": "1c0707e4d0aa5aa335de1b560262c0a7e1c9c090",
+      "output_path": "C:/Users/Admin/AppData/Roaming/AllMyAgents/data/worktrees/1503a621/target/mesh04-correctness/sendonly-regression-native/prepare-candidate.py"
+    }
+  },
+  "helper_identity_at_reviewed_app_base": {
+    "path": "scripts/ci/myownmesh-corrections/prepare-candidate.py",
+    "commit": "4b09a615f2c899a348a81b22e762e1647c572780",
+    "bytes": 17074,
+    "sha256": "f698d79e564feb88294156b16f131ac0e10a5bb20ccd640c7550af7301ba2a20",
+    "git_blob": "1c0707e4d0aa5aa335de1b560262c0a7e1c9c090"
+  },
+  "prepare_once_argv": [
+    "C:/Python313/python.exe",
+    "C:/Users/Admin/AppData/Roaming/AllMyAgents/data/worktrees/1503a621/target/mesh04-correctness/sendonly-regression-native/prepare-candidate.py",
+    "prepare",
+    "--upstream",
+    "C:/ams-mesh04-sendonly-regression-0b4ac426",
+    "--patch-set",
+    "C:/Users/Admin/AppData/Roaming/AllMyAgents/data/worktrees/1503a621/target/mesh04-correctness/sendonly-regression-inputs/sendonly-regression-provenance.json",
+    "--patch-set-sha256",
+    "466e5ea662808ceab4dab6f56c0a1e007aba96959113306947af899fa29af317",
+    "--output",
+    "C:/Users/Admin/AppData/Roaming/AllMyAgents/data/worktrees/1503a621/target/mesh04-correctness/sendonly-regression-native/candidate-source.json"
+  ],
+  "verify_before_after_compile_and_runtime_argv": [
+    "C:/Python313/python.exe",
+    "C:/Users/Admin/AppData/Roaming/AllMyAgents/data/worktrees/1503a621/target/mesh04-correctness/sendonly-regression-native/prepare-candidate.py",
+    "verify",
+    "--upstream",
+    "C:/ams-mesh04-sendonly-regression-0b4ac426",
+    "--source-receipt",
+    "C:/Users/Admin/AppData/Roaming/AllMyAgents/data/worktrees/1503a621/target/mesh04-correctness/sendonly-regression-native/candidate-source.json",
+    "--source-receipt-sha256",
+    {
+      "derive_sha256_of_file": "C:/Users/Admin/AppData/Roaming/AllMyAgents/data/worktrees/1503a621/target/mesh04-correctness/sendonly-regression-native/candidate-source.json"
+    }
+  ],
+  "source_custody": "Source receipt must be patched-candidate/source_commit:null, kind diagnostic, exact manifest hash/ec092/767/8f5. Verify before and after compilation, listing and any selected runtime. Preserve every original control and perform owned cleanup before normative assertions; same immutable child bytes are mandatory.",
+  "toolchain_evidence_commands": [
+    [
+      "cargo",
+      "+1.88.0",
+      "-vV"
+    ],
+    [
+      "rustc",
+      "+1.88.0",
+      "-vV"
+    ]
+  ],
+  "workspace": {
+    "package": "myownmesh-core",
+    "target_name": "myownmesh_core",
+    "target_kind": "lib",
+    "edition": "2021",
+    "rust": "1.88.0",
+    "cargo_lock_sha256": "8f5a30ce863c43b0a8c5225f74d7446aed7656cd7032f47e70030526381930c6",
+    "new_dependencies_or_manifest_or_resolver_changes": false
+  },
+  "compile": {
+    "cwd": "C:/ams-mesh04-sendonly-regression-0b4ac426",
+    "environment": {
+      "CARGO_TARGET_DIR": "C:/ams-mesh04-sendonly-regression-target-0b4ac426"
+    },
+    "argv": [
+      "cargo",
+      "+1.88.0",
+      "test",
+      "--locked",
+      "-p",
+      "myownmesh-core",
+      "--lib",
+      "--no-run",
+      "--message-format=json"
+    ],
+    "complete_command_receipt": "C:/Users/Admin/AppData/Roaming/AllMyAgents/data/worktrees/1503a621/target/mesh04-correctness/sendonly-regression-native/compile.complete.json",
+    "complete_receipt_required": "Actual exit0, complete exact argv/cwd/environment/toolchain/native-host/source/lock correspondence, full stdout/stderr EOF/hash/length. This is a lib unit executable, never a daemon build receipt."
+  },
+  "executable_selection": "Derive only from the successful complete CargoJSON compiler-artifact whose package is myownmesh-core, target.name is myownmesh_core, target.kind contains lib, target.src_path is this source's crates/myownmesh-core/src/lib.rs, profile.test is true and executable is nonnull. Exactly one executable; record actual bytes/SHA/path, not a guessed old artifact.",
+  "artifact_binding": "Derive only the single actual CargoJSON lib test executable for this NEW source/target after successful compile. Record path/bytes/SHA from retained actual artifact; never copy a known old executable hash into future evidence. No record-build daemon command applies to this unit gate.",
+  "list_argv": [
+    {
+      "derive_exact_lib_test_executable_from_compile_receipt": true
+    },
+    "--list",
+    "--ignored",
+    "--format",
+    "terse"
+  ],
+  "inventory": {
+    "module_prefix": "transport::webrtc::tests::local_identity_regression::",
+    "exact_full_names": [
+      "transport::webrtc::tests::local_identity_regression::mesh04_local_identity_fresh_reverse_reaches_registered_flow",
+      "transport::webrtc::tests::local_identity_regression::mesh04_local_identity_reverse_after_retirement_reaches_registered_flow",
+      "transport::webrtc::tests::local_identity_regression::mesh04_local_identity_reverse_after_pending_pressure_retirement_reaches_registered_flow"
+    ],
+    "expected_module_count": 3,
+    "all_ignored": true,
+    "zero_or_missing_names_is_failure": true
+  },
+  "run_each_exact_argv": [
+    [
+      {
+        "derive_exact_lib_test_executable_from_compile_receipt": true
+      },
+      "transport::webrtc::tests::local_identity_regression::mesh04_local_identity_reverse_after_pending_pressure_retirement_reaches_registered_flow",
+      "--exact",
+      "--ignored",
+      "--nocapture",
+      "--test-threads=1"
+    ]
+  ],
+  "runtime_selection": {
+    "exact_full_names": [
+      "transport::webrtc::tests::local_identity_regression::mesh04_local_identity_reverse_after_pending_pressure_retirement_reaches_registered_flow"
+    ],
+    "selected_count": 1,
+    "retained_control_names_not_executed": [
+      "transport::webrtc::tests::local_identity_regression::mesh04_local_identity_fresh_reverse_reaches_registered_flow",
+      "transport::webrtc::tests::local_identity_regression::mesh04_local_identity_reverse_after_retirement_reaches_registered_flow"
+    ]
+  },
+  "candidate_native_acceptance": "Execute ONLY same new exact selector. Require actual0/1PASS/0fail/0ignored after same setup/Pending/close/audio/reverse-bind/cleanup controls, complete strict reverse video/audio delivery and registered native association. Setup/bind/audio/cleanup failure is not a fix pass. Native structural PASS is not daemon route/role/cause/AV qualification.",
+  "fixed_role_sequence": "A is this fixture's original Offerer, B its original Answerer. Actual1bc A/B role orientation is unknown. All SDP transactions use A's offer and B's answer; media reversal never flips roles. Each intended local inbound receiver then opposite outbound source exists before the explicit transaction. No completed receive-only offer in the primary cases.",
+  "lifecycle_controls": "Genuine data-channel open and current owner/table; initial forward video+audio; await A outbound removal and B inbound stop; actual audio survives; pressure video receiver/source opens and retires without a payload; actual audio survives; close remaining forward audio; reverse receiver/source pairs remain owned, genuine bind and actual reverse audio precede final reverse-video expectation. One valid checked AU/packet per control phase is a minimal native structural sequence, not all original daemon AV phases.",
+  "metadata_and_data": "Embedded119-byte source AU and371-byte Opus packet are unchanged existing reference vectors; only existing allowed Annex-B startcode/AUD9/filler12 normalization yields the expected video bytes. Exact unit payload/local label, IDR significance and consecutive20ms Opus RTP clock steps960 are checked. No decoder or live device is used.",
+  "resource_and_wait_bounds": "Each peer uses the exact existing paired-policy finite resource grant, not an expanded or default grant. Existing15s native loopback setup and5s startup/close hang bounds; no sleeps/retries/warmup/discard/new dependency. First-bind readiness is only a real setup prerequisite, not an RTP-write/delivery assertion. Provider counts, owned native/task close and zero return are checked before final normative assertions.",
+  "association_limits": "classifies and native-port matches/get_transceivers/receiver.tracks produce only safe live-record/association booleans and counts. Track kind exists during negotiation and is NOT arrival proof. Normative receipt is the unchanged production on_track\u2192read/assemble\u2192resource-accounted callback delivery, not a direct resolver/guard call or overridden callback. Host-local production interface filters are unchanged;127.0.0.1 candidates are not forced.",
+  "new_case_delta": "Complete existing35844-byte prefix unchanged. Separate copied lifecycle helper differs only in its name and pressure block: both pressure native objects constructed, block SDP/successful-bind wait withheld, actual existing first-bind future polled ONCE with std Waker::noop, require Pending, lexical wait drop before same close/stop. Later original fixed-role BOTH reverse objects/SDP/bind/audio/video checks/cleanup unchanged.",
+  "retained_controls": {
+    "runtime_audit": {
+      "path": "C:\\Users\\Admin\\AppData\\Roaming\\AllMyAgents\\data\\worktrees\\1503a621\\target\\mesh04-correctness\\local-identity-native-baseline\\runtime-audit.json",
+      "sha256": "bff302cdc690b48b144e4bd26adcbba6d507cfabc7212a6af4ef7e716f2fe353",
+      "bytes": 12176
+    },
+    "test_executable_preserved": {
+      "path": "C:\\ams-mesh04-local-identity-baseline-target-0b4ac426\\debug\\deps\\myownmesh_core-80ace0b2de652b76.exe",
+      "bytes": 59521024,
+      "sha256": "b42cd1794b40db59a921e02848d960ba4561215afd0ad45b224ed3733a81746d"
+    },
+    "old_full_test_names": [
+      "transport::webrtc::tests::local_identity_regression::mesh04_local_identity_fresh_reverse_reaches_registered_flow",
+      "transport::webrtc::tests::local_identity_regression::mesh04_local_identity_reverse_after_retirement_reaches_registered_flow"
+    ],
+    "old_result": "BOTH actualPASS1/0fail/0ignored, retained controls only; not rerun or reclassified"
+  },
+  "retained_meaningful_baseline": {
+    "path": "C:\\Users\\Admin\\AppData\\Roaming\\AllMyAgents\\data\\worktrees\\1503a621\\target\\mesh04-correctness\\pending-pressure-native\\runtime-audit.json",
+    "sha256": "49e738032e0e1ef5cc652be6ec68de15cac31ca9b63066ca470b86af588d1906",
+    "source_tree": "d950ece4f2a761abb65134be9faa06e92f3965a0",
+    "actual_native_result": "101/0pass/1fail/0ignored AFTER controls_and_cleanup marker, received2/expected_native_associations0"
+  },
+  "retained_same_test_pass": {
+    "audit": {
+      "path": "C:\\Users\\Admin\\AppData\\Roaming\\AllMyAgents\\data\\worktrees\\1503a621\\target\\mesh04-correctness\\sendonly-corrected-native\\runtime-audit.json",
+      "bytes": 10422,
+      "sha256": "cb4143fe60f40590a10d03f2497f6e6442c443f13a5247abff4bc2d815103568",
+      "git_blob": "6964d40584c853f7f92405e6f507cf2e85f91da3"
+    },
+    "case": {
+      "test": "transport::webrtc::tests::local_identity_regression::mesh04_local_identity_reverse_after_pending_pressure_retirement_reaches_registered_flow",
+      "command_label": "03-pending-pressure-reverse",
+      "exit_code": 0,
+      "counts": {
+        "status": "ok",
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0,
+        "filtered_out": 1090
+      },
+      "static_controls_cleanup_marker": true,
+      "passed": true,
+      "final_normative_failure_after_controls_cleanup": false,
+      "safe_marker_lines": [
+        "test transport::webrtc::tests::local_identity_regression::mesh04_local_identity_reverse_after_pending_pressure_retirement_reaches_registered_flow ... mesh04_local_identity pending_pressure_controls_and_cleanup_passed ReverseOutcome { received: 3, association: IdentityObservation { still_registered: true, video_native_associations: 1, expected_native_associations: 1 } }"
+      ]
+    },
+    "verified_streams": [
+      {
+        "label": "01-manager-head",
+        "stream": "stdout",
+        "bytes": 41,
+        "sha256": "26236f9be3a42a262b5feac17d2415367dd289d3feb6e3f06e616c0f22786b05",
+        "git_blob": "7dd6b4e22f8525b2c9db714974939e63c9d3467c",
+        "eof": true
+      },
+      {
+        "label": "01-manager-head",
+        "stream": "stderr",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "git_blob": "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+        "eof": true
+      },
+      {
+        "label": "02-manager-status",
+        "stream": "stdout",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "git_blob": "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+        "eof": true
+      },
+      {
+        "label": "02-manager-status",
+        "stream": "stderr",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "git_blob": "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+        "eof": true
+      },
+      {
+        "label": "03-pending-pressure-reverse",
+        "stream": "stdout",
+        "bytes": 490,
+        "sha256": "a050340e211aabeefb4a170212129bf847bf38c288db28597a9696ca329343f1",
+        "git_blob": "47caedc13ba828640b7de9d5a5d35d5088952eea",
+        "eof": true
+      },
+      {
+        "label": "03-pending-pressure-reverse",
+        "stream": "stderr",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "git_blob": "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+        "eof": true
+      },
+      {
+        "label": "04-manager-head-after",
+        "stream": "stdout",
+        "bytes": 41,
+        "sha256": "26236f9be3a42a262b5feac17d2415367dd289d3feb6e3f06e616c0f22786b05",
+        "git_blob": "7dd6b4e22f8525b2c9db714974939e63c9d3467c",
+        "eof": true
+      },
+      {
+        "label": "04-manager-head-after",
+        "stream": "stderr",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "git_blob": "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+        "eof": true
+      },
+      {
+        "label": "05-manager-status-after",
+        "stream": "stdout",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "git_blob": "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+        "eof": true
+      },
+      {
+        "label": "05-manager-status-after",
+        "stream": "stderr",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "git_blob": "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+        "eof": true
+      }
+    ],
+    "no_reexecution": true
+  },
+  "scope_limits": [
+    "Controlled real two-PC/native/core-callback structural comparison only; actual daemon1bc original role/cause remains unknown. No decode/relay/reconnect/strict-daemon AV/f76 qualification follows.",
+    "No test, SDP barrier, fixture media/resource/policy/pacing/clock/control/cleanup or accepted predicate changes. This export adds only the already tested declaration/child bytes after the accepted production7 chain.",
+    "The stock7 release/pair recipe is separate and excludes this NEW test declaration/child. This manifest is diagnostic solely for test qualification; no temporary logging/role patch is included.",
+    "No driver/workflow/corrected-default/old manifest/native-qualification documentation changes in this packet. No warmup/discard/retry/delay/budget increase/new dependency/API/hook."
+  ],
+  "worker_source_parser_formatter_cargo_compiler_helper_controller_probe_native_execution": false
+}

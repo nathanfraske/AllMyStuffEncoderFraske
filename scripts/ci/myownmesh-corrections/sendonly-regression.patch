@@ -1,0 +1,1068 @@
+diff --git a/crates/myownmesh-core/src/transport/webrtc.rs b/crates/myownmesh-core/src/transport/webrtc.rs
+index 0c8258a745712115d32fb2a4752f65f923ef908a..61f4d488ac1e5f480bd75197155b23df76c14abb 100644
+--- a/crates/myownmesh-core/src/transport/webrtc.rs
++++ b/crates/myownmesh-core/src/transport/webrtc.rs
+@@ -10431,6 +10431,7 @@
+ 
+ #[cfg(test)]
+ mod tests {
++    mod local_identity_regression;
+     mod sender_reopen_regression;
+     mod startup_regression;
+ 
+diff --git a/crates/myownmesh-core/src/transport/webrtc/tests/local_identity_regression.rs b/crates/myownmesh-core/src/transport/webrtc/tests/local_identity_regression.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..5fd03bbc4141ac36018c535fc64761b0027597ee
+--- /dev/null
++++ b/crates/myownmesh-core/src/transport/webrtc/tests/local_identity_regression.rs
+@@ -0,0 +1,1050 @@
++//! Two real core connectors, locally registered identities and unchanged on_track.
++//! This is native callback/whole-unit qualification, not daemon IPC, authentication,
++//! candidate-admission, decode, relay or a claimed reproduction before execution.
++
++use super::*;
++use crate::transport::webrtc::session_flow::RealtimeFraming;
++
++type NativeResult<T> = std::result::Result<T, &'static str>;
++
++// Existing native loopback setup bound and startup/close hang bound. Neither
++// delays a transition: every wait below observes an actual result or event.
++const CONNECT_BOUND: Duration = Duration::from_secs(15);
++const STEP_BOUND: Duration = Duration::from_secs(5);
++const VIDEO: &[u8] = &[
++    0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0xd0, 0x0b, 0x8c, 0x68, 0x42, 0x48, 0x07, 0x84, 0x42, 0x35,
++    0x00, 0x00, 0x00, 0x01, 0x68, 0xce, 0x3c, 0x80, 0x00, 0x00, 0x00, 0x01, 0x06, 0x05, 0x21, 0x41,
++    0x4d, 0x53, 0x2d, 0x41, 0x55, 0x2d, 0x53, 0x45, 0x51, 0x2d, 0x56, 0x32, 0x21, 0x21, 0x21, 0x52,
++    0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x33, 0x65, 0x38,
++    0x80, 0x00, 0x00, 0x00, 0x01, 0x65, 0xb8, 0x00, 0x04, 0x09, 0xff, 0xff, 0xf8, 0x7a, 0x28, 0x00,
++    0x08, 0x1b, 0xf9, 0x3f, 0x0f, 0xff, 0xc3, 0xd1, 0x40, 0x00, 0x40, 0x6b, 0xc9, 0xd7, 0x5d, 0x75,
++    0xf1, 0xff, 0xfe, 0x1e, 0x8a, 0x00, 0x02, 0x0d, 0x5e, 0xfc, 0x61, 0xff, 0xf8, 0x7a, 0x28, 0x00,
++    0x08, 0x03, 0x7b, 0xea, 0x4a, 0xeb, 0xaf,
++];
++// The existing paired check's exact normalization: four-byte Annex-B starts,
++// only payloader AUD9/filler12 removal; every retained NAL stays byte-exact.
++const VIDEO_EXPECTED: &[u8] = &[
++    0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0xd0, 0x0b, 0x8c, 0x68, 0x42, 0x48, 0x07, 0x84, 0x42, 0x35,
++    0x00, 0x00, 0x00, 0x01, 0x68, 0xce, 0x3c, 0x80, 0x00, 0x00, 0x00, 0x01, 0x06, 0x05, 0x21, 0x41,
++    0x4d, 0x53, 0x2d, 0x41, 0x55, 0x2d, 0x53, 0x45, 0x51, 0x2d, 0x56, 0x32, 0x21, 0x21, 0x21, 0x52,
++    0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x33, 0x65, 0x38,
++    0x80, 0x00, 0x00, 0x00, 0x01, 0x65, 0xb8, 0x00, 0x04, 0x09, 0xff, 0xff, 0xf8, 0x7a, 0x28, 0x00,
++    0x08, 0x1b, 0xf9, 0x3f, 0x0f, 0xff, 0xc3, 0xd1, 0x40, 0x00, 0x40, 0x6b, 0xc9, 0xd7, 0x5d, 0x75,
++    0xf1, 0xff, 0xfe, 0x1e, 0x8a, 0x00, 0x02, 0x0d, 0x5e, 0xfc, 0x61, 0xff, 0xf8, 0x7a, 0x28, 0x00,
++    0x08, 0x03, 0x7b, 0xea, 0x4a, 0xeb, 0xaf,
++];
++const AUDIO: &[u8] = &[
++    0xf8, 0x9f, 0x32, 0xb3, 0x1d, 0xee, 0x2b, 0xc2, 0xa4, 0x04, 0x87, 0x26, 0x09, 0x12, 0x41, 0xd4,
++    0x9b, 0x5d, 0x6e, 0xed, 0xc5, 0x5d, 0x86, 0xf4, 0xeb, 0x55, 0xa4, 0xf4, 0xa2, 0xcc, 0xd1, 0xc8,
++    0xa8, 0xd4, 0x00, 0x06, 0x01, 0x0b, 0xd6, 0xb5, 0xfb, 0x57, 0x7c, 0x19, 0x22, 0xf0, 0xc9, 0xce,
++    0x96, 0xb3, 0x7b, 0xf9, 0x51, 0x73, 0xb2, 0xc6, 0xeb, 0x3e, 0xe4, 0x17, 0x58, 0xd2, 0xa2, 0x4e,
++    0x8f, 0xa9, 0x06, 0x9d, 0xfe, 0x19, 0x89, 0x5e, 0x17, 0x6d, 0xc1, 0xda, 0x94, 0x88, 0x74, 0x1e,
++    0x86, 0x73, 0x45, 0xd8, 0x1b, 0xe0, 0x1e, 0x4a, 0xb2, 0x2f, 0xd5, 0x7b, 0xb8, 0x9a, 0x0c, 0xe9,
++    0xc2, 0x6a, 0xb9, 0x6c, 0x19, 0xc3, 0x6c, 0xb4, 0x2e, 0x97, 0x82, 0x0b, 0xba, 0x7c, 0x8f, 0x7f,
++    0xc4, 0x75, 0x0d, 0xfb, 0x51, 0xb4, 0xcd, 0x8c, 0xa6, 0x6b, 0x60, 0xcc, 0xbe, 0x26, 0x16, 0x23,
++    0x2c, 0xdf, 0x1b, 0x79, 0xb0, 0x70, 0x84, 0x12, 0x79, 0xbc, 0xe4, 0x31, 0xe1, 0x7f, 0x8e, 0xea,
++    0x49, 0x35, 0x02, 0x24, 0x1e, 0x8f, 0x06, 0xe2, 0x92, 0x43, 0xed, 0x19, 0x4f, 0xdb, 0x15, 0xb9,
++    0x81, 0xb6, 0xba, 0xe5, 0xa5, 0x18, 0xa3, 0x9d, 0x52, 0x2c, 0x72, 0xd5, 0x1f, 0xdd, 0xe6, 0xff,
++    0x14, 0x42, 0xfc, 0x80, 0x53, 0x43, 0xad, 0xeb, 0x00, 0x00, 0x00, 0x65, 0x94, 0x0f, 0x68, 0xcf,
++    0xd7, 0xbd, 0xa8, 0xfb, 0x68, 0xcf, 0xd7, 0xbd, 0xa8, 0xfb, 0x68, 0xcf, 0xd5, 0x33, 0xe1, 0x02,
++    0x69, 0x3c, 0x18, 0xcc, 0x4c, 0x2c, 0x99, 0x9b, 0x44, 0x99, 0x9b, 0x44, 0xcc, 0x4c, 0x2c, 0x5d,
++    0x43, 0x96, 0x66, 0x26, 0x16, 0x2f, 0x11, 0xbf, 0x6b, 0xb7, 0x19, 0x23, 0x73, 0xaf, 0xd5, 0xdb,
++    0x8c, 0x91, 0xb9, 0xd7, 0xe4, 0xce, 0x7c, 0xa6, 0xd6, 0xad, 0x86, 0x0c, 0xcc, 0xed, 0x44, 0x39,
++    0xf4, 0x22, 0x1c, 0xfa, 0x1f, 0xaf, 0x10, 0x54, 0x72, 0xcd, 0xff, 0x5e, 0x20, 0x9e, 0x4c, 0xf2,
++    0xf3, 0x29, 0xf0, 0xad, 0x6f, 0xba, 0x2f, 0x54, 0x89, 0x45, 0xf1, 0x5f, 0xe2, 0xb1, 0x68, 0x60,
++    0x8c, 0xac, 0xe2, 0x32, 0xb3, 0x89, 0xf8, 0xa9, 0x32, 0x8e, 0x35, 0x1c, 0x87, 0x58, 0xdb, 0x93,
++    0x0f, 0xf2, 0x6f, 0x00, 0x28, 0xbb, 0x08, 0x57, 0xc5, 0x38, 0x7e, 0x5b, 0x43, 0x01, 0x20, 0x53,
++    0x94, 0xaa, 0x6a, 0xf9, 0x73, 0xe6, 0xfa, 0x52, 0xaf, 0x7f, 0xe3, 0x85, 0x1b, 0x5f, 0x75, 0x66,
++    0xc7, 0x60, 0x7b, 0xcf, 0xc9, 0xfd, 0x0c, 0x95, 0xf0, 0xab, 0x59, 0xdb, 0x29, 0x47, 0x25, 0x74,
++    0x0f, 0xca, 0xa1, 0x64, 0x2d, 0x83, 0x44, 0xc5, 0x04, 0xb7, 0xaa, 0x32, 0x5c, 0x57, 0xc2, 0x49,
++    0x0f, 0x83, 0xb1,
++];
++
++#[derive(Clone, Copy, PartialEq, Eq)]
++enum Side {
++    Offerer,
++    Answerer,
++}
++
++struct OpenFlow {
++    name: RealtimeFlowName,
++    identity: Option<Arc<RealtimeTrackIdentity>>,
++    native: Option<Arc<TrackLocalStaticSample>>,
++    sender: Option<Arc<RTCRtpSender>>,
++}
++
++struct NativePeer {
++    worker: WebRtcConnectorWorker,
++    events: WebRtcConnectorEventReceiver,
++    flows: SessionRealtimeFlows,
++    binding: FlowFixtureSession,
++    names: Vec<RealtimeFlowName>,
++    authentication: Option<crate::endpoint_auth::EndpointAuthTask>,
++    open: bool,
++    provider: FiniteResourceProvider,
++    owner: ConnectorResourceOwnerPort,
++    scope: MeshConnectorResourceScope,
++    baseline: crate::resource::ResourceClaim,
++    baseline_reservations: usize,
++    baseline_scopes: usize,
++}
++
++impl NativePeer {
++    async fn new(role: Role) -> NativeResult<Self> {
++        use crate::resource::{ResourceClaim, ResourceClass};
++        // Exact existing private paired policy grant, independently verified in
++        // the authoring receipt. This selects no new production budget/default.
++        let grant = ResourceClaim::try_from_entries([
++            (ResourceClass::AccountedMemoryBytes, 536_870_912),
++            (ResourceClass::QueuedBytes, 67_108_864),
++            (ResourceClass::SocketOrHandle, 512),
++            (ResourceClass::NativeTransportObject, 512),
++            (ResourceClass::WorkerOrTask, 1_024),
++            (ResourceClass::CallbackOrScheduledWork, 4_096),
++            (ResourceClass::StorageBytes, 268_435_456),
++            (ResourceClass::StorageObject, 4_096),
++            (ResourceClass::RelayOrProviderAllocation, 64),
++            (ResourceClass::ParsingOrCpuWork, 100_000_000),
++            (ResourceClass::OpaqueDependencyResidual, 536_870_912),
++        ])
++        .map_err(|_| "fixture resource claim")?;
++        let provider = FiniteResourceProvider::new(grant);
++        let owner = ConnectorResourceOwnerPort::new(
++            ResourceProviderPort::new(provider.clone()).map_err(|_| "fixture provider")?,
++        );
++        let scope = owner.issue_mesh_scope().map_err(|_| "fixture Mesh scope")?;
++        let baseline = provider.in_use();
++        let baseline_reservations = provider.active_reservations();
++        let baseline_scopes = provider.active_scopes();
++        let profile = WebRtcConnectorProfile::new(ConnectorCallbackPolicy::elastic_realtime())
++            .with_realtime_profile(
++                RealtimeProfile::new(vec![
++                    session_flow::RealtimeCodec {
++                        kind: WebRtcRtpKind::Video,
++                        payload_type: 96,
++                        mime: "video/H264".to_owned(),
++                        clock_rate: 90_000,
++                        channels: 0,
++                        fmtp:
++                            "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
++                                .to_owned(),
++                        framing: RealtimeFraming::AnnexB,
++                        rtcp_feedback: Vec::new(),
++                    },
++                    session_flow::RealtimeCodec {
++                        kind: WebRtcRtpKind::Audio,
++                        payload_type: 111,
++                        mime: "audio/opus".to_owned(),
++                        clock_rate: 48_000,
++                        channels: 2,
++                        fmtp: "minptime=10;useinbandfec=1".to_owned(),
++                        framing: RealtimeFraming::Whole,
++                        rtcp_feedback: Vec::new(),
++                    },
++                ])
++                .map_err(|_| "fixture codec profile")?,
++            )
++            .map_err(|_| "fixture realtime profile")?;
++        let process = ProcessResourceRoot::isolated();
++        let resource_scope = process
++            .mesh_runtime_scope()
++            .network_instance_scope()
++            .peer_connection_scope();
++        let transport = Transport::new()
++            .map_err(|_| "fixture transport")?
++            .with_connector_resource_scope_for_test(scope.clone(), profile)
++            .map_err(|_| "fixture media installation")?;
++        let opened = tokio::time::timeout(
++            CONNECT_BOUND,
++            transport.open_connector_peer(role, &[], &[], resource_scope),
++        )
++        .await;
++        drop(transport);
++        let (worker, events) = match opened {
++            Ok(Ok(opened)) => opened,
++            failed => {
++                // The original constructor's partial-native custodian owns any
++                // unfinished close. Keep its resource owner alive and observe
++                // that completion even when setup failed or was cancelled.
++                let settled = tokio::time::timeout(STEP_BOUND, async {
++                    loop {
++                        let report = owner.report();
++                        if report.active_candidates == 0
++                            && report.failed_cleanup_candidates == 0
++                            && report.cleanup.queued_jobs == 0
++                            && report.cleanup.active_jobs == 0
++                            && provider.in_use() == baseline
++                            && provider.active_reservations() == baseline_reservations
++                            && provider.active_scopes() == baseline_scopes
++                        {
++                            break;
++                        }
++                        tokio::task::yield_now().await;
++                    }
++                })
++                .await
++                .is_ok();
++                drop(scope);
++                drop(owner);
++                if !settled
++                    || provider.in_use() != ResourceClaim::ZERO
++                    || provider.active_reservations() != 0
++                    || provider.active_scopes() != 0
++                {
++                    return Err("fixture partial-construction cleanup");
++                }
++                return Err(if failed.is_err() {
++                    "fixture native construction bound"
++                } else {
++                    "fixture native construction"
++                });
++            }
++        };
++        let binding = FlowFixtureSession {
++            incarnation: Arc::clone(worker.ownership.incarnation.generic()),
++        };
++        let flows = worker.new_session_flows();
++        Ok(Self {
++            worker,
++            events,
++            flows,
++            binding,
++            names: Vec::new(),
++            authentication: None,
++            open: false,
++            provider,
++            owner,
++            scope,
++            baseline,
++            baseline_reservations,
++            baseline_scopes,
++        })
++    }
++
++    fn encoding(video: bool) -> NativeResult<RealtimeEncoding> {
++        let (kind, mime, clock, channels) = if video {
++            (WebRtcRtpKind::Video, "video/H264", 90_000, 0)
++        } else {
++            (WebRtcRtpKind::Audio, "audio/opus", 48_000, 2)
++        };
++        RealtimeEncoding::new(kind, mime, clock, channels).ok_or("fixture encoding")
++    }
++
++    async fn open_flow(
++        &mut self,
++        label: &'static [u8],
++        video: bool,
++        inbound: bool,
++    ) -> NativeResult<OpenFlow> {
++        let encoding = Self::encoding(video)?;
++        let name = self
++            .flows
++            .open(
++                &self.binding,
++                self.worker.live_connector_incarnation(),
++                RealtimeFlowSpec {
++                    name: RealtimeFlowName::new(label.to_vec()).ok_or("fixture flow name")?,
++                    direction: if inbound {
++                        RealtimeDirection::Inbound
++                    } else {
++                        RealtimeDirection::Outbound
++                    },
++                    encoding: encoding.clone(),
++                },
++            )
++            .map_err(|_| "fixture logical flow open")?;
++        self.names.push(name.clone());
++        if inbound {
++            let identity = self
++                .worker
++                .mint_inbound_realtime_identity()
++                .map_err(|_| "fixture identity")?;
++            let retirement = self
++                .worker
++                .inbound_realtime_retirement(Arc::clone(&identity))
++                .map_err(|_| "fixture retirement reservation")?;
++            self.flows
++                .bind_inbound(
++                    &self.binding,
++                    self.worker.live_connector_incarnation(),
++                    &name,
++                    Arc::clone(&identity),
++                    retirement,
++                )
++                .map_err(|_| "fixture registered binding")?;
++            tokio::time::timeout(
++                STEP_BOUND,
++                self.worker
++                    .open_inbound_realtime_transceiver(&identity, &encoding),
++            )
++            .await
++            .map_err(|_| "fixture inbound construction bound")?
++            .map_err(|_| "fixture native inbound negotiation")?;
++            if !self.worker.session.realtime_tracks.classifies(&identity) {
++                return Err("fixture native inbound identity was not recorded");
++            }
++            Ok(OpenFlow {
++                name,
++                identity: Some(identity),
++                native: None,
++                sender: None,
++            })
++        } else {
++            let track = tokio::time::timeout(
++                STEP_BOUND,
++                self.worker.open_outbound_realtime_track(&encoding),
++            )
++            .await
++            .map_err(|_| "fixture outbound construction bound")?
++            .map_err(|_| "fixture native outbound negotiation")?;
++            let native = Arc::clone(&track.track);
++            let sender = Arc::clone(&track.sender);
++            if let Err((_error, track)) = self.flows.attach_outbound(
++                &self.binding,
++                self.worker.live_connector_incarnation(),
++                &name,
++                track,
++            ) {
++                tokio::time::timeout(STEP_BOUND, self.worker.close_outbound_realtime_track(track))
++                    .await
++                    .map_err(|_| "fixture refused attachment cleanup bound")?;
++                return Err("fixture outbound attachment");
++            }
++            Ok(OpenFlow {
++                name,
++                identity: None,
++                native: Some(native),
++                sender: Some(sender),
++            })
++        }
++    }
++
++    async fn await_bind(&self, flow: &OpenFlow) -> NativeResult<()> {
++        let native = flow.native.as_ref().ok_or("fixture sender handle")?;
++        tokio::time::timeout(STEP_BOUND, native.wait_for_first_bind())
++            .await
++            .map_err(|_| "fixture sender stayed unbound; not the selected receiver negative")
++    }
++
++    fn send(&mut self, flow: &OpenFlow, video: bool) -> NativeResult<()> {
++        self.flows
++            .send(
++                &self.binding,
++                self.worker.live_connector_incarnation(),
++                &flow.name,
++                RealtimeSendUnit {
++                    data: Bytes::from_static(if video { VIDEO } else { AUDIO }),
++                    pace: if video {
++                        Duration::from_millis(40)
++                    } else {
++                        Duration::from_millis(20)
++                    },
++                },
++            )
++            .map_err(|_| "fixture real pump queue send")
++    }
++
++    async fn close_name(&mut self, name: &RealtimeFlowName) -> NativeResult<()> {
++        let remains = self
++            .flows
++            .close(
++                &self.binding,
++                self.worker.live_connector_incarnation(),
++                name,
++            )
++            .map_err(|_| "fixture flow close")?;
++        self.names.retain(|held| held.as_bytes() != name.as_bytes());
++        match remains {
++            RealtimeFlowRemains::Inbound(mut retirement) => {
++                let identity = retirement.take_for_explicit_close();
++                self.worker
++                    .close_inbound_realtime_transceiver(&identity)
++                    .await;
++                drop(retirement);
++                if self.worker.session.realtime_tracks.classifies(&identity) {
++                    return Err("fixture inbound native stop did not complete");
++                }
++            }
++            RealtimeFlowRemains::Outbound(retired) => {
++                retired
++                    .await
++                    .map_err(|_| "fixture actual pump retirement ACK dropped")?;
++            }
++            RealtimeFlowRemains::None => {}
++        }
++        Ok(())
++    }
++
++    async fn close_flow(&mut self, flow: &OpenFlow) -> NativeResult<()> {
++        tokio::time::timeout(STEP_BOUND, async {
++            self.close_name(&flow.name).await?;
++            if let Some(sender) = flow.sender.as_ref() {
++                if sender.track().await.is_some() {
++                    return Err("fixture native sender was not detached before ACK");
++                }
++            }
++            Ok(())
++        })
++        .await
++        .map_err(|_| "fixture flow retirement bound")?
++    }
++
++    async fn cleanup(mut self) -> NativeResult<()> {
++        let mut clean = true;
++        while let Some(name) = self.names.pop() {
++            clean &= matches!(
++                tokio::time::timeout(STEP_BOUND, self.close_name(&name)).await,
++                Ok(Ok(()))
++            );
++        }
++        let weak_native = Arc::downgrade(&self.worker.session.pc);
++        clean &= matches!(
++            tokio::time::timeout(STEP_BOUND, self.worker.retire_and_close()).await,
++            Ok(Ok(()))
++        );
++        clean &= self.flows.is_quiescent();
++        let Self {
++            worker,
++            events,
++            flows,
++            binding,
++            authentication,
++            provider,
++            owner,
++            scope,
++            baseline,
++            baseline_reservations,
++            baseline_scopes,
++            ..
++        } = self;
++        drop(authentication);
++        drop(flows);
++        drop(binding);
++        drop(events);
++        drop(worker);
++        let settled = tokio::time::timeout(STEP_BOUND, async {
++            loop {
++                let report = owner.report();
++                if report.active_candidates == 0
++                    && report.failed_cleanup_candidates == 0
++                    && report.cleanup.queued_jobs == 0
++                    && report.cleanup.active_jobs == 0
++                    && provider.in_use() == baseline
++                    && provider.active_reservations() == baseline_reservations
++                    && provider.active_scopes() == baseline_scopes
++                    && weak_native.upgrade().is_none()
++                {
++                    break;
++                }
++                tokio::task::yield_now().await;
++            }
++        })
++        .await
++        .is_ok();
++        drop(scope);
++        drop(owner);
++        if !clean || !settled {
++            return Err("fixture owned native/task/socket/resource cleanup");
++        }
++        if provider.in_use() != crate::resource::ResourceClaim::ZERO
++            || provider.active_reservations() != 0
++            || provider.active_scopes() != 0
++        {
++            return Err("fixture provider did not return to zero after owner drop");
++        }
++        Ok(())
++    }
++}
++
++struct UnitEvent {
++    side: Side,
++    delivery: RealtimeInboundDelivery,
++    _resources: AcceptedWebRtcConnectorEventResources,
++}
++
++struct NativePair {
++    offerer: NativePeer,
++    answerer: NativePeer,
++}
++
++impl NativePair {
++    async fn new() -> NativeResult<Self> {
++        let offerer = NativePeer::new(Role::Offerer).await?;
++        let answerer = match NativePeer::new(Role::Answerer).await {
++            Ok(peer) => peer,
++            Err(error) => {
++                offerer.cleanup().await?;
++                return Err(error);
++            }
++        };
++        Ok(Self { offerer, answerer })
++    }
++
++    fn peer(&mut self, side: Side) -> &mut NativePeer {
++        match side {
++            Side::Offerer => &mut self.offerer,
++            Side::Answerer => &mut self.answerer,
++        }
++    }
++
++    async fn negotiate(&mut self) -> NativeResult<()> {
++        // Fixed roles for every transaction; the original answerer never
++        // introduces a new offer/m-line through an artificial role flip.
++        tokio::time::timeout(CONNECT_BOUND, async {
++            let offer = self
++                .offerer
++                .worker
++                .create_offer()
++                .await
++                .map_err(|_| "fixture offer")?;
++            self.answerer
++                .worker
++                .session
++                .set_remote_description(offer)
++                .await
++                .map_err(|_| "fixture remote offer")?;
++            let answer = self
++                .answerer
++                .worker
++                .create_answer()
++                .await
++                .map_err(|_| "fixture answer")?;
++            self.offerer
++                .worker
++                .session
++                .set_remote_description(answer)
++                .await
++                .map_err(|_| "fixture remote answer")?;
++            Ok(())
++        })
++        .await
++        .map_err(|_| "fixture offer/answer bound")?
++    }
++
++    async fn next_unit(&mut self) -> NativeResult<Option<UnitEvent>> {
++        let (side, raw) = tokio::select! {
++            event = self.offerer.events.recv() => (Side::Offerer, event),
++            event = self.answerer.events.recv() => (Side::Answerer, event),
++        };
++        let raw = raw.ok_or("fixture native event stream ended")?;
++        let accepted = self
++            .peer(side)
++            .worker
++            .accept_event(raw)
++            .ok_or("fixture native owner rejected event")?;
++        let (event, resources) = accepted.into_parts();
++        match event {
++            TransportEvent::LocalIceCandidate(Some(candidate)) => {
++                let opposite = if side == Side::Offerer {
++                    Side::Answerer
++                } else {
++                    Side::Offerer
++                };
++                // Existing loopback signaling seam; production on_track and
++                // flow admission are unchanged. Candidate policy is not this test.
++                self.peer(opposite)
++                    .worker
++                    .session
++                    .add_ice_candidate(candidate)
++                    .await
++                    .map_err(|_| "fixture native candidate application")?;
++                Ok(None)
++            }
++            TransportEvent::DataChannelOpen => {
++                let peer = self.peer(side);
++                match peer.worker.confirm_data_channel_open() {
++                    DataChannelOpenOwnership::Connected(handoff) => {
++                        peer.authentication = Some(task_from_handoff(handoff))
++                    }
++                    DataChannelOpenOwnership::AlreadyConnected => {}
++                    DataChannelOpenOwnership::Rejected => {
++                        return Err("fixture native open ownership")
++                    }
++                }
++                peer.events.commit_data_channel_open();
++                peer.open = true;
++                Ok(None)
++            }
++            TransportEvent::RealtimeUnit(delivery) => Ok(Some(UnitEvent {
++                side,
++                delivery,
++                _resources: resources,
++            })),
++            TransportEvent::DataChannelClosed => Err("fixture native channel closed early"),
++            // Renegotiation events are serviced by the explicit fixed-role
++            // transactions above. No realtime unit is discarded by this arm.
++            _ => Ok(None),
++        }
++    }
++
++    async fn connect(&mut self) -> NativeResult<()> {
++        self.negotiate().await?;
++        tokio::time::timeout(CONNECT_BOUND, async {
++            while !self.offerer.open || !self.answerer.open {
++                if self.next_unit().await?.is_some() {
++                    return Err("fixture unsolicited media before flow open");
++                }
++            }
++            Ok(())
++        })
++        .await
++        .map_err(|_| "fixture genuine native open bound")?
++    }
++
++    async fn receive(
++        &mut self,
++        side: Side,
++        video: Option<&OpenFlow>,
++        audio: Option<&OpenFlow>,
++        audio_clock: &mut Option<u32>,
++    ) -> NativeResult<u8> {
++        let wanted = u8::from(video.is_some()) | (u8::from(audio.is_some()) << 1);
++        let mut seen = 0u8;
++        let deadline = tokio::time::Instant::now() + STEP_BOUND;
++        while seen != wanted {
++            let event = match tokio::time::timeout_at(deadline, self.next_unit()).await {
++                Err(_) => return Ok(seen),
++                Ok(event) => event?,
++            };
++            let Some(event) = event else { continue };
++            if event.side != side || event.delivery.payload.is_none() {
++                return Err("fixture wrong recipient or unaccounted native delivery");
++            }
++            let label = event.delivery.label.name().as_bytes();
++            let (bit, bytes) = if video.is_some_and(|flow| flow.name.as_bytes() == label) {
++                (1u8, VIDEO_EXPECTED)
++            } else if audio.is_some_and(|flow| flow.name.as_bytes() == label) {
++                (2u8, AUDIO)
++            } else {
++                return Err("fixture native delivery used an unexpected local flow");
++            };
++            if seen & bit != 0 || event.delivery.unit.data.as_ref() != bytes {
++                return Err("fixture duplicate or nonexact first native unit");
++            }
++            if bit == 1 && !event.delivery.unit.marker {
++                return Err("fixture valid first video AU lost its entry-point significance");
++            }
++            if bit == 2 {
++                let timestamp = event.delivery.unit.timestamp;
++                if audio_clock.is_some_and(|previous| timestamp.wrapping_sub(previous) != 960) {
++                    return Err("fixture surviving audio clock step is not exact");
++                }
++                *audio_clock = Some(timestamp);
++            }
++            seen |= bit;
++        }
++        Ok(seen)
++    }
++
++    async fn cleanup(self) -> NativeResult<()> {
++        let (a, b) = tokio::join!(self.offerer.cleanup(), self.answerer.cleanup());
++        a?;
++        b
++    }
++}
++
++#[derive(Default, Debug)]
++struct IdentityObservation {
++    still_registered: bool,
++    video_native_associations: usize,
++    expected_native_associations: usize,
++}
++
++async fn association(peer: &NativePeer, flow: &OpenFlow) -> NativeResult<IdentityObservation> {
++    let identity = flow
++        .identity
++        .as_ref()
++        .ok_or("fixture expected inbound identity")?;
++    let mut result = IdentityObservation {
++        still_registered: peer.worker.session.realtime_tracks.classifies(identity),
++        ..Default::default()
++    };
++    for transceiver in peer.worker.session.pc.get_transceivers().await {
++        // Association only: tracks/kind are populated during negotiation and
++        // cannot establish receipt of even one RTP packet.
++        if transceiver.kind() != webrtc::rtp_transceiver::rtp_codec::RTPCodecType::Video {
++            continue;
++        }
++        let receiver = transceiver.receiver().await;
++        if receiver.tracks().await.is_empty() {
++            continue;
++        }
++        result.video_native_associations += 1;
++        let expected = {
++            let mut records = peer.worker.session.realtime_tracks.negotiated.lock();
++            records
++                .iter()
++                .find(|record| Arc::ptr_eq(&record.identity, identity))
++                .is_some_and(|record| record.transceiver.matches_native(&transceiver))
++        };
++        result.expected_native_associations += usize::from(expected);
++    }
++    Ok(result)
++}
++
++#[derive(Debug)]
++struct ReverseOutcome {
++    received: u8,
++    association: IdentityObservation,
++}
++
++async fn fresh_reverse(pair: &mut NativePair) -> NativeResult<ReverseOutcome> {
++    pair.connect().await?;
++    let video_in = pair
++        .offerer
++        .open_flow(b"identity-fresh-video", true, true)
++        .await?;
++    let video = pair
++        .answerer
++        .open_flow(b"identity-fresh-video", true, false)
++        .await?;
++    let audio_in = pair
++        .offerer
++        .open_flow(b"identity-fresh-audio", false, true)
++        .await?;
++    let audio = pair
++        .answerer
++        .open_flow(b"identity-fresh-audio", false, false)
++        .await?;
++    // Both intended native objects exist before the original offerer's offer.
++    // An early receive-only offer would test a distinct unbound-sender rival.
++    pair.negotiate().await?;
++    pair.answerer.await_bind(&video).await?;
++    pair.answerer.await_bind(&audio).await?;
++    pair.answerer.send(&video, true)?;
++    pair.answerer.send(&audio, false)?;
++    let received = pair
++        .receive(Side::Offerer, Some(&video_in), Some(&audio_in), &mut None)
++        .await?;
++    let association = tokio::time::timeout(STEP_BOUND, association(&pair.offerer, &video_in))
++        .await
++        .map_err(|_| "fixture fresh association observation bound")??;
++    Ok(ReverseOutcome {
++        received,
++        association,
++    })
++}
++
++async fn lifecycle_reverse(pair: &mut NativePair) -> NativeResult<ReverseOutcome> {
++    pair.connect().await?;
++    // Fixture orientation is explicit: A is the original SDP offerer and the
++    // initial media source. Actual1bc did not retain its A/B role orientation.
++    let video_in = pair
++        .answerer
++        .open_flow(b"identity-forward-video", true, true)
++        .await?;
++    let video = pair
++        .offerer
++        .open_flow(b"identity-forward-video", true, false)
++        .await?;
++    let audio_in = pair
++        .answerer
++        .open_flow(b"identity-forward-audio", false, true)
++        .await?;
++    let audio = pair
++        .offerer
++        .open_flow(b"identity-forward-audio", false, false)
++        .await?;
++    pair.negotiate().await?;
++    pair.offerer.await_bind(&video).await?;
++    pair.offerer.await_bind(&audio).await?;
++    pair.offerer.send(&video, true)?;
++    pair.offerer.send(&audio, false)?;
++    let mut audio_clock = None;
++    if pair
++        .receive(
++            Side::Answerer,
++            Some(&video_in),
++            Some(&audio_in),
++            &mut audio_clock,
++        )
++        .await?
++        != 3
++    {
++        return Err("fixture initial real forward video/audio control did not complete");
++    }
++
++    // This A outbound remove AND B inbound stop are the actual two retirement
++    // directions. A has never opened an inbound media flow before reverse.
++    pair.offerer.close_flow(&video).await?;
++    pair.answerer.close_flow(&video_in).await?;
++    pair.offerer.send(&audio, false)?;
++    if pair
++        .receive(Side::Answerer, None, Some(&audio_in), &mut audio_clock)
++        .await?
++        != 2
++    {
++        return Err("fixture actual audio did not survive video retirement");
++    }
++    drop(video);
++    drop(video_in);
++
++    let pressure_in = pair
++        .answerer
++        .open_flow(b"identity-pressure-video", true, true)
++        .await?;
++    let pressure = pair
++        .offerer
++        .open_flow(b"identity-pressure-video", true, false)
++        .await?;
++    pair.negotiate().await?;
++    pair.offerer.await_bind(&pressure).await?;
++    // The strict daemon pressure path rejects the oversized IPC prefix before
++    // it becomes RTP. This core control preserves native open/retire only;
++    // it neither fabricates that rejection nor writes a warmup media unit.
++    pair.offerer.close_flow(&pressure).await?;
++    pair.answerer.close_flow(&pressure_in).await?;
++    pair.offerer.send(&audio, false)?;
++    if pair
++        .receive(Side::Answerer, None, Some(&audio_in), &mut audio_clock)
++        .await?
++        != 2
++    {
++        return Err("fixture actual audio did not survive pressure-track retirement");
++    }
++    drop(pressure);
++    drop(pressure_in);
++    pair.offerer.close_flow(&audio).await?;
++    pair.answerer.close_flow(&audio_in).await?;
++    drop(audio);
++    drop(audio_in);
++
++    let reverse_in = pair
++        .offerer
++        .open_flow(b"identity-reverse-video", true, true)
++        .await?;
++    let reverse = pair
++        .answerer
++        .open_flow(b"identity-reverse-video", true, false)
++        .await?;
++    let reverse_audio_in = pair
++        .offerer
++        .open_flow(b"identity-reverse-audio", false, true)
++        .await?;
++    let reverse_audio = pair
++        .answerer
++        .open_flow(b"identity-reverse-audio", false, false)
++        .await?;
++    // No role flip and no completed receive-only transaction between either
++    // legitimate inbound open and its opposite outbound source construction.
++    pair.negotiate().await?;
++    pair.answerer.await_bind(&reverse).await?;
++    pair.answerer.await_bind(&reverse_audio).await?;
++    pair.answerer.send(&reverse, true)?;
++    pair.answerer.send(&reverse_audio, false)?;
++    let received = pair
++        .receive(
++            Side::Offerer,
++            Some(&reverse_in),
++            Some(&reverse_audio_in),
++            &mut None,
++        )
++        .await?;
++    if received & 2 == 0 {
++        return Err("fixture real reverse audio control did not complete");
++    }
++    let association = tokio::time::timeout(STEP_BOUND, association(&pair.offerer, &reverse_in))
++        .await
++        .map_err(|_| "fixture reverse association observation bound")??;
++    // Handles and both PCs remain owned at this observation. The associated
++    // native receiver's kind is not counted as RTP arrival; only a complete
++    // unchanged on_track/pump delivery sets a received bit.
++    Ok(ReverseOutcome {
++        received,
++        association,
++    })
++}
++
++#[tokio::test(flavor = "current_thread")]
++#[ignore = "opens two native peer connections; run the exact isolated native selector"]
++async fn mesh04_local_identity_fresh_reverse_reaches_registered_flow() {
++    let mut pair = NativePair::new().await.expect("fresh native pair setup");
++    let observed = fresh_reverse(&mut pair).await;
++    let cleanup = pair.cleanup().await;
++    cleanup.expect("fresh native pair cleanup must finish before assertions");
++    let observed = observed.expect("fresh native setup/bind/whole-unit controls");
++    println!("mesh04_local_identity fresh_setup_and_cleanup_passed {observed:?}");
++    assert!(
++        observed.association.still_registered && observed.received == 3,
++        "fresh native reverse must reach its locally registered video/audio flows; {observed:?}"
++    );
++}
++
++#[tokio::test(flavor = "current_thread")]
++#[ignore = "opens two native peer connections; run the exact isolated native selector"]
++async fn mesh04_local_identity_reverse_after_retirement_reaches_registered_flow() {
++    let mut pair = NativePair::new()
++        .await
++        .expect("lifecycle native pair setup");
++    let observed = lifecycle_reverse(&mut pair).await;
++    let cleanup = pair.cleanup().await;
++    cleanup.expect("lifecycle native pair cleanup must finish before assertions");
++    let observed = observed.expect("native forward/audio/retirement/reverse-bind controls");
++    println!("mesh04_local_identity lifecycle_controls_and_cleanup_passed {observed:?}");
++    assert!(observed.association.still_registered && observed.received == 3,
++        "bound reverse video must reach its still-owned local flow after completed retirements; {observed:?}");
++}
++
++// Append-only contrast: retire pressure while its real first-bind wait is Pending.
++// The complete two-case passing-control prefix above remains byte-exact.
++async fn lifecycle_reverse_with_pending_pressure(
++    pair: &mut NativePair,
++) -> NativeResult<ReverseOutcome> {
++    pair.connect().await?;
++    // Fixture orientation is explicit: A is the original SDP offerer and the
++    // initial media source. Actual1bc did not retain its A/B role orientation.
++    let video_in = pair
++        .answerer
++        .open_flow(b"identity-forward-video", true, true)
++        .await?;
++    let video = pair
++        .offerer
++        .open_flow(b"identity-forward-video", true, false)
++        .await?;
++    let audio_in = pair
++        .answerer
++        .open_flow(b"identity-forward-audio", false, true)
++        .await?;
++    let audio = pair
++        .offerer
++        .open_flow(b"identity-forward-audio", false, false)
++        .await?;
++    pair.negotiate().await?;
++    pair.offerer.await_bind(&video).await?;
++    pair.offerer.await_bind(&audio).await?;
++    pair.offerer.send(&video, true)?;
++    pair.offerer.send(&audio, false)?;
++    let mut audio_clock = None;
++    if pair
++        .receive(
++            Side::Answerer,
++            Some(&video_in),
++            Some(&audio_in),
++            &mut audio_clock,
++        )
++        .await?
++        != 3
++    {
++        return Err("fixture initial real forward video/audio control did not complete");
++    }
++
++    // This A outbound remove AND B inbound stop are the actual two retirement
++    // directions. A has never opened an inbound media flow before reverse.
++    pair.offerer.close_flow(&video).await?;
++    pair.answerer.close_flow(&video_in).await?;
++    pair.offerer.send(&audio, false)?;
++    if pair
++        .receive(Side::Answerer, None, Some(&audio_in), &mut audio_clock)
++        .await?
++        != 2
++    {
++        return Err("fixture actual audio did not survive video retirement");
++    }
++    drop(video);
++    drop(video_in);
++
++    let pressure_in = pair
++        .answerer
++        .open_flow(b"identity-pressure-video", true, true)
++        .await?;
++    let pressure = pair
++        .offerer
++        .open_flow(b"identity-pressure-video", true, false)
++        .await?;
++    // Withhold only this pressure block's explicit SDP/bind barrier.
++    // Poll the real first-bind wait once. Pending is a setup control, not a
++    // claim that native bind could never become ready concurrently with close.
++    // This block drops the wait before either actual native retirement.
++    let pressure_was_pending = {
++        let native = pressure
++            .native
++            .as_ref()
++            .ok_or("fixture pending pressure sender handle")?;
++        let mut first_bind = std::pin::pin!(native.wait_for_first_bind());
++        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
++        matches!(
++            std::future::Future::poll(first_bind.as_mut(), &mut context),
++            std::task::Poll::Pending
++        )
++    };
++    if !pressure_was_pending {
++        return Err("fixture pressure first-bind was not Pending; setup control failed");
++    }
++    pair.offerer.close_flow(&pressure).await?;
++    pair.answerer.close_flow(&pressure_in).await?;
++    pair.offerer.send(&audio, false)?;
++    if pair
++        .receive(Side::Answerer, None, Some(&audio_in), &mut audio_clock)
++        .await?
++        != 2
++    {
++        return Err("fixture actual audio did not survive pressure-track retirement");
++    }
++    drop(pressure);
++    drop(pressure_in);
++    pair.offerer.close_flow(&audio).await?;
++    pair.answerer.close_flow(&audio_in).await?;
++    drop(audio);
++    drop(audio_in);
++
++    let reverse_in = pair
++        .offerer
++        .open_flow(b"identity-reverse-video", true, true)
++        .await?;
++    let reverse = pair
++        .answerer
++        .open_flow(b"identity-reverse-video", true, false)
++        .await?;
++    let reverse_audio_in = pair
++        .offerer
++        .open_flow(b"identity-reverse-audio", false, true)
++        .await?;
++    let reverse_audio = pair
++        .answerer
++        .open_flow(b"identity-reverse-audio", false, false)
++        .await?;
++    // No role flip and no completed receive-only transaction between either
++    // legitimate inbound open and its opposite outbound source construction.
++    pair.negotiate().await?;
++    pair.answerer.await_bind(&reverse).await?;
++    pair.answerer.await_bind(&reverse_audio).await?;
++    pair.answerer.send(&reverse, true)?;
++    pair.answerer.send(&reverse_audio, false)?;
++    let received = pair
++        .receive(
++            Side::Offerer,
++            Some(&reverse_in),
++            Some(&reverse_audio_in),
++            &mut None,
++        )
++        .await?;
++    if received & 2 == 0 {
++        return Err("fixture real reverse audio control did not complete");
++    }
++    let association = tokio::time::timeout(STEP_BOUND, association(&pair.offerer, &reverse_in))
++        .await
++        .map_err(|_| "fixture reverse association observation bound")??;
++    // Handles and both PCs remain owned at this observation. The associated
++    // native receiver's kind is not counted as RTP arrival; only a complete
++    // unchanged on_track/pump delivery sets a received bit.
++    Ok(ReverseOutcome {
++        received,
++        association,
++    })
++}
++
++#[tokio::test(flavor = "current_thread")]
++#[ignore = "opens two native peer connections; run the exact isolated native selector"]
++async fn mesh04_local_identity_reverse_after_pending_pressure_retirement_reaches_registered_flow() {
++    let mut pair = NativePair::new()
++        .await
++        .expect("pending-pressure native pair setup");
++    let observed = lifecycle_reverse_with_pending_pressure(&mut pair).await;
++    let cleanup = pair.cleanup().await;
++    cleanup.expect("pending-pressure native pair cleanup must finish before assertions");
++    let observed =
++        observed.expect("native forward/Pending-pressure/audio/retirement/reverse-bind controls");
++    println!("mesh04_local_identity pending_pressure_controls_and_cleanup_passed {observed:?}");
++    assert!(observed.association.still_registered && observed.received == 3,
++        "bound reverse video must reach its still-owned local flow after Pending-pressure retirement; {observed:?}");
++}
