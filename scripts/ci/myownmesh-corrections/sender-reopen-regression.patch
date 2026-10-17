@@ -12,11 +12,11 @@ index 2eff2e153bd7d520c891e155370000ebc77da479..b5fac6f603bdc4b1c457a3c5da14e5b4
      use super::*;
 diff --git a/crates/myownmesh-core/src/transport/webrtc/tests/sender_reopen_regression.rs b/crates/myownmesh-core/src/transport/webrtc/tests/sender_reopen_regression.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..68f5013a4df89d1ea9eab3965a6c95b7bba9a113
+index 0000000000000000000000000000000000000000..1895c20ec3df068233a2e634f6b66f934eeb5fea
 --- /dev/null
 +++ b/crates/myownmesh-core/src/transport/webrtc/tests/sender_reopen_regression.rs
-@@ -0,0 +1,169 @@
-+//! Native sender lifecycle only: no SDP, media write, sleep or remote delivery.
+@@ -0,0 +1,185 @@
++//! Native sender lifecycle with local SDP generation, no media write or remote delivery.
 +
 +use std::sync::Arc;
 +use std::time::Duration;
@@ -57,6 +57,7 @@ index 0000000000000000000000000000000000000000..68f5013a4df89d1ea9eab3965a6c95b7
 +#[derive(Debug)]
 +struct Observation {
 +    initial_attached: bool,
++    initial_id_advertised: bool,
 +    removed_track_absent: bool,
 +    same_id: AddOutcome,
 +    different_id: AddOutcome,
@@ -94,7 +95,8 @@ index 0000000000000000000000000000000000000000..68f5013a4df89d1ea9eab3965a6c95b7
 +#[tokio::test]
 +async fn native_sender_same_id_reopens_after_awaited_remove() {
 +    // Match the native track tuple and initial ID used by the application path.
-+    // No negotiation or packet is required to exercise add/remove eligibility.
++    // A local offer stamps the initial track ID used by reuse eligibility.
++    // No description is applied and no packet or external signaling is needed.
 +    let codec = RTCRtpCodecCapability {
 +        mime_type: "video/H264".to_owned(),
 +        clock_rate: 90_000,
@@ -134,6 +136,15 @@ index 0000000000000000000000000000000000000000..68f5013a4df89d1ea9eab3965a6c95b7
 +            .track()
 +            .await
 +            .is_some_and(|track| track.id() == SAME_ID && track.kind() == RTPCodecType::Video);
++        let offer = pc
++            .create_offer(None)
++            .await
++            .map_err(|error| ("create-offer", classify_refusal(error)))?;
++        let initial_id_advertised = offer
++            .sdp
++            .lines()
++            .any(|line| line == "a=msid:myownmesh flow-video/H264");
++        drop(offer);
 +        pc.remove_track(&sender)
 +            .await
 +            .map_err(|error| ("awaited-remove", classify_refusal(error)))?;
@@ -145,6 +156,7 @@ index 0000000000000000000000000000000000000000..68f5013a4df89d1ea9eab3965a6c95b7
 +        let different_id = observe_add(&pc, &codec, CONTROL_ID).await;
 +        Ok::<_, SequenceFailure>(Observation {
 +            initial_attached,
++            initial_id_advertised,
 +            removed_track_absent,
 +            same_id,
 +            different_id,
@@ -169,6 +181,10 @@ index 0000000000000000000000000000000000000000..68f5013a4df89d1ea9eab3965a6c95b7
 +    assert!(
 +        observed.initial_attached,
 +        "initial native add did not attach the expected video track"
++    );
++    assert!(
++        observed.initial_id_advertised,
++        "local offer did not advertise the expected initial track ID"
 +    );
 +    assert!(
 +        observed.removed_track_absent,
