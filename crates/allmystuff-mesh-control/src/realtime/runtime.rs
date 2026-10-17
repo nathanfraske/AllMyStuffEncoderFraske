@@ -581,6 +581,11 @@ impl RealtimeFlow {
                 Err(_) => Err(RealtimeError::Timeout),
             },
         };
+        // A completed write failure is not cancellation of this future.
+        // The taken writer stays unusable; the monitor owns EOF/IO evidence.
+        if matches!(&result, Err(RealtimeError::Transport)) {
+            guard.disarm();
+        }
         if result.is_ok() {
             let mut custody = self.state.writer.lock();
             self.shared.verify()?;
