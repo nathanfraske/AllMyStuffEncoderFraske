@@ -1,0 +1,278 @@
+diff --git a/crates/myownmesh-core/src/engine/state.rs b/crates/myownmesh-core/src/engine/state.rs
+index 26a01742605a9d5dda0fdf9a375aa974c86137b5..e94bcfb3d0f240c83975f0294e9df3601b5758c6 100644
+--- a/crates/myownmesh-core/src/engine/state.rs
++++ b/crates/myownmesh-core/src/engine/state.rs
+@@ -7509,6 +7509,44 @@
+         .unwrap_or(false)
+     }
+ 
++    /// Capture a wait-only view of the native worker stamped on this handle.
++    /// No owner, flow, worker or table guard escapes the synchronous fence.
++    pub(crate) fn observe_realtime_worker_retirement(
++        &self,
++        handle: &crate::realtime::RealtimeFlowHandle,
++    ) -> std::result::Result<
++        crate::transport::webrtc::RealtimeWorkerRetirement,
++        crate::realtime::RealtimeRefusal,
++    > {
++        use crate::transport::webrtc::RealtimeWorkerRetirement;
++
++        // Never let the generic owner helper select a worker for an unstamped
++        // handle. This observer can name only its already captured worker.
++        if handle.owner().worker().is_none() {
++            return Ok(RealtimeWorkerRetirement::unusable());
++        }
++        match self.with_owned_realtime_flows_and_worker(
++            handle.owner(),
++            |session, flows, live, worker| {
++                Self::handle_names_live_flow(flows, handle)?;
++                if !flows.is_current(session, Some(live), handle.name()) {
++                    return Err(RealtimeFlowError::SessionNotCurrent);
++                }
++                let claim = RealtimeWorkerRetirement::retained_claim()
++                    .map_err(|_| RealtimeFlowError::FlowRefused)?;
++                let retained = session
++                    .validity_witness()
++                    .reserve_retained(claim)
++                    .map_err(|_| RealtimeFlowError::FlowRefused)?;
++                Ok(worker.observe_realtime_retirement(retained))
++            },
++        ) {
++            Ok(observer) => Ok(observer),
++            Err(RealtimeFlowError::SessionNotCurrent) => Ok(RealtimeWorkerRetirement::unusable()),
++            Err(error) => Err(error.into()),
++        }
++    }
++
+     /// Deliver one inbound realtime unit onto the flow it names.
+     ///
+     /// The connector half resolved which flow the track belongs to and
+diff --git a/crates/myownmesh-core/src/handle.rs b/crates/myownmesh-core/src/handle.rs
+index 1b10cd5a19e2d6593d37c832156731d4c7772439..540174f3cb06f726c7c4c521d711aca6feaa42ba 100644
+--- a/crates/myownmesh-core/src/handle.rs
++++ b/crates/myownmesh-core/src/handle.rs
+@@ -1527,6 +1527,25 @@
+     /// about.
+     pub fn realtime_is_current(&self, flow: &crate::realtime::RealtimeFlowHandle) -> bool {
+         self.state.realtime_is_current(flow)
++    }
++
++    /// Wait for unusability of the exact native worker captured by `flow`.
++    ///
++    /// Capture is synchronous and fallible while the handle is fenced. A stale
++    /// handle returns an immediately ready wait; resource refusal stays an
++    /// error. The owned, nonclone wait retains no flow or native worker and
++    /// grants no send, close or invalidation authority. Readiness does not
++    /// acknowledge native cleanup or every individual-flow close/reopen.
++    pub fn observe_webrtc_realtime_worker_retirement(
++        &self,
++        flow: &crate::realtime::RealtimeFlowHandle,
++    ) -> std::result::Result<
++        impl std::future::Future<Output = ()> + Send + 'static,
++        crate::realtime::RealtimeRefusal,
++    > {
++        self.state
++            .observe_realtime_worker_retirement(flow)
++            .map(|observer| observer.wait())
+     }
+ 
+     /// Claim the inbound stream of `peer`'s current session.
+diff --git a/crates/myownmesh-core/src/transport/webrtc.rs b/crates/myownmesh-core/src/transport/webrtc.rs
+index 0c8258a745712115d32fb2a4752f65f923ef908a..4b8c46e92b9f29fe3b86be2298e8d4354404decf 100644
+--- a/crates/myownmesh-core/src/transport/webrtc.rs
++++ b/crates/myownmesh-core/src/transport/webrtc.rs
+@@ -2045,6 +2045,63 @@
+     }
+ }
+ 
++/// A wait-only view of one exact native worker's unusability.
++///
++/// This owns neither the worker nor a flow, and is deliberately not cloneable.
++/// Readiness is not a native-close acknowledgement or an individual-flow close.
++pub(crate) struct RealtimeWorkerRetirement {
++    retirement: Option<watch::Receiver<bool>>,
++    // Last: receiver and its wait bookkeeping must drop before their funding.
++    _retained: Option<crate::resource::ResourceLease>,
++}
++
++impl RealtimeWorkerRetirement {
++    pub(crate) fn unusable() -> Self {
++        Self {
++            retirement: None,
++            _retained: None,
++        }
++    }
++
++    pub(crate) fn retained_claim() -> std::result::Result<
++        crate::resource::ResourceClaim,
++        crate::resource::ResourceClaimArithmeticError,
++    > {
++        // Reserve the visible observer plus the actual inline wait future,
++        // including its dependency wait bookkeeping. The empty measurement
++        // value subscribes to nothing and retains no shared state or lease.
++        let waiting = Self::unusable().wait();
++        let bytes = size_of::<Self>()
++            .checked_add(std::mem::size_of_val(&waiting))
++            .and_then(|bytes| u64::try_from(bytes).ok())
++            .ok_or(crate::resource::ResourceClaimArithmeticError::Overflow {
++                dimension: crate::resource::ResourceClass::AccountedMemoryBytes,
++            })?;
++        crate::resource::ResourceClaim::try_from_entries([
++            (crate::resource::ResourceClass::AccountedMemoryBytes, bytes),
++            // The retained watch shared allocation has dependency-private
++            // metadata; it may outlive its original sender while we wait.
++            (crate::resource::ResourceClass::OpaqueDependencyResidual, 1),
++        ])
++    }
++
++    pub(crate) async fn wait(mut self) {
++        if let Some(retirement) = self.retirement.as_mut() {
++            loop {
++                // Subscribe marks the current version seen. Check the value
++                // first so retirement before capture is immediately ready.
++                if *retirement.borrow() {
++                    return;
++                }
++                if retirement.changed().await.is_err() {
++                    // Sender absence proves unusability, not native cleanup.
++                    return;
++                }
++            }
++        }
++    }
++}
++
+ async fn await_until_connector_retirement<T>(
+     mut retirement: watch::Receiver<bool>,
+     work: impl Future<Output = T>,
+@@ -5285,6 +5342,17 @@
+ }
+ 
+ impl WebRtcConnectorWorker {
++    /// Called only after the exact session has funded this retained observer.
++    pub(crate) fn observe_realtime_retirement(
++        &self,
++        retained: crate::resource::ResourceLease,
++    ) -> RealtimeWorkerRetirement {
++        RealtimeWorkerRetirement {
++            retirement: Some(self.ownership.incarnation.subscribe_retirement()),
++            _retained: Some(retained),
++        }
++    }
++
+     /// Reserve exact finite work against this connector's attempt owner before
+     /// parsing an endpoint protocol frame.
+     pub(crate) fn reserve_attempt_work(
+diff --git a/crates/myownmesh/src/control.rs b/crates/myownmesh/src/control.rs
+index 373b23e19e4d30514fb2fd61a6f0e5d7a81c203d..dfc08d43f558237a6beec6b2cc5933f137b64ae0 100644
+--- a/crates/myownmesh/src/control.rs
++++ b/crates/myownmesh/src/control.rs
+@@ -1681,9 +1681,9 @@
+                 // reason: a client that acked and then found every unit refused
+                 // would have to discover from silence that its capability was
+                 // wrong.
+-                let inbound_stream = match &*bound {
++                let (inbound_stream, outbound_retirement) = match &*bound {
+                     RealtimePipeBinding::Inbound { peer, .. } => match net.realtime_inbound(peer) {
+-                        Some(stream) => Some(stream),
++                        Some(stream) => (Some(stream), None),
+                         None => {
+                             let text = PreparedText::acquiring(
+                                 format!(
+@@ -1712,24 +1712,43 @@
+                         network,
+                         flow_capability,
+                     } => {
+-                        if pipe_owner
+-                            .with_realtime_flow(flow_capability, network, |_flow| ())
+-                            .is_none()
+-                        {
+-                            match write_static_error(
+-                                &mut writer,
+-                                &json_lines,
+-                                &cancel,
+-                                "unknown flow_capability on this network: it was never issued \
+-                                 to this client, or the flow it named has already been closed",
+-                            )
+-                            .await?
+-                            {
+-                                Wrote::Sent => continue,
+-                                Wrote::Ended => break,
+-                            }
+-                        }
+-                        None
++                        let retirement =
++                            match pipe_owner.with_realtime_flow(flow_capability, network, |flow| {
++                                net.observe_webrtc_realtime_worker_retirement(flow)
++                            }) {
++                                None => {
++                                    match write_static_error(
++                                    &mut writer,
++                                    &json_lines,
++                                    &cancel,
++                                    "unknown flow_capability on this network: it was never issued \
++                                     to this client, or the flow it named has already been closed",
++                                )
++                                .await?
++                                {
++                                    Wrote::Sent => continue,
++                                    Wrote::Ended => break,
++                                }
++                                }
++                                Some(Err(refusal)) => {
++                                    let owner = ResponseOwner::acquire(&json_lines)
++                                        .context("realtime operation result was not admitted")?;
++                                    let refused = owner.finish(Ok(
++                                        reply::OperationReplyData::RealtimeRefused {
++                                            error: refusal.to_string(),
++                                            code: refusal.code().to_owned(),
++                                        },
++                                    ));
++                                    match write_variable(&mut writer, &json_lines, &cancel, refused)
++                                        .await?
++                                    {
++                                        Wrote::Sent => continue,
++                                        Wrote::Ended => break,
++                                    }
++                                }
++                                Some(Ok(retirement)) => retirement,
++                            };
++                        (None, Some(retirement))
+                     }
+                 };
+                 let ack = PreparedReply::Bool {
+@@ -1750,15 +1769,19 @@
+                 // Recover the buffered reader — it may already hold the first
+                 // frame.
+                 let pipe = async {
+-                    match (inbound_stream, &*bound) {
++                    match (inbound_stream, outbound_retirement, &*bound) {
+                         (
+                             None,
++                            Some(retirement),
+                             RealtimePipeBinding::Outbound {
+                                 network,
+                                 flow_capability,
+                             },
+                         ) => {
+-                            run_realtime_outbound_pipe(
++                            tokio::select! {
++                                biased;
++                                () = retirement => Ok(()),
++                                result = run_realtime_outbound_pipe(
+                                 &net,
+                                 &pipe_owner,
+                                 flow_capability,
+@@ -1773,9 +1796,10 @@
+                                 reader.frames(),
+                                 &realtime_frames,
+                             )
+-                            .await
++                             => result,
++                            }
+                         }
+-                        (Some(stream), RealtimePipeBinding::Inbound { peer, .. }) => {
++                        (Some(stream), None, RealtimePipeBinding::Inbound { peer, .. }) => {
+                             run_realtime_inbound_pipe(
+                                 &net,
+                                 peer,
