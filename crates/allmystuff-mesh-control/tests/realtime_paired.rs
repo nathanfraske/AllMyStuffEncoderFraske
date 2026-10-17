@@ -336,7 +336,7 @@ fn isolated_realtime_pair() {
                 .unwrap();
             assert!(
                 matches!(end, PipeEnd::RemoteClosed),
-                "require actual remote pipe termination"
+                "require actual remote pipe termination; observed {end:?}"
             );
             assert!(
                 a.session.registration().is_active(),
