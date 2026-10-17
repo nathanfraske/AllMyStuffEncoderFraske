@@ -1,0 +1,29 @@
+diff --git a/crates/myownmesh-core/src/transport/webrtc.rs b/crates/myownmesh-core/src/transport/webrtc.rs
+index b5fac6f603bdc4b1c457a3c5da14e5b4756b4138..0c8258a745712115d32fb2a4752f65f923ef908a 100644
+--- a/crates/myownmesh-core/src/transport/webrtc.rs
++++ b/crates/myownmesh-core/src/transport/webrtc.rs
+@@ -5621,12 +5621,21 @@
+             format!("flow-{}", encoding.mime()),
+             "myownmesh".to_string(),
+         ));
+-        let sender = self
++        let transceiver = self
+             .session
+             .pc
+-            .add_track(Arc::clone(&track) as Arc<dyn TrackLocal + Send + Sync>)
++            .add_transceiver_from_track(
++                Arc::clone(&track) as Arc<dyn TrackLocal + Send + Sync>,
++                Some(RTCRtpTransceiverInit {
++                    direction: RTCRtpTransceiverDirection::Sendonly,
++                    send_encodings: Vec::new(),
++                }),
++            )
+             .await
+-            .map_err(|error| Error::Transport(format!("outbound realtime add_track: {error}")))?;
++            .map_err(|error| {
++                Error::Transport(format!("outbound realtime add_transceiver: {error}"))
++            })?;
++        let sender = transceiver.sender().await;
+         Ok(RealtimeOutboundTrack {
+             track,
+             sender,
