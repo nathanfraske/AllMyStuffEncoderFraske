@@ -332,6 +332,7 @@ async fn receive(
     route: &mut RealtimeAvRoute,
     prefix: &str,
     phase: &'static str,
+    send_helpers_returned: &std::cell::Cell<bool>,
 ) -> Value {
     let mut video = Vec::new();
     let mut audio = Vec::new();
@@ -345,9 +346,10 @@ async fn receive(
                 _ => "other",
             };
             panic!(
-                "consumer receive failed; phase={phase}; video_completed={}; audio_completed={}; error_family={error_family}",
+                "consumer receive failed; phase={phase}; video_completed={}; audio_completed={}; error_family={error_family}; send_helpers_returned={}",
                 video.len(),
                 audio.len(),
+                send_helpers_returned.get(),
             );
         }) {
             ReceivedAvUnit::Video(unit) => {
@@ -418,13 +420,18 @@ async fn transfer(
     phase: &'static str,
 ) -> Value {
     let (mut video, mut audio) = source.split_senders().unwrap();
+    let send_helpers_returned = std::cell::Cell::new(false);
     let sending = async {
         let ((), ()) = tokio::join!(
             send_video(&mut video, &context.video),
             send_audio(&mut audio, &context.audio)
         );
+        send_helpers_returned.set(true);
     };
-    let ((), receipt) = tokio::join!(sending, receive(context, sink, prefix, phase));
+    let ((), receipt) = tokio::join!(
+        sending,
+        receive(context, sink, prefix, phase, &send_helpers_returned)
+    );
     receipt
 }
 
