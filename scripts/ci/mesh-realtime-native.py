@@ -22,9 +22,9 @@ import tempfile
 import time
 
 CANDIDATE = "db7818e09fedd98899490347b86ac9bc9f97b59b"
-CORRECTED_PATCH_SET = "4cb553e829e61dab2858357b1a2c031a2cf5995d0e49eaa9770517c345a497e6"
-CORRECTED_TREE = "bdbf1b96c7809107bd3a151b2ccf9bcad9ace73a"
-CORRECTED_SCOPE = "owner-cleanup and startup-first-bind source; strict native AV gates pending; sender-reuse unqualified"
+CORRECTED_PATCH_SET = "a9edda5de43430f4eb0407bad11352d9d7eeda4e36c866bdeb7298873e8fe279"
+CORRECTED_TREE = "c87e382172530f898a0f351557c24552926daad1"
+CORRECTED_SCOPE = "owner-cleanup, startup-first-bind and sender-reopen source; strict native AV, reconnect and relay gates pending"
 POLICY = "e6729ca6d0887ec0b4ef2cd91da404ffb477b251e00a5a8c1381254c1a9a9fe6"
 LOCKS = ["Cargo.lock", "node/Cargo.lock", "gui/src-tauri/Cargo.lock",
          "gui/mobile/Cargo.lock", "scripts/ci/mesh-realtime-minimal/Cargo.lock"]
