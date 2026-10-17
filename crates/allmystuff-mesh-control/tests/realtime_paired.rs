@@ -458,7 +458,20 @@ fn isolated_realtime_pair() {
             let stale_terminal = stale_end
                 .wait(context.realtime_policy().operation_timeout)
                 .await
-                .unwrap();
+                .unwrap_or_else(|_| {
+                    let (stale_write_category, stale_write_end): (&'static str, Option<PipeEnd>) =
+                        match &_stale_write {
+                            Ok(()) => ("ok", None),
+                            Err(RealtimeError::Transport) => ("transport", None),
+                            Err(RealtimeError::StaleSession) => ("stale_session", None),
+                            Err(RealtimeError::PipeEnded(reason)) => ("pipe_ended", Some(*reason)),
+                            Err(RealtimeError::Timeout) => ("timeout", None),
+                            Err(_) => ("other", None),
+                        };
+                    panic!(
+                        "stale pipe termination wait failed; stale write category {stale_write_category}; stale write end {stale_write_end:?}"
+                    );
+                });
             assert!(matches!(
                 stale_terminal,
                 PipeEnd::RemoteClosed | PipeEnd::SessionEnded
@@ -467,6 +480,42 @@ fn isolated_realtime_pair() {
             let mut fresh_a = context.session(&Arc::clone(&context.a)).await;
             let mut fresh_b = context.session(&Arc::clone(&context.b)).await;
             assert_ne!(fresh_a.session.registration().generation(), old_generation);
+            // This is an explicit two-sided setup prerequisite after the old lifetime checks.
+            // Local ACTIVE still does not reserve the following inbound claim.
+            let replacement_b_timeout = context.realtime_policy().operation_timeout;
+            let replacement_b_wait_ms = u64::try_from(replacement_b_timeout.as_millis())
+                .unwrap()
+                .checked_sub(1000)
+                .unwrap();
+            let replacement_b_connected = paired::raw(
+                &context.b,
+                json!({"op":"network_connect_peer", "network":&context.network,
+                       "peer":&a_id, "pin":false, "wait_ms":replacement_b_wait_ms}),
+                replacement_b_timeout,
+            )
+            .await;
+            assert!(
+                replacement_b_connected.ok
+                    && replacement_b_connected
+                        .data
+                        .as_ref()
+                        .and_then(|data| data.get("active"))
+                        .and_then(Value::as_bool)
+                        == Some(true),
+                "one explicit replacement-B setup dial must reach ACTIVE; ok={}; active_shape={}; error_family={}",
+                replacement_b_connected.ok,
+                match replacement_b_connected.data.as_ref().and_then(|data| data.get("active")) {
+                    None => "absent",
+                    Some(Value::Bool(false)) => "false",
+                    Some(Value::Bool(true)) => "true",
+                    Some(_) => "not_bool",
+                },
+                match replacement_b_connected.error.as_deref() {
+                    None => "absent",
+                    Some(error) if error.starts_with("unknown network:") => "unknown_network",
+                    Some(_) => "other",
+                }
+            );
             let mut fresh_inbound = fresh_b
                 .session
                 .open_inbound(&context.network, &a_id)

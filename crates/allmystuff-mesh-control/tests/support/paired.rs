@@ -322,7 +322,19 @@ pub async fn connect(context: &Context, peer: &str) {
                 .and_then(|data| data.get("active"))
                 .and_then(Value::as_bool)
                 == Some(true),
-        "one explicit private dial must reach ACTIVE; no retry on an ambiguous write"
+        "one explicit private dial must reach ACTIVE; no retry on an ambiguous write; ok={}; active_shape={}; error_family={}",
+        response.ok,
+        match response.data.as_ref().and_then(|data| data.get("active")) {
+            None => "absent",
+            Some(Value::Bool(false)) => "false",
+            Some(Value::Bool(true)) => "true",
+            Some(_) => "not_bool",
+        },
+        match response.error.as_deref() {
+            None => "absent",
+            Some(error) if error.starts_with("unknown network:") => "unknown_network",
+            Some(_) => "other",
+        }
     );
 }
 

@@ -22,9 +22,9 @@ import tempfile
 import time
 
 CANDIDATE = "db7818e09fedd98899490347b86ac9bc9f97b59b"
-CORRECTED_PATCH_SET = "a9edda5de43430f4eb0407bad11352d9d7eeda4e36c866bdeb7298873e8fe279"
-CORRECTED_TREE = "c87e382172530f898a0f351557c24552926daad1"
-CORRECTED_SCOPE = "owner-cleanup, startup-first-bind and sender-reopen source; strict native AV, reconnect and relay gates pending"
+CORRECTED_PATCH_SET = "5de332dd5676f420ca9ab5a150e780dbf85944ecffbc726c131d44a1c91a2cb7"
+CORRECTED_TREE = "e865a7bc9f446feaeb2e7d244a7b1a211c22d5b9"
+CORRECTED_SCOPE = "owner-cleanup, startup-first-bind, sender-reopen, Sendonly and exact-worker retirement source; strict daemon AV, reconnect and relay gates pending"
 POLICY = "e6729ca6d0887ec0b4ef2cd91da404ffb477b251e00a5a8c1381254c1a9a9fe6"
 LOCKS = ["Cargo.lock", "node/Cargo.lock", "gui/src-tauri/Cargo.lock",
          "gui/mobile/Cargo.lock", "scripts/ci/mesh-realtime-minimal/Cargo.lock"]
@@ -222,7 +222,7 @@ def main():
             if (args.patch_set_sha256 != CORRECTED_PATCH_SET
                     or patch_set["expected_tree"] != CORRECTED_TREE
                     or patch_set.get("qualification_scope") != CORRECTED_SCOPE):
-                raise RuntimeError("corrected matrix requires the exact reviewed owner-cleanup and startup patch set")
+                raise RuntimeError("corrected matrix requires the exact reviewed worker-retirement stock patch set, tree and qualification scope")
             receipt.update(candidate=None, candidate_kind="corrected", candidate_base_commit=CANDIDATE,
                            candidate_qualification_scope=CORRECTED_SCOPE,
                            patch_set_sha256=args.patch_set_sha256, patch_set=patch_set)

@@ -138,8 +138,8 @@ jobs:
           --expected-app '${{ github.sha }}'
           --artifacts '${{ runner.temp }}/mesh03-native-artifacts'
           --candidate-kind corrected
-          --patch-set scripts/ci/myownmesh-corrections/patch-set.json
-          --patch-set-sha256 a9edda5de43430f4eb0407bad11352d9d7eeda4e36c866bdeb7298873e8fe279
+          --patch-set scripts/ci/myownmesh-corrections/worker-retirement-stock-provenance.json
+          --patch-set-sha256 5de332dd5676f420ca9ab5a150e780dbf85944ecffbc726c131d44a1c91a2cb7
       - name: Retain commands, native identities, media receipts and cleanup
         if: always()
         uses: actions/upload-artifact@v4
