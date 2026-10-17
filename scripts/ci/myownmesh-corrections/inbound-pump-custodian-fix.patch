@@ -1,0 +1,584 @@
+diff --git a/crates/myownmesh-core/src/transport/webrtc.rs b/crates/myownmesh-core/src/transport/webrtc.rs
+--- a/crates/myownmesh-core/src/transport/webrtc.rs
++++ b/crates/myownmesh-core/src/transport/webrtc.rs
+@@ -1254,8 +1254,14 @@
+     }
+ }
+ 
+-impl Drop for RealtimeInboundRetirement {
+-    fn drop(&mut self) {
++impl RealtimeInboundRetirement {
++    /// Queued by the callback only after the actual pump handle is attached.
++    /// The pump signals its tail; this external executor joins it before stop.
++    fn submit_after_pump(mut self, ended: crate::resource::FundedArc<RealtimeRetirementSignal>) {
++        self.submit(Some(ended));
++    }
++
++    fn submit(&mut self, ended: Option<crate::resource::FundedArc<RealtimeRetirementSignal>>) {
+         let Some(tracks) = self
+             .tracks
+             .take()
+@@ -1287,6 +1293,9 @@
+             slot,
+             Box::pin(async move {
+                 let _tail = tail;
++                if let Some(ended) = ended {
++                    await_retirement(ended).await;
++                }
+                 tracks.stop_claimed(&identity).await;
+             }),
+             Box::new(|| {}),
+@@ -1309,6 +1318,25 @@
+         // rather than implicit so the retention is not an accident of where a
+         // value happened to fall out of scope.
+         drop(submitted);
++    }
++}
++
++impl Drop for RealtimeInboundRetirement {
++    fn drop(&mut self) {
++        self.submit(None);
++    }
++}
++
++/// A pump-end wake, separate from the native retirement completion. Dropping
++/// this never claims, joins, stops, or publishes native retirement completion.
++/// Its funded cell survives until both the pump and the queued job release it.
++struct RealtimeInboundPumpEnd {
++    ended: crate::resource::FundedArc<RealtimeRetirementSignal>,
++}
++
++impl Drop for RealtimeInboundPumpEnd {
++    fn drop(&mut self) {
++        self.ended.finish();
+     }
+ }
+ 
+@@ -1600,6 +1628,44 @@
+             slot: Some(slot),
+             tail: None,
+         }
++    }
++
++    /// Reserve the pump's external retirement before spawning any task. The
++    /// extra job and its end cell each have their own lease; the flow's existing
++    /// retirement slot is neither borrowed nor reused for a second submission.
++    fn pump_retirement(
++        self: &Arc<Self>,
++        identity: &Arc<RealtimeTrackIdentity>,
++        scope: &ConnectorWorkResourceScope,
++    ) -> Result<(RealtimeInboundRetirement, RealtimeInboundPumpEnd)> {
++        let slot_claim = crate::runtime::attempt::cleanup_job_claim().map_err(|error| {
++            Error::Transport(format!("inbound realtime pump retirement claim: {error}"))
++        })?;
++        let ended_claim = RealtimeRetirementSignal::mint_claim().map_err(|error| {
++            Error::Transport(format!("inbound realtime pump end claim: {error}"))
++        })?;
++        let slot = scope
++            .acquire(
++                crate::resource::ResourceAuthorityClass::Admitted,
++                slot_claim,
++            )
++            .map_err(Error::ResourceUnavailable)?;
++        let ended = scope
++            .acquire(
++                crate::resource::ResourceAuthorityClass::Admitted,
++                ended_claim,
++            )
++            .map_err(Error::ResourceUnavailable)?;
++        Ok((
++            self.retirement(
++                Arc::clone(identity),
++                scope.cleanup_submission().clone(),
++                slot,
++            ),
++            RealtimeInboundPumpEnd {
++                ended: RealtimeRetirementSignal::mint(ended),
++            },
++        ))
+     }
+ 
+     /// Drop one record, once its transceiver really is stopped.
+@@ -8234,6 +8300,7 @@
+     {
+         let tx = events_tx.clone();
+         let task_scope = resource_scope.clone();
++        let retirement_scope = work_resource_scope.clone();
+         let session_tracks = Arc::clone(&realtime_tracks);
+         let callback_observation = observe_callback_if(resource_scope.as_ref(), "track");
+         pc.on_track(Box::new(move |track, _receiver, transceiver| {
+@@ -8254,6 +8321,7 @@
+             let session_tracks = Arc::clone(&session_tracks);
+             let task_observation =
+                 observe_inexact_item_if(task_scope.as_ref(), PreAuthResourceFamily::Task, 1, 1);
++            let retirement_scope = retirement_scope.clone();
+             Box::pin(async move {
+                 let _callback_work = callback_work;
+                 let Some(_operation) = tx.operation_fence.try_enter() else {
+@@ -8312,6 +8380,19 @@
+                 // one active-flow lease it is entitled to; taking a second for
+                 // the same flow would halve the configured capacity and let a
+                 // refusal land on a flow whose open had already succeeded.
++                let Some(retirement_scope) = retirement_scope.as_ref() else {
++                    tx.retire_after_callback_violation();
++                    return;
++                };
++                let (retirement, pump_end) =
++                    match session_tracks.pump_retirement(&identity, retirement_scope) {
++                        Ok(retirement) => retirement,
++                        Err(_) => {
++                            tx.retire_after_callback_violation();
++                            return;
++                        }
++                    };
++                let ended = pump_end.ended.clone();
+                 let task = tokio::spawn(pump_session_flow_track(
+                     track,
+                     tx,
+@@ -8319,8 +8400,7 @@
+                         task_observation,
+                         port: attachment.port,
+                         end: attachment.end,
+-                        tracks: Arc::clone(&session_tracks),
+-                        identity: Arc::clone(&identity),
++                        pump_end,
+                         label: attachment.label,
+                         policy: attachment.policy,
+                     },
+@@ -8329,6 +8409,9 @@
+                     task.abort();
+                     session_tracks.submit_tasks(vec![task]);
+                 }
++                // Submission (including refusal handling) runs on the callback,
++                // never on the pump whose actual handle the job must join.
++                retirement.submit_after_pump(ended);
+             })
+         }));
+     }
+@@ -10499,6 +10582,7 @@
+ 
+ #[cfg(test)]
+ mod tests {
++    mod self_retirement_regression;
+     mod sender_reopen_regression;
+     mod startup_regression;
+ 
+@@ -11007,6 +11091,22 @@
+         // names. Granting their sum would also let a control pass while any two
+         // of the three were confused for each other, which is the other defect
+         // these grants are derived to catch.
++        realtime_native_test_scope_with_pumps(transceivers, slots, identities, 0)
++    }
++
++    fn realtime_native_test_scope_with_pumps(
++        transceivers: u64,
++        slots: u64,
++        identities: u64,
++        pumps: u64,
++    ) -> (
++        FiniteResourceProvider,
++        ConnectorResourceOwnerPort,
++        crate::runtime::attempt::MeshConnectorResourceScope,
++        ConnectorCandidateCapability,
++        AttemptLifetime,
++        ConnectorWorkResourceScope,
++    ) {
+         let per_transceiver = [
+             negotiated_inbound_record_claim().expect("the fixture record claim is representable"),
+             RealtimeRetirementSignal::mint_claim()
+@@ -11031,10 +11131,15 @@
+             RealtimeTrackIdentity::mint_claim().expect("the identity claim is representable"),
+         )
+         .expect("the fixture identity reservation charge is representable");
++        let per_pump_end = FiniteResourceProvider::reservation_charge_for_test(
++            RealtimeRetirementSignal::mint_claim().expect("the pump-end claim is representable"),
++        )
++        .expect("the pump-end reservation charge is representable");
+         let native_work = (0..transceivers)
+             .map(|_| per_transceiver)
+             .chain((0..slots).map(|_| per_slot))
+             .chain((0..identities).map(|_| per_identity))
++            .chain((0..pumps).flat_map(|_| [per_slot, per_pump_end]))
+             .try_fold(crate::resource::ResourceClaim::ZERO, |total, claim| {
+                 total.checked_add(claim)
+             })
+diff --git a/crates/myownmesh-core/src/transport/webrtc/inbound.rs b/crates/myownmesh-core/src/transport/webrtc/inbound.rs
+--- a/crates/myownmesh-core/src/transport/webrtc/inbound.rs
++++ b/crates/myownmesh-core/src/transport/webrtc/inbound.rs
+@@ -31,15 +31,9 @@
+     /// peer happened to send again — holding a native read lease against a flow
+     /// that no longer exists.
+     pub(super) end: Arc<LeasedWake>,
+-    /// The connector's track table and this track's token, for the one
+-    /// retirement this task may perform.
+-    ///
+-    /// The transceiver itself is deliberately not held: stopping it is a
+-    /// single-owner decision and the table is where that is decided, so a task
+-    /// that could reach the transceiver directly could stop one someone else
+-    /// had already claimed.
+-    pub(super) tracks: Arc<super::RealtimeSessionTracks>,
+-    pub(super) identity: Arc<RealtimeTrackIdentity>,
++    /// Signals the pre-funded external retirement job when this pump exits.
++    /// It holds neither a native object nor the authority to stop one.
++    pub(super) pump_end: RealtimeInboundPumpEnd,
+     /// The flow this track may deliver to, resolved once at admission.
+     ///
+     /// It comes from the binding table, so it is a fact this side established
+@@ -73,8 +67,7 @@
+         task_observation: _task_observation,
+         port,
+         end,
+-        tracks,
+-        identity,
++        pump_end,
+         label,
+         policy,
+     } = owner;
+@@ -181,10 +174,10 @@
+             break;
+         }
+     }
+-    // However that ended — closed flow, close wake, dead track, refused
+-    // resources — this task's transceiver is retired here. Through the table, so
+-    // that a close or a session replacement racing the same record wins or loses
+-    // it cleanly; and awaited, so a `stop` someone else is running is finished
+-    // before this task's own observation leases go back.
+-    tracks.stop_claimed(&identity).await;
++    // Never retire through our own attached JoinHandle. Signal the existing
++    // process cleanup executor and return; its job claims the same record,
++    // joins this actual task, stops the native object, and only then announces
++    // retirement completion. An external winner still aborts and joins us;
++    // dropping this guard on cancellation releases the queued job as a loser.
++    drop(pump_end);
+ }
+diff --git a/crates/myownmesh-core/src/transport/webrtc/tests/self_retirement_regression.rs b/crates/myownmesh-core/src/transport/webrtc/tests/self_retirement_regression.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/myownmesh-core/src/transport/webrtc/tests/self_retirement_regression.rs
+@@ -0,0 +1,326 @@
++//! Exercise retirement from the task whose real handle the track record owns.
++
++use super::*;
++use std::future::Future;
++use std::pin::Pin;
++use std::task::{Context, Poll, Waker};
++use tokio::sync::oneshot;
++
++const DEADLINE: Duration = Duration::from_secs(5);
++
++struct GatedStop {
++    inner: Arc<dyn NativeRealtimeTransceiverPort>,
++    entered: SyncMutex<Option<oneshot::Sender<()>>>,
++    release: SyncMutex<Option<oneshot::Receiver<()>>>,
++    returned: Arc<AtomicBool>,
++}
++
++impl NativeRealtimeTransceiverPort for GatedStop {
++    fn stop(&self) -> NativeTransceiverStopFuture<'_> {
++        Box::pin(async move {
++            let result = self.inner.stop().await;
++            if let Some(entered) = self.entered.lock().take() {
++                let _ = entered.send(());
++            }
++            let release = self.release.lock().take().expect("one native stop gate");
++            if release.await.is_err() {
++                return Err(Error::Transport("test stop gate was dropped".to_owned()));
++            }
++            self.returned.store(true, Ordering::Release);
++            result
++        })
++    }
++
++    fn matches_native(&self, transceiver: &Arc<RTCRtpTransceiver>) -> bool {
++        self.inner.matches_native(transceiver)
++    }
++}
++
++struct PumpExit {
++    normal_return: bool,
++    dropped: Option<oneshot::Sender<bool>>,
++}
++
++impl Drop for PumpExit {
++    fn drop(&mut self) {
++        if let Some(dropped) = self.dropped.take() {
++            let _ = dropped.send(self.normal_return);
++        }
++    }
++}
++
++struct AttachedPump {
++    tracks: Arc<RealtimeSessionTracks>,
++    identity: Arc<RealtimeTrackIdentity>,
++    completion: crate::resource::FundedArc<RealtimeRetirementSignal>,
++    // Keep this already-funded cell stable across both provider snapshots.
++    _pump_end: crate::resource::FundedArc<RealtimeRetirementSignal>,
++    stops: Arc<AtomicUsize>,
++    stop_returned: Arc<AtomicBool>,
++    stop_entered: oneshot::Receiver<()>,
++    stop_release: Option<oneshot::Sender<()>>,
++    start: Option<oneshot::Sender<()>>,
++    exited: oneshot::Receiver<bool>,
++    abort: tokio::task::AbortHandle,
++}
++
++impl AttachedPump {
++    fn new(scope: &ConnectorWorkResourceScope) -> Self {
++        let tracks = Arc::new(RealtimeSessionTracks::with_task_reaper(TaskReaper::new()));
++        let (identity, stops) = record_test_transceiver(&tracks, scope, false);
++        let (entered_tx, stop_entered) = oneshot::channel();
++        let (release_tx, release_rx) = oneshot::channel();
++        let stop_returned = Arc::new(AtomicBool::new(false));
++        let completion = {
++            let mut records = tracks.negotiated.lock();
++            let record = records
++                .iter_mut()
++                .find(|record| Arc::ptr_eq(&record.identity, &identity))
++                .expect("the production record was just installed");
++            record.transceiver = Arc::new(GatedStop {
++                inner: Arc::clone(&record.transceiver),
++                entered: SyncMutex::new(Some(entered_tx)),
++                release: SyncMutex::new(Some(release_rx)),
++                returned: Arc::clone(&stop_returned),
++            });
++            record.retirement.done.clone()
++        };
++        let (start, started) = oneshot::channel();
++        let (dropped, exited) = oneshot::channel();
++        // Captured before spawn, so abort-before-first-poll is observable too.
++        let exit = PumpExit {
++            normal_return: false,
++            dropped: Some(dropped),
++        };
++        let (retirement, pump_end) = tracks
++            .pump_retirement(&identity, scope)
++            .expect("the fixture funds the actual pump retirement");
++        let ended = pump_end.ended.clone();
++        let end_witness = ended.clone();
++        let task = tokio::spawn(async move {
++            let mut exit = exit;
++            if started.await.is_ok() {
++                exit.normal_return = true;
++            }
++            drop(pump_end);
++        });
++        let abort = task.abort_handle();
++        if let Err(task) = tracks.attach_task(&identity, task) {
++            task.abort();
++            tracks.submit_tasks(vec![task]);
++            panic!("the gated pump must attach before it can retire");
++        }
++        retirement.submit_after_pump(ended);
++        Self {
++            tracks,
++            identity,
++            completion,
++            _pump_end: end_witness,
++            stops,
++            stop_returned,
++            stop_entered,
++            stop_release: Some(release_tx),
++            start: Some(start),
++            exited,
++            abort,
++        }
++    }
++
++    async fn finish(&mut self, exit_consumed: bool) -> bool {
++        drop(self.start.take());
++        drop(self.stop_release.take());
++        self.abort.abort();
++        let dropped = exit_consumed
++            || matches!(
++                tokio::time::timeout(DEADLINE, &mut self.exited).await,
++                Ok(Ok(_))
++            );
++        self.tracks.prepare_for_close();
++        let reaped = tokio::time::timeout(DEADLINE, self.tracks.wait_for_tasks())
++            .await
++            .is_ok();
++        dropped && reaped && self.abort.is_finished()
++    }
++}
++
++fn pending<F: Future>(future: Pin<&mut F>) -> bool {
++    let mut context = Context::from_waker(Waker::noop());
++    matches!(future.poll(&mut context), Poll::Pending)
++}
++
++/// Exact provider usage, not whether unrelated free capacity admits another
++/// transceiver. The fixture retains identity, completion and pump-end funding.
++/// Record, native and job funding additionally survive until the stop returns.
++fn expected_provider_usage(
++    baseline: crate::resource::ResourceClaim,
++    stop_pending: bool,
++) -> crate::resource::ResourceClaim {
++    let retained = [
++        RealtimeTrackIdentity::mint_claim(),
++        RealtimeRetirementSignal::mint_claim(), // retirement completion
++        RealtimeRetirementSignal::mint_claim(), // retained pump-end witness
++    ];
++    let pending = [
++        negotiated_inbound_record_claim(),
++        negotiated_inbound_transceiver_claim(),
++        crate::runtime::attempt::cleanup_job_claim(),
++    ];
++    retained
++        .into_iter()
++        .chain(pending.into_iter().filter(|_| stop_pending))
++        .try_fold(baseline, |total, claim| {
++            total.checked_add(
++                FiniteResourceProvider::reservation_charge_for_test(
++                    claim.expect("the exact fixture claim is representable"),
++                )
++                .expect("the fixture reservation charge is representable"),
++            )
++        })
++        .expect("the exact fixture usage is representable")
++}
++
++/// This owner is isolated and queues exactly the one pump retirement job.
++/// Its positive completed count is published after that future has returned;
++/// retirement's earlier done wake and transient queue/active counts are not
++/// barriers for the final record-removal or task-drain observations.
++async fn wait_for_custodian_job_return(
++    owner: &ConnectorResourceOwnerPort,
++    completed_before: u64,
++) -> bool {
++    let returned = std::future::poll_fn(|context| {
++        if owner.report().cleanup.completed_jobs > completed_before {
++            Poll::Ready(())
++        } else {
++            context.waker().wake_by_ref();
++            Poll::Pending
++        }
++    });
++    tokio::time::timeout(DEADLINE, returned).await.is_ok()
++}
++
++#[tokio::test(flavor = "current_thread")]
++async fn attached_pump_tail_custodian_stops_once_and_completes() {
++    let (_provider, _owner, _mesh, _candidate, _lifetime, scope) =
++        realtime_native_test_scope_with_pumps(1, 0, 1, 1);
++    let completed_before = _owner.report().cleanup.completed_jobs;
++    let usage_before_pump = _provider.in_use();
++    let mut pump = AttachedPump::new(&scope);
++    pump.start.take().unwrap().send(()).unwrap();
++    // Only the queued production custodian can claim before native entry;
++    // no external stop future is polled until that entry has been observed.
++    let (normal_return, exit_consumed) =
++        match tokio::time::timeout(DEADLINE, &mut pump.exited).await {
++            Ok(result) => (result.ok(), true),
++            Err(_) => (None, false),
++        };
++    let first = match tokio::time::timeout(DEADLINE, &mut pump.stop_entered).await {
++        Ok(Ok(())) => "native_stop_entered",
++        Ok(Err(_)) => "stop_entry_closed",
++        Err(_) => "deadline",
++    };
++    let joined_before_stop = pump.abort.is_finished();
++    let completion_before_release = pump.completion.is_done();
++    let native_held_before_release =
++        _provider.in_use() == expected_provider_usage(usage_before_pump, true);
++    // Poll the actual external loser, not a replacement completion primitive.
++    let mut external = Box::pin(pump.tracks.stop_claimed(&pump.identity));
++    let external_pending = pending(external.as_mut());
++    let released = pump.stop_release.take().unwrap().send(()).is_ok();
++    let external_completed =
++        !external_pending || tokio::time::timeout(DEADLINE, &mut external).await.is_ok();
++    drop(external);
++    let custodian_returned = wait_for_custodian_job_return(&_owner, completed_before).await;
++    let stop_calls = pump.stops.load(Ordering::Acquire);
++    let stop_returned = pump.stop_returned.load(Ordering::Acquire);
++    let completed = pump.completion.is_done();
++    let forgotten = !pump.tracks.classifies(&pump.identity);
++    let native_recovered = _provider.in_use() == expected_provider_usage(usage_before_pump, false);
++    // Clean up before any behavior assertion, including on the current defect.
++    let drained = pump.finish(exit_consumed).await;
++    assert_eq!(
++        first, "native_stop_entered",
++        "self-winner: first={first}, normal_return={normal_return:?}, stop_calls={stop_calls}, stop_returned={stop_returned}, completed={completed}, external_completed={external_completed}"
++    );
++    assert!(joined_before_stop && !completion_before_release && external_pending);
++    assert!(
++        native_held_before_release,
++        "a pending stop still owns its native claim"
++    );
++    assert!(
++        released && external_completed && stop_returned && completed,
++        "self-winner completion: first={first}, normal_return={normal_return:?}, stop_calls={stop_calls}, stop_returned={stop_returned}, completed={completed}, external_completed={external_completed}"
++    );
++    assert_eq!(
++        normal_return,
++        Some(true),
++        "the signalling pump must return normally"
++    );
++    assert_eq!(stop_calls, 1);
++    assert!(custodian_returned, "the actual custodian job must return");
++    assert!(forgotten && native_recovered && drained);
++}
++
++#[tokio::test(flavor = "current_thread")]
++async fn attached_pump_external_winner_joins_before_native_stop() {
++    let (_provider, _owner, _mesh, _candidate, _lifetime, scope) =
++        realtime_native_test_scope_with_pumps(1, 0, 1, 1);
++    let completed_before = _owner.report().cleanup.completed_jobs;
++    let usage_before_pump = _provider.in_use();
++    let mut pump = AttachedPump::new(&scope);
++    // The pump cannot reach its tail: this control retains the start gate.
++    let mut external = Box::pin(pump.tracks.stop_claimed(&pump.identity));
++    let first = tokio::time::timeout(DEADLINE, async {
++        tokio::select! {
++            () = &mut external => "external_returned_before_stop",
++            entered = &mut pump.stop_entered => {
++                if entered.is_ok() { "native_stop_entered" } else { "stop_entry_closed" }
++            }
++        }
++    })
++    .await
++    .unwrap_or("deadline");
++    // The original stop_owned must have joined the aborted pump before entry.
++    let (normal_return, mut exit_consumed) = match pump.exited.try_recv() {
++        Ok(normal) => (Some(normal), true),
++        Err(oneshot::error::TryRecvError::Closed) => (None, true),
++        Err(oneshot::error::TryRecvError::Empty) => (None, false),
++    };
++    let joined_before_stop = pump.abort.is_finished();
++    let completion_before_release = pump.completion.is_done();
++    let native_held_before_release =
++        _provider.in_use() == expected_provider_usage(usage_before_pump, true);
++    let mut loser = Box::pin(pump.tracks.stop_claimed(&pump.identity));
++    let loser_pending = pending(loser.as_mut());
++    let released = pump.stop_release.take().unwrap().send(()).is_ok();
++    let external_completed = first == "external_returned_before_stop"
++        || tokio::time::timeout(DEADLINE, &mut external).await.is_ok();
++    drop(external);
++    let loser_completed =
++        !loser_pending || tokio::time::timeout(DEADLINE, &mut loser).await.is_ok();
++    drop(loser);
++    if !exit_consumed {
++        exit_consumed = matches!(
++            tokio::time::timeout(DEADLINE, &mut pump.exited).await,
++            Ok(Ok(_))
++        );
++    }
++    let custodian_returned = wait_for_custodian_job_return(&_owner, completed_before).await;
++    let stop_calls = pump.stops.load(Ordering::Acquire);
++    let stop_returned = pump.stop_returned.load(Ordering::Acquire);
++    let completed = pump.completion.is_done();
++    let forgotten = !pump.tracks.classifies(&pump.identity);
++    let native_recovered = _provider.in_use() == expected_provider_usage(usage_before_pump, false);
++    let drained = pump.finish(exit_consumed).await;
++    assert_eq!(first, "native_stop_entered");
++    assert_eq!(
++        normal_return,
++        Some(false),
++        "the external winner cancels the gated pump"
++    );
++    assert!(joined_before_stop && !completion_before_release && loser_pending);
++    assert!(native_held_before_release);
++    assert!(released && external_completed && loser_completed && stop_returned && completed);
++    assert_eq!(stop_calls, 1);
++    assert!(custodian_returned, "the actual custodian job must return");
++    assert!(forgotten && native_recovered && drained);
++}
