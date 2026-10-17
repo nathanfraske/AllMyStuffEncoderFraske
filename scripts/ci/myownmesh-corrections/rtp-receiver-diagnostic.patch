@@ -1,0 +1,419 @@
+diff --git a/crates/myownmesh-core/src/transport/webrtc.rs b/crates/myownmesh-core/src/transport/webrtc.rs
+index 75b43879aa6214225684f724e1a62f648b0751a9..f492e5e6f2316df6298ebadc09c326944dd433b8 100644
+--- a/crates/myownmesh-core/src/transport/webrtc.rs
++++ b/crates/myownmesh-core/src/transport/webrtc.rs
+@@ -1898,6 +1898,48 @@
+ static FLOW_BIND_PUMP_END: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+ static FLOW_BIND_ACTIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+ static FLOW_BIND_RETIRE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
++
++// Receiver diagnostics retain no track identity or payload. Counters stop at
++// eight per category/process; absence after the cap is not delivery evidence.
++static RTP_RECEIVER_CALLBACK_ENTRY: std::sync::atomic::AtomicUsize =
++    std::sync::atomic::AtomicUsize::new(0);
++static RTP_RECEIVER_ADMISSION: std::sync::atomic::AtomicUsize =
++    std::sync::atomic::AtomicUsize::new(0);
++
++fn observe_rtp_receiver(
++    counter: &std::sync::atomic::AtomicUsize,
++    stage: &'static str,
++    shape: &'static str,
++    result: &'static str,
++    bytes: usize,
++) {
++    if tracing::enabled!(target: "mesh_first_unit", tracing::Level::DEBUG) {
++        if let Ok(ordinal) = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
++            if count < 8 {
++                Some(count + 1)
++            } else {
++                None
++            }
++        }) {
++            tracing::debug!(target: "mesh_first_unit", stage, shape, result, bytes, ordinal,
++                "MESH04_RTP_RECEIVER");
++        }
++    }
++}
++
++fn observe_first_rtp_receiver(
++    first: &mut bool,
++    counter: &std::sync::atomic::AtomicUsize,
++    stage: &'static str,
++    shape: &'static str,
++    result: &'static str,
++    bytes: usize,
++) {
++    if *first {
++        *first = false;
++        observe_rtp_receiver(counter, stage, shape, result, bytes);
++    }
++}
+ 
+ fn flow_bind_next_ordinal(counter: &std::sync::atomic::AtomicUsize) -> usize {
+     counter
+@@ -8333,10 +8375,25 @@
+         let callback_observation = observe_callback_if(resource_scope.as_ref(), "track");
+         pc.on_track(Box::new(move |track, _receiver, transceiver| {
+             let _keep_callback_observation = &callback_observation;
++            // Kind is unavailable until the original native_rtp_kind call below.
++            observe_rtp_receiver(
++                &RTP_RECEIVER_CALLBACK_ENTRY,
++                "callback_entry",
++                "unknown",
++                "entered",
++                0,
++            );
+             let callback_work =
+                 match tx.begin_native_callback_operation(ConnectorCallbackClass::Realtime) {
+                     Ok(work) => work,
+                     Err(error) => {
++                        observe_rtp_receiver(
++                            &RTP_RECEIVER_ADMISSION,
++                            "callback_work",
++                            "unknown",
++                            "refused",
++                            0,
++                        );
+                         warn!(
+                             ?error,
+                             "refusing native track callback under resource pressure"
+@@ -8352,9 +8409,23 @@
+             Box::pin(async move {
+                 let _callback_work = callback_work;
+                 let Some(_operation) = tx.operation_fence.try_enter() else {
++                    observe_rtp_receiver(
++                        &RTP_RECEIVER_ADMISSION,
++                        "operation_fence",
++                        "unknown",
++                        "closed",
++                        0,
++                    );
+                     return;
+                 };
+                 if !tx.callback_gate.is_active() {
++                    observe_rtp_receiver(
++                        &RTP_RECEIVER_ADMISSION,
++                        "callback_gate",
++                        "unknown",
++                        "inactive",
++                        0,
++                    );
+                     return;
+                 }
+ 
+@@ -8375,18 +8446,43 @@
+                 // would let a peer end a session by offering one unsolicited
+                 // track.
+                 let Some(identity) = session_tracks.resolve(&transceiver) else {
++                    observe_rtp_receiver(
++                        &RTP_RECEIVER_ADMISSION,
++                        "local_identity",
++                        "unknown",
++                        "unresolved",
++                        0,
++                    );
+                     trace!("dropping a track on a transceiver this side did not negotiate");
+                     return;
+                 };
+                 // Our transceiver, but the session that gave its token meaning
+                 // is gone. Refused, and deliberately not passed on.
+                 let Some(bindings) = session_tracks.current() else {
++                    observe_rtp_receiver(
++                        &RTP_RECEIVER_ADMISSION,
++                        "current_bindings",
++                        "unknown",
++                        "absent",
++                        0,
++                    );
+                     return;
+                 };
+                 // An unspecified kind is not guessed at: it matches no binding,
+                 // and a track matching no binding is dropped.
+                 let Some(kind) = native_rtp_kind(track.kind()) else {
++                    observe_rtp_receiver(
++                        &RTP_RECEIVER_ADMISSION,
++                        "native_kind",
++                        "unknown",
++                        "unsupported",
++                        0,
++                    );
+                     return;
++                };
++                let diagnostic_shape = match &kind {
++                    WebRtcRtpKind::Audio => "audio",
++                    WebRtcRtpKind::Video => "video",
+                 };
+                 let capability = &track.codec().capability;
+                 let Some(attachment) = bindings.admit(
+@@ -8396,11 +8492,25 @@
+                     capability.clock_rate,
+                     capability.channels,
+                 ) else {
++                    observe_rtp_receiver(
++                        &RTP_RECEIVER_ADMISSION,
++                        "registered_shape",
++                        diagnostic_shape,
++                        "refused",
++                        0,
++                    );
+                     // Our transceiver, a shape we did not open the flow for —
+                     // or one whose flow has since closed. Attaching would feed
+                     // a decoder configured for something else.
+                     return;
+                 };
++                observe_rtp_receiver(
++                    &RTP_RECEIVER_ADMISSION,
++                    "registered_shape",
++                    diagnostic_shape,
++                    "admitted",
++                    0,
++                );
+                 // No second flow open here, and that is the point of the weak
+                 // port handle the admission carried. The
+                 // application already opened this flow and it already holds the
+diff --git a/crates/myownmesh-core/src/transport/webrtc/inbound.rs b/crates/myownmesh-core/src/transport/webrtc/inbound.rs
+index 92e14612345eddf82a9dba1a21c8a23700c13ce2..8ddcaf55a09c84fcd7a04e7e9b5b6a77219cb2f9 100644
+--- a/crates/myownmesh-core/src/transport/webrtc/inbound.rs
++++ b/crates/myownmesh-core/src/transport/webrtc/inbound.rs
+@@ -15,6 +15,15 @@
+ //! nor how it is reassembled.
+ 
+ use super::*;
++
++static RTP_RECEIVER_PUMP_START: std::sync::atomic::AtomicUsize =
++    std::sync::atomic::AtomicUsize::new(0);
++static RTP_RECEIVER_FIRST_READ: std::sync::atomic::AtomicUsize =
++    std::sync::atomic::AtomicUsize::new(0);
++static RTP_RECEIVER_FIRST_ASSEMBLY: std::sync::atomic::AtomicUsize =
++    std::sync::atomic::AtomicUsize::new(0);
++static RTP_RECEIVER_FIRST_EMIT: std::sync::atomic::AtomicUsize =
++    std::sync::atomic::AtomicUsize::new(0);
+ 
+ /// Exact ownership retained by one session-flow inbound track pump.
+ pub(super) struct SessionInboundTrackOwner {
+@@ -78,6 +87,21 @@
+         label,
+         policy,
+     } = owner;
++    // Framing is local profile metadata, not a remote track name or codec read.
++    let diagnostic_shape = match &policy {
++        RealtimeUnitPolicy::Assembled(_) => "assembled",
++        RealtimeUnitPolicy::PayloadPerUnit => "whole",
++    };
++    let mut diagnostic_first_read = true;
++    let mut diagnostic_first_assembly = true;
++    let mut diagnostic_first_emit = true;
++    observe_rtp_receiver(
++        &RTP_RECEIVER_PUMP_START,
++        "pump_start",
++        diagnostic_shape,
++        "entered",
++        0,
++    );
+     let mut assembler = match policy {
+         RealtimeUnitPolicy::Assembled(framing) => {
+             Some(RealtimeUnitAssembler::guarded(framing, port.clone()))
+@@ -93,11 +117,29 @@
+         // close check as well as the accounting route: a closed flow answers
+         // `None`, and there is nothing left to deliver to.
+         let Some(flow) = port.port() else {
++            observe_first_rtp_receiver(
++                &mut diagnostic_first_read,
++                &RTP_RECEIVER_FIRST_READ,
++                "native_read",
++                diagnostic_shape,
++                "flow_closed_before_read",
++                0,
++            );
+             break;
+         };
+         let native_read = match flow.lifetime.registry.begin_native_read_checked() {
+             Ok(read) => read,
+-            Err(_) => break,
++            Err(_) => {
++                observe_first_rtp_receiver(
++                    &mut diagnostic_first_read,
++                    &RTP_RECEIVER_FIRST_READ,
++                    "native_read",
++                    diagnostic_shape,
++                    "lease_refused",
++                    0,
++                );
++                break;
++            }
+         };
+         drop(flow);
+         let pkt = tokio::select! {
+@@ -105,13 +147,30 @@
+             // `read_rtp` — holding the native read lease above — until the peer
+             // happened to send again, which for a peer that has stopped sending
+             // is never.
+-            () = &mut ended => break,
++            () = &mut ended => {
++                observe_first_rtp_receiver(&mut diagnostic_first_read, &RTP_RECEIVER_FIRST_READ, "native_read", diagnostic_shape, "flow_ended", 0);
++                break;
++            },
+             read = track.read_rtp() => match read {
+-                Ok((pkt, _)) => pkt,
+-                Err(_) => break, // track ended with its connection
++                Ok((pkt, _)) => {
++                    observe_first_rtp_receiver(&mut diagnostic_first_read, &RTP_RECEIVER_FIRST_READ, "native_read", diagnostic_shape, "packet", pkt.payload.len());
++                    pkt
++                }
++                Err(_) => {
++                    observe_first_rtp_receiver(&mut diagnostic_first_read, &RTP_RECEIVER_FIRST_READ, "native_read", diagnostic_shape, "error", 0);
++                    break; // track ended with its connection
++                }
+             },
+         };
+         let Some(flow) = port.port() else {
++            observe_first_rtp_receiver(
++                &mut diagnostic_first_assembly,
++                &RTP_RECEIVER_FIRST_ASSEMBLY,
++                "assembly",
++                diagnostic_shape,
++                "flow_closed_after_read",
++                0,
++            );
+             break;
+         };
+         // Every packet this task reads belongs to a flow the promoted session
+@@ -125,7 +184,17 @@
+             .admit_session_packet_checked(pkt.payload.len())
+         {
+             Ok(work) => work,
+-            Err(_) => break,
++            Err(_) => {
++                observe_first_rtp_receiver(
++                    &mut diagnostic_first_assembly,
++                    &RTP_RECEIVER_FIRST_ASSEMBLY,
++                    "assembly",
++                    diagnostic_shape,
++                    "packet_work_refused",
++                    pkt.payload.len(),
++                );
++                break;
++            }
+         };
+         // The exact content-byte work lease now owns the returned packet. The
+         // opaque native-read lease no longer has to cover dependency output.
+@@ -134,8 +203,24 @@
+             Some(assembler) => match assembler.push(&pkt) {
+                 Ok(Some(mut assembled)) => {
+                     let Some(output) = assembled.output.take() else {
++                        observe_first_rtp_receiver(
++                            &mut diagnostic_first_assembly,
++                            &RTP_RECEIVER_FIRST_ASSEMBLY,
++                            "assembly",
++                            diagnostic_shape,
++                            "output_missing",
++                            assembled.data.len(),
++                        );
+                         break;
+                     };
++                    observe_first_rtp_receiver(
++                        &mut diagnostic_first_assembly,
++                        &RTP_RECEIVER_FIRST_ASSEMBLY,
++                        "assembly",
++                        diagnostic_shape,
++                        "complete",
++                        assembled.data.len(),
++                    );
+                     (
+                         RealtimeRecvUnit {
+                             timestamp: assembled.rtp_timestamp,
+@@ -145,23 +230,65 @@
+                         output,
+                     )
+                 }
+-                Ok(None) => continue,
++                Ok(None) => {
++                    observe_first_rtp_receiver(
++                        &mut diagnostic_first_assembly,
++                        &RTP_RECEIVER_FIRST_ASSEMBLY,
++                        "assembly",
++                        diagnostic_shape,
++                        "pending",
++                        pkt.payload.len(),
++                    );
++                    continue;
++                }
+                 // One malformed packet costs the current unit only; the stream
+                 // re-syncs on the next timestamp.
+                 Err(error) => {
++                    observe_first_rtp_receiver(
++                        &mut diagnostic_first_assembly,
++                        &RTP_RECEIVER_FIRST_ASSEMBLY,
++                        "assembly",
++                        diagnostic_shape,
++                        "error",
++                        pkt.payload.len(),
++                    );
+                     trace!("session flow depacketize: {error}");
+                     continue;
+                 }
+             },
+             None => {
+                 if pkt.payload.is_empty() {
++                    observe_first_rtp_receiver(
++                        &mut diagnostic_first_assembly,
++                        &RTP_RECEIVER_FIRST_ASSEMBLY,
++                        "assembly",
++                        diagnostic_shape,
++                        "empty",
++                        0,
++                    );
+                     continue; // padding / probe
+                 }
+                 // Whole-payload flows still account their bytes through the
+                 // same reservation, so the two shapes are bounded identically.
+                 let Some(output) = flow.reserve_output(pkt.payload.len()) else {
++                    observe_first_rtp_receiver(
++                        &mut diagnostic_first_assembly,
++                        &RTP_RECEIVER_FIRST_ASSEMBLY,
++                        "assembly",
++                        diagnostic_shape,
++                        "output_refused",
++                        pkt.payload.len(),
++                    );
+                     continue;
+                 };
++                observe_first_rtp_receiver(
++                    &mut diagnostic_first_assembly,
++                    &RTP_RECEIVER_FIRST_ASSEMBLY,
++                    "assembly",
++                    diagnostic_shape,
++                    "whole_complete",
++                    pkt.payload.len(),
++                );
+                 (
+                     RealtimeRecvUnit {
+                         timestamp: pkt.header.timestamp,
+@@ -176,10 +303,27 @@
+         // and the delivery carries one that lives as long as the queued unit
+         // does. Both are the same shared record, so this is a refcount rather
+         // than a second name.
++        let diagnostic_emit_bytes = unit.data.len();
+         let delivery = RealtimeInboundDelivery::new(label.clone(), unit);
+         if !tx.emit_realtime(&flow, TransportEvent::RealtimeUnit(delivery), output) {
++            observe_first_rtp_receiver(
++                &mut diagnostic_first_emit,
++                &RTP_RECEIVER_FIRST_EMIT,
++                "complete_unit_emit",
++                diagnostic_shape,
++                "refused",
++                diagnostic_emit_bytes,
++            );
+             break;
+         }
++        observe_first_rtp_receiver(
++            &mut diagnostic_first_emit,
++            &RTP_RECEIVER_FIRST_EMIT,
++            "complete_unit_emit",
++            diagnostic_shape,
++            "returned_true",
++            diagnostic_emit_bytes,
++        );
+     }
+     // However that ended — closed flow, close wake, dead track, refused
+     // resources — this task's transceiver is retired here. Through the table, so
