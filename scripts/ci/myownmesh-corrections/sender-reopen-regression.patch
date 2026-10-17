@@ -1,0 +1,187 @@
+diff --git a/crates/myownmesh-core/src/transport/webrtc.rs b/crates/myownmesh-core/src/transport/webrtc.rs
+index 2eff2e153bd7d520c891e155370000ebc77da479..b5fac6f603bdc4b1c457a3c5da14e5b4756b4138 100644
+--- a/crates/myownmesh-core/src/transport/webrtc.rs
++++ b/crates/myownmesh-core/src/transport/webrtc.rs
+@@ -10422,6 +10422,7 @@ pub(crate) fn one_mesh_connector_fixture_grant(
+ 
+ #[cfg(test)]
+ mod tests {
++    mod sender_reopen_regression;
+     mod startup_regression;
+ 
+     use super::*;
+diff --git a/crates/myownmesh-core/src/transport/webrtc/tests/sender_reopen_regression.rs b/crates/myownmesh-core/src/transport/webrtc/tests/sender_reopen_regression.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..68f5013a4df89d1ea9eab3965a6c95b7bba9a113
+--- /dev/null
++++ b/crates/myownmesh-core/src/transport/webrtc/tests/sender_reopen_regression.rs
+@@ -0,0 +1,169 @@
++//! Native sender lifecycle only: no SDP, media write, sleep or remote delivery.
++
++use std::sync::Arc;
++use std::time::Duration;
++
++use webrtc::api::media_engine::MediaEngine;
++use webrtc::api::APIBuilder;
++use webrtc::peer_connection::configuration::RTCConfiguration;
++use webrtc::peer_connection::RTCPeerConnection;
++use webrtc::rtp_transceiver::rtp_codec::{
++    RTCRtpCodecCapability, RTCRtpCodecParameters, RTPCodecType,
++};
++use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
++use webrtc::track::track_local::TrackLocal;
++
++const NATIVE_TEST_BOUND: Duration = Duration::from_secs(5);
++const SAME_ID: &str = "flow-video/H264";
++const CONTROL_ID: &str = "mesh04-independent-video";
++
++#[derive(Debug, PartialEq, Eq)]
++enum AddOutcome {
++    Attached,
++    MissingOrWrongTrack,
++    RefusedIncorrectEnvelope,
++    RefusedOther,
++}
++
++fn classify_refusal(error: webrtc::Error) -> AddOutcome {
++    match error {
++        webrtc::Error::ErrRTPSenderNewTrackHasIncorrectEnvelope => {
++            AddOutcome::RefusedIncorrectEnvelope
++        }
++        _ => AddOutcome::RefusedOther,
++    }
++}
++
++type SequenceFailure = (&'static str, AddOutcome);
++
++#[derive(Debug)]
++struct Observation {
++    initial_attached: bool,
++    removed_track_absent: bool,
++    same_id: AddOutcome,
++    different_id: AddOutcome,
++}
++
++fn track(codec: &RTCRtpCodecCapability, id: &str) -> Arc<dyn TrackLocal + Send + Sync> {
++    Arc::new(TrackLocalStaticSample::new(
++        codec.clone(),
++        id.to_owned(),
++        "myownmesh".to_owned(),
++    ))
++}
++
++async fn observe_add(
++    pc: &RTCPeerConnection,
++    codec: &RTCRtpCodecCapability,
++    id: &str,
++) -> AddOutcome {
++    match pc.add_track(track(codec, id)).await {
++        Ok(sender) => {
++            let attached = sender
++                .track()
++                .await
++                .is_some_and(|track| track.id() == id && track.kind() == RTPCodecType::Video);
++            if attached {
++                AddOutcome::Attached
++            } else {
++                AddOutcome::MissingOrWrongTrack
++            }
++        }
++        Err(error) => classify_refusal(error),
++    }
++}
++
++#[tokio::test]
++async fn native_sender_same_id_reopens_after_awaited_remove() {
++    // Match the native track tuple and initial ID used by the application path.
++    // No negotiation or packet is required to exercise add/remove eligibility.
++    let codec = RTCRtpCodecCapability {
++        mime_type: "video/H264".to_owned(),
++        clock_rate: 90_000,
++        channels: 0,
++        ..Default::default()
++    };
++    let mut media = MediaEngine::default();
++    let registered = media.register_codec(
++        RTCRtpCodecParameters {
++            capability: codec.clone(),
++            payload_type: 96,
++            ..Default::default()
++        },
++        RTPCodecType::Video,
++    );
++    assert!(registered.is_ok(), "native test codec registration refused");
++    let api = APIBuilder::new().with_media_engine(media).build();
++    let created = tokio::time::timeout(
++        NATIVE_TEST_BOUND,
++        api.new_peer_connection(RTCConfiguration::default()),
++    )
++    .await;
++    let pc = match created {
++        Ok(Ok(pc)) => pc,
++        Ok(Err(_)) => panic!("native test PC construction refused"),
++        Err(_) => panic!("native test PC construction exceeded its bound"),
++    };
++
++    // Capture every outcome first. No assertion or unwrap after acquiring the
++    // PC can skip the bounded native close below, including a typed refusal.
++    let sequence = tokio::time::timeout(NATIVE_TEST_BOUND, async {
++        let sender = pc
++            .add_track(track(&codec, SAME_ID))
++            .await
++            .map_err(|error| ("initial-add", classify_refusal(error)))?;
++        let initial_attached = sender
++            .track()
++            .await
++            .is_some_and(|track| track.id() == SAME_ID && track.kind() == RTPCodecType::Video);
++        pc.remove_track(&sender)
++            .await
++            .map_err(|error| ("awaited-remove", classify_refusal(error)))?;
++        let removed_track_absent = sender.track().await.is_none();
++        drop(sender);
++        let same_id = observe_add(&pc, &codec, SAME_ID).await;
++        // This same-kind/different-ID control isolates fresh sender creation
++        // from eligibility to reuse the removed sender's original track ID.
++        let different_id = observe_add(&pc, &codec, CONTROL_ID).await;
++        Ok::<_, SequenceFailure>(Observation {
++            initial_attached,
++            removed_track_absent,
++            same_id,
++            different_id,
++        })
++    })
++    .await;
++    let close = tokio::time::timeout(NATIVE_TEST_BOUND, pc.close()).await;
++    // Sequence futures and temporary sender/track handles are already gone.
++    // Close owns all senders retained by this PC, including an unexpected add.
++    drop(pc);
++    drop(api);
++
++    assert!(
++        matches!(close, Ok(Ok(()))),
++        "native PC close did not complete successfully"
++    );
++    let observed = match sequence {
++        Ok(Ok(observed)) => observed,
++        Ok(Err(error)) => panic!("native remove/reopen setup failed: {error:?}"),
++        Err(_) => panic!("native remove/reopen sequence exceeded its bound"),
++    };
++    assert!(
++        observed.initial_attached,
++        "initial native add did not attach the expected video track"
++    );
++    assert!(
++        observed.removed_track_absent,
++        "awaited native remove left a track installed"
++    );
++    assert_eq!(
++        observed.different_id,
++        AddOutcome::Attached,
++        "different-ID native control failed"
++    );
++    assert_eq!(
++        observed.same_id,
++        AddOutcome::Attached,
++        "same-ID native reopen refused after awaited remove"
++    );
++}
