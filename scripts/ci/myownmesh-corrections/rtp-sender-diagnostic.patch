@@ -1,0 +1,290 @@
+diff --git a/vendor/webrtc-0.13.0/src/track/track_local/mod.rs b/vendor/webrtc-0.13.0/src/track/track_local/mod.rs
+index 2c5ea8bf8da8636e3d8f4486551d7636828aec51..c64566791a9a9eb34be409df74a9d64f52a37779 100644
+--- a/vendor/webrtc-0.13.0/src/track/track_local/mod.rs
++++ b/vendor/webrtc-0.13.0/src/track/track_local/mod.rs
+@@ -22,6 +22,32 @@
+ use crate::error::{Error, Result};
+ use crate::rtp_transceiver::rtp_codec::*;
+ use crate::rtp_transceiver::*;
++
++static RTP_SENDER_INTERCEPTOR_BRANCH: std::sync::atomic::AtomicUsize =
++    std::sync::atomic::AtomicUsize::new(0);
++static RTP_SENDER_INTERCEPTOR_RESULT: std::sync::atomic::AtomicUsize =
++    std::sync::atomic::AtomicUsize::new(0);
++
++fn observe_rtp_sender_interceptor(
++    counter: &std::sync::atomic::AtomicUsize,
++    stage: &'static str,
++    payload_bytes: usize,
++    written_bytes: usize,
++    result: &'static str,
++) {
++    if !log::log_enabled!(target: "mesh_first_unit", log::Level::Debug) {
++        return;
++    }
++    if let Ok(ordinal) = counter.fetch_update(
++        std::sync::atomic::Ordering::Relaxed,
++        std::sync::atomic::Ordering::Relaxed,
++        |count| if count < 8 { Some(count + 1) } else { None },
++    ) {
++        log::debug!(target: "mesh_first_unit",
++            "MESH04_RTP_SENDER stage={} ordinal={} payload_bytes={} written_bytes={} result={}",
++            stage, ordinal, payload_bytes, written_bytes, result);
++    }
++}
+ 
+ /// TrackLocalWriter is the Writer for outbound RTP Packets
+ #[async_trait]
+@@ -183,13 +209,61 @@
+         attr: &Attributes,
+     ) -> Result<usize> {
+         if self.is_sender_paused() {
++            observe_rtp_sender_interceptor(
++                &RTP_SENDER_INTERCEPTOR_BRANCH,
++                "writer_branch",
++                pkt.payload.len(),
++                0,
++                "paused",
++            );
++            observe_rtp_sender_interceptor(
++                &RTP_SENDER_INTERCEPTOR_RESULT,
++                "writer_result",
++                pkt.payload.len(),
++                0,
++                "zero",
++            );
+             return Ok(0);
+         }
+ 
+         let interceptor_rtp_writer = self.interceptor_rtp_writer.lock().await;
+         if let Some(writer) = &*interceptor_rtp_writer {
+-            Ok(writer.write(pkt, attr).await?)
++            observe_rtp_sender_interceptor(
++                &RTP_SENDER_INTERCEPTOR_BRANCH,
++                "writer_branch",
++                pkt.payload.len(),
++                0,
++                "present",
++            );
++            let result = writer.write(pkt, attr).await;
++            let (written_bytes, category) = match &result {
++                Ok(0) => (0, "zero"),
++                Ok(bytes) => (*bytes, "nonzero"),
++                Err(_) => (0, "error"),
++            };
++            observe_rtp_sender_interceptor(
++                &RTP_SENDER_INTERCEPTOR_RESULT,
++                "writer_result",
++                pkt.payload.len(),
++                written_bytes,
++                category,
++            );
++            Ok(result?)
+         } else {
++            observe_rtp_sender_interceptor(
++                &RTP_SENDER_INTERCEPTOR_BRANCH,
++                "writer_branch",
++                pkt.payload.len(),
++                0,
++                "absent",
++            );
++            observe_rtp_sender_interceptor(
++                &RTP_SENDER_INTERCEPTOR_RESULT,
++                "writer_result",
++                pkt.payload.len(),
++                0,
++                "zero",
++            );
+             Ok(0)
+         }
+     }
+diff --git a/vendor/webrtc-0.13.0/src/track/track_local/track_local_static_rtp.rs b/vendor/webrtc-0.13.0/src/track/track_local/track_local_static_rtp.rs
+index 44e6de8ded2a177a5348696914c5f5b1fc1d5610..8ece400508edc04d0d56b2775d57f25957aa2e1c 100644
+--- a/vendor/webrtc-0.13.0/src/track/track_local/track_local_static_rtp.rs
++++ b/vendor/webrtc-0.13.0/src/track/track_local/track_local_static_rtp.rs
+@@ -6,6 +6,31 @@
+ 
+ use super::*;
+ use crate::error::flatten_errs;
++
++static RTP_SENDER_BINDING_STATE: std::sync::atomic::AtomicUsize =
++    std::sync::atomic::AtomicUsize::new(0);
++static RTP_SENDER_BINDING_SKIP: std::sync::atomic::AtomicUsize =
++    std::sync::atomic::AtomicUsize::new(0);
++
++fn observe_rtp_sender_binding(
++    counter: &std::sync::atomic::AtomicUsize,
++    stage: &'static str,
++    bindings: Option<usize>,
++    result: &'static str,
++) {
++    if !log::log_enabled!(target: "mesh_first_unit", log::Level::Debug) {
++        return;
++    }
++    if let Ok(ordinal) = counter.fetch_update(
++        std::sync::atomic::Ordering::Relaxed,
++        std::sync::atomic::Ordering::Relaxed,
++        |count| if count < 8 { Some(count + 1) } else { None },
++    ) {
++        log::debug!(target: "mesh_first_unit",
++            "MESH04_RTP_SENDER stage={} ordinal={} bindings={:?} result={}",
++            stage, ordinal, bindings, result);
++    }
++}
+ 
+ /// TrackLocalStaticRTP  is a TrackLocal that has a pre-set codec and accepts RTP Packets.
+ /// If you wish to send a media.Sample use TrackLocalStaticSample
+@@ -60,9 +85,20 @@
+ 
+     pub async fn all_binding_paused(&self) -> bool {
+         let bindings = self.bindings.lock().await;
+-        bindings
+-            .iter()
+-            .all(|b| b.sender_paused.load(Ordering::SeqCst))
++        let all_paused = bindings
++            .iter()
++            .all(|b| b.sender_paused.load(Ordering::SeqCst));
++        observe_rtp_sender_binding(
++            &RTP_SENDER_BINDING_STATE,
++            "binding_state",
++            Some(bindings.len()),
++            if all_paused {
++                "all-paused"
++            } else {
++                "not-all-paused"
++            },
++        );
++        all_paused
+     }
+ 
+     /// write_rtp_with_extensions writes a RTP Packet to the TrackLocalStaticRTP
+@@ -122,6 +158,12 @@
+ 
+         for b in bindings.into_iter() {
+             if b.is_sender_paused() {
++                observe_rtp_sender_binding(
++                    &RTP_SENDER_BINDING_SKIP,
++                    "binding_skip",
++                    None,
++                    "paused",
++                );
+                 // See caveat in function doc.
+                 continue;
+             }
+diff --git a/vendor/webrtc-0.13.0/src/track/track_local/track_local_static_sample.rs b/vendor/webrtc-0.13.0/src/track/track_local/track_local_static_sample.rs
+index 57b3c315ceab56e46f91e088d2f81354c2b66303..aefb829766d09c5845c5fe96c17e44d6179127e3 100644
+--- a/vendor/webrtc-0.13.0/src/track/track_local/track_local_static_sample.rs
++++ b/vendor/webrtc-0.13.0/src/track/track_local/track_local_static_sample.rs
+@@ -6,6 +6,36 @@
+ use super::*;
+ use crate::error::flatten_errs;
+ use crate::track::RTP_OUTBOUND_MTU;
++
++static RTP_SENDER_SAMPLE_STATE: std::sync::atomic::AtomicUsize =
++    std::sync::atomic::AtomicUsize::new(0);
++static RTP_SENDER_SAMPLE_PACKETS: std::sync::atomic::AtomicUsize =
++    std::sync::atomic::AtomicUsize::new(0);
++static RTP_SENDER_SAMPLE_RESULT: std::sync::atomic::AtomicUsize =
++    std::sync::atomic::AtomicUsize::new(0);
++
++fn observe_rtp_sender_sample(
++    counter: &std::sync::atomic::AtomicUsize,
++    stage: &'static str,
++    unit_bytes: usize,
++    any_paused: bool,
++    all_paused: bool,
++    packets: usize,
++    result: &'static str,
++) {
++    if !log::log_enabled!(target: "mesh_first_unit", log::Level::Debug) {
++        return;
++    }
++    if let Ok(ordinal) = counter.fetch_update(
++        std::sync::atomic::Ordering::Relaxed,
++        std::sync::atomic::Ordering::Relaxed,
++        |count| if count < 8 { Some(count + 1) } else { None },
++    ) {
++        log::debug!(target: "mesh_first_unit",
++            "MESH04_RTP_SENDER stage={} ordinal={} unit_bytes={} any_paused={} all_paused={} packets={} result={}",
++            stage, ordinal, unit_bytes, any_paused, all_paused, packets, result);
++    }
++}
+ 
+ #[derive(Debug, Clone)]
+ struct TrackLocalStaticSampleInternal {
+@@ -116,6 +146,19 @@
+             self.rtp_track.all_binding_paused().await,
+         );
+ 
++        observe_rtp_sender_sample(
++            &RTP_SENDER_SAMPLE_STATE,
++            "sample_state",
++            sample.data.len(),
++            any_paused,
++            all_paused,
++            0,
++            if all_paused {
++                "all-paused-zero-output"
++            } else {
++                "continue"
++            },
++        );
+         if all_paused {
+             // Abort already here to not increment sequence numbers.
+             return Ok(());
+@@ -161,11 +204,35 @@
+             if sample.prev_dropped_packets > 0 {
+                 packetizer.skip_samples(samples * sample.prev_dropped_packets as u32);
+             }
+-            packetizer.packetize(&sample.data, samples)?
++            let packetized = packetizer.packetize(&sample.data, samples);
++            let (count, result) = match &packetized {
++                Ok(packets) => (packets.len(), "packetized"),
++                Err(_) => (0, "packetize-error"),
++            };
++            observe_rtp_sender_sample(
++                &RTP_SENDER_SAMPLE_PACKETS,
++                "sample_packets",
++                sample.data.len(),
++                any_paused,
++                all_paused,
++                count,
++                result,
++            );
++            packetized?
+         } else {
++            observe_rtp_sender_sample(
++                &RTP_SENDER_SAMPLE_PACKETS,
++                "sample_packets",
++                sample.data.len(),
++                any_paused,
++                all_paused,
++                0,
++                "packetizer-absent",
++            );
+             vec![]
+         };
+ 
++        let diagnostic_packet_count = packets.len();
+         let mut write_errs = vec![];
+         for p in packets {
+             if let Err(err) = self
+@@ -177,7 +244,17 @@
+             }
+         }
+ 
+-        flatten_errs(write_errs)
++        let result = flatten_errs(write_errs);
++        observe_rtp_sender_sample(
++            &RTP_SENDER_SAMPLE_RESULT,
++            "sample_result",
++            sample.data.len(),
++            any_paused,
++            all_paused,
++            diagnostic_packet_count,
++            if result.is_ok() { "ok" } else { "write-error" },
++        );
++        result
+     }
+ 
+     /// Create a builder for writing samples with additional data.
