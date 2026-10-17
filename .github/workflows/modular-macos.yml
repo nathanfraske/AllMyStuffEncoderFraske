@@ -139,7 +139,7 @@ jobs:
           --artifacts '${{ runner.temp }}/mesh03-native-artifacts'
           --candidate-kind corrected
           --patch-set scripts/ci/myownmesh-corrections/patch-set.json
-          --patch-set-sha256 4cb553e829e61dab2858357b1a2c031a2cf5995d0e49eaa9770517c345a497e6
+          --patch-set-sha256 a9edda5de43430f4eb0407bad11352d9d7eeda4e36c866bdeb7298873e8fe279
       - name: Retain commands, native identities, media receipts and cleanup
         if: always()
         uses: actions/upload-artifact@v4
