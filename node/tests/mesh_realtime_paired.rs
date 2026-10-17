@@ -572,6 +572,42 @@ fn isolated_realtime_consumer_pair() {
             let mut a = context.session(&context.a).await;
             let mut b = context.session(&context.b).await;
             assert_ne!(a.session.generation(), generation);
+            // This is an explicit two-sided setup prerequisite after the old lifetime checks.
+            // Local ACTIVE still does not reserve the following inbound claim.
+            let replacement_b_timeout = context.realtime_policy().operation_timeout;
+            let replacement_b_wait_ms = u64::try_from(replacement_b_timeout.as_millis())
+                .unwrap()
+                .checked_sub(1000)
+                .unwrap();
+            let replacement_b_connected = paired::raw(
+                &context.b,
+                json!({"op":"network_connect_peer", "network":&context.network,
+                       "peer":&a_id, "pin":false, "wait_ms":replacement_b_wait_ms}),
+                replacement_b_timeout,
+            )
+            .await;
+            assert!(
+                replacement_b_connected.ok
+                    && replacement_b_connected
+                        .data
+                        .as_ref()
+                        .and_then(|data| data.get("active"))
+                        .and_then(Value::as_bool)
+                        == Some(true),
+                "one explicit replacement-B setup dial must reach ACTIVE; ok={}; active_shape={}; error_family={}",
+                replacement_b_connected.ok,
+                match replacement_b_connected.data.as_ref().and_then(|data| data.get("active")) {
+                    None => "absent",
+                    Some(Value::Bool(false)) => "false",
+                    Some(Value::Bool(true)) => "true",
+                    Some(_) => "not_bool",
+                },
+                match replacement_b_connected.error.as_deref() {
+                    None => "absent",
+                    Some(error) if error.starts_with("unknown network:") => "unknown_network",
+                    Some(_) => "other",
+                }
+            );
             let (state_a, state_b, video, audio) = approve_pair(&a_id, &b_id, 2);
             let mut sink = RealtimeAvRoute::open(
                 &mut b.session,
