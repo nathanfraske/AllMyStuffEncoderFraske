@@ -412,3 +412,120 @@ root locks after the commands. The regression patch, all four test bodies,
 corrected source manifest `4cb553e8...`, daemon build and strict AV predicates
 are unchanged. The canonical core controls already have their separate
 before/after result; this recipe correction requests no repeat of those tests.
+
+The current final candidate extends the earlier four-patch input
+`4cb553e829e61dab2858357b1a2c031a2cf5995d0e49eaa9770517c345a497e6`.
+That earlier input and its native results remain historical evidence. The
+current `patch-set.json` is kind `corrected`, with raw LF SHA256
+`a9edda5de43430f4eb0407bad11352d9d7eeda4e36c866bdeb7298873e8fe279` and exact resulting tree `c87e382172530f898a0f351557c24552926daad1`.
+It covers owner cleanup, startup first bind and sender reopen source. Strict
+native AV, reconnect and relay qualification remain pending. Temporary
+flow-bind/refusal/first-unit observation patches are absent from this input.
+
+The first four ordered records are byte/data-identical to the retained
+four-patch manifest. Record five is the independently accepted
+`sender-reopen-fix.patch`, raw SHA256 `4e93bbc7e96ae871fd53b40b1eeaf4204e162116c4c0ff9582ab07de4017e012`, applied from
+`bdbf1b96c7809107bd3a151b2ccf9bcad9ace73a` to `717d7a360f9ce8196b17cb75cfee8f00e54bf50e`.
+Record six is the unchanged stamped test export from original
+`eec65c8209109740e4edc2f4a86f3cac51688f97`,
+`sender-reopen-regression.patch`, raw SHA256
+`978d54016c38e318043eaf4bb03dc28eb0146dca665ef2a7442ccab301650173`.
+Its declared before/after trees reflect its position after the production
+patch: `717d7a360f9ce8196b17cb75cfee8f00e54bf50e` to `c87e382172530f898a0f351557c24552926daad1`. The patch bytes and test child
+blob `1895c20ec3df068233a2e634f6b66f934eeb5fea` are unchanged. All six records
+retain the canonical root lock SHA256 `8f5a30ce...`; no manifest, dependency,
+test predicate, media vector, pace, resource ceiling or product pin changes.
+
+The sender control has two retained native results. The original unnegotiated
+fixture at tree `e64f9bf4e6fec84bcba4e787120500f68c212cd3` passed one test in
+`0.020771` seconds. Its expected-negative wrapper failed because the fixture
+did not reach the reuse precondition; audit SHA256
+`4f62b1fb228dffd8e585b99b018614e5ddf2b874ba1951f350f0ea97bc2833a3`.
+The stamped fixture at tree `31313a0c0a071d6f97522fde65cc3eb163c788d2` then
+produced the intended native failure: zero passed, one failed, 1087 filtered,
+exit 101 in `0.049043` seconds. Expected-negative wrapper run `4a943301`
+passed; audit SHA256
+`51045a276f8d588870398466021f227152b68b2d9b83256a4dc5ece22c1f7731`.
+The final same-ID `Attached` assertion observed `RefusedIncorrectEnvelope`
+after the offer MSID, initial attachment/removal, different-ID `Attached`
+control and bounded successful PC close. These are native lifecycle results;
+the earlier unnegotiated passing result remains valid control history. The
+original `f76a69d3` receive timeout is a separate unresolved observation.
+
+Use the final reviewed application task commit containing the accepted new
+production export, unchanged stamped regression and this selected manifest.
+Materialize all selected manifest/patch files as their exact canonical LF
+bytes; rehash their raw contents before preparation. The existing helper
+records actual patched source identity, ordered trees and `source_commit:null`.
+Preserve the earlier test-only `e66706be...` manifest and every historical
+failure/source/receipt. No diagnostic/test-only receipt qualifies the final
+release artifact.
+
+One newly prepared final source may serve the canonical unit gate and release
+build. The manager reserved `C:/ams-mesh04-sender-reuse-corrected-0b4ac426`
+and its unique `C:/ams-mesh04-sender-reuse-corrected-target-0b4ac426` target.
+Its pristine preparation receipt is
+`target/mesh04-correctness/sender-reuse-corrected-lf-base-preparation.json`
+in the manager's evidence tree. Verify that actual source is still exact
+db/tree5492/canonical8f5 before the first preparation; preserve a failed input
+rather than recreating it. Select a new outside evidence directory. Apply the complete
+manifest once with the existing `prepare` command above, selecting the exact
+current SHA256 `a9edda5de43430f4eb0407bad11352d9d7eeda4e36c866bdeb7298873e8fe279`, and retain its new source-receipt SHA.
+Never run `prepare` again on that patched source. Use the same selected source
+receipt with `verify` immediately before and after every following command.
+Stop on a failed or ambiguous verification and inspect that exact state.
+
+With the source root as cwd and that explicit private `CARGO_TARGET_DIR`,
+the one changed canonical core gate builds with the existing locked graph:
+
+```sh
+cargo +1.88.0 test --locked --no-default-features -p myownmesh-core --lib --no-run --message-format=json
+```
+
+Select the actual `myownmesh-core` library test executable from complete Cargo
+JSON, recording its package/target/source, SHA256 and bytes. Its full test name
+is unchanged. Require exactly one listed and executed unignored case:
+
+```sh
+"$mesh04_actual_core_test_executable" transport::webrtc::tests::sender_reopen_regression:: --list --format terse
+"$mesh04_actual_core_test_executable" --exact transport::webrtc::tests::sender_reopen_regression::native_sender_same_id_reopens_after_awaited_remove --nocapture --test-threads=1
+```
+
+The final candidate must exit zero with one passed and zero failed or ignored.
+An absent name, unrelated setup/control/close failure or wrapper-only success
+does not satisfy it. The already retained meaningful baseline negative is the
+comparison; this sequence requests no identical baseline or startup-control
+rerun. Keep the complete unit build/list/runtime receipts, EOF streams,
+artifact identity and before/after source verification separate from the
+daemon release receipts. `record-build` is for the exact daemon build command,
+not for this unit executable.
+
+After the unit gate and its source re-verification pass, retain the same
+source receipt and manager-selected target. Debug unit and release artifacts
+have separate profiles and separate retained receipts. Run the exact
+stock-feature command from that source root:
+
+```sh
+cargo +1.88.0 build --locked --release --no-default-features -p myownmesh --bin myownmesh
+```
+
+Reverify that source and its canonical lock, then use the existing
+`record-build` command above with the actual complete release command receipt,
+stock executable and Rust/Cargo evidence. Retain a new build-v1 receipt and
+its whole-file SHA; the source and ordered patches must match the final
+selected manifest. The actual command receipt records the source cwd and
+complete streams. No unit result or an older candidate binary substitutes for
+this release evidence. A separately selected transport-lab build keeps its
+own target, feature set, before/after verification and build receipt.
+
+The native driver and exact task-branch workflow still bind the previous
+four-patch identity until their separately reviewed binding refresh. Hold that
+refresh until this final manifest is frozen and the central component result
+is available. The refreshed route must pin this exact six-record manifest,
+result tree and honest scope, retaining existing stock/cumulative routing.
+It must not accept an arbitrary hash, partial scope or diagnostic candidate.
+The unchanged strict transport and node AV gates then require their actual
+received payload/SEI/order/clock/decode, independent lifetime, refusal,
+pressure, cancel/reconnect and selected direct/relay evidence. Source or unit
+passes do not qualify those gates, and no installed service or upstream
+publication is part of this recipe.
