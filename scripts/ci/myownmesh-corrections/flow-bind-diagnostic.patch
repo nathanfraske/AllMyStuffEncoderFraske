@@ -1,0 +1,336 @@
+diff --git a/crates/myownmesh-core/src/engine/handshake.rs b/crates/myownmesh-core/src/engine/handshake.rs
+index 91c68a376cbb93494be1914f216882cd9f271019..cc67148b80382ef6c2ffbee0d39a9463e2db6bc5 100644
+--- a/crates/myownmesh-core/src/engine/handshake.rs
++++ b/crates/myownmesh-core/src/engine/handshake.rs
+@@ -1003,6 +1003,7 @@ async fn maybe_activate_after_check_with_persistence<F, P>(
+             format!("{} ACTIVE", super::short_peer(device_id)),
+             serde_json::json!({ "peer": device_id }),
+         );
++        crate::transport::WebRtcConnectorWorker::observe_flow_bind_active(owner.worker());
+         state.emit(MeshEvent::Peer(PeerEvent::Approved {
+             network_id: state.network_id.clone(),
+             device_id: device_id.to_string(),
+diff --git a/crates/myownmesh-core/src/transport/webrtc.rs b/crates/myownmesh-core/src/transport/webrtc.rs
+index 2eff2e153bd7d520c891e155370000ebc77da479..3ae40fa257e2ef01d283641ac04b2c54d8350738 100644
+--- a/crates/myownmesh-core/src/transport/webrtc.rs
++++ b/crates/myownmesh-core/src/transport/webrtc.rs
+@@ -1880,6 +1880,55 @@ fn native_rtp_kind(kind: RTPCodecType) -> Option<WebRtcRtpKind> {
+     }
+ }
+ 
++// Diagnostic metadata only. These integers never participate in admission,
++// ownership, lookup, or a protocol message. Each observation category is capped
++// independently at eight per process; zero means an ordinal was unavailable.
++static FLOW_BIND_CONNECTOR_ORDINAL: std::sync::atomic::AtomicUsize =
++    std::sync::atomic::AtomicUsize::new(0);
++static FLOW_BIND_PUMP_ORDINAL: std::sync::atomic::AtomicUsize =
++    std::sync::atomic::AtomicUsize::new(0);
++static FLOW_BIND_ATTACH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
++static FLOW_BIND_WAIT_ENTER: std::sync::atomic::AtomicUsize =
++    std::sync::atomic::AtomicUsize::new(0);
++static FLOW_BIND_WAIT_END: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
++static FLOW_BIND_FIRST_STEP: std::sync::atomic::AtomicUsize =
++    std::sync::atomic::AtomicUsize::new(0);
++static FLOW_BIND_FIRST_UNIT: std::sync::atomic::AtomicUsize =
++    std::sync::atomic::AtomicUsize::new(0);
++static FLOW_BIND_PUMP_END: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
++static FLOW_BIND_ACTIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
++static FLOW_BIND_RETIRE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
++
++fn flow_bind_next_ordinal(counter: &std::sync::atomic::AtomicUsize) -> usize {
++    counter
++        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
++            value.checked_add(1)
++        })
++        .map_or(0, |previous| previous + 1)
++}
++
++fn observe_flow_bind(
++    counter: &std::sync::atomic::AtomicUsize,
++    connector_ordinal: usize,
++    pump_ordinal: usize,
++    stage: &'static str,
++    result: &'static str,
++    bytes: usize,
++) {
++    if tracing::enabled!(target: "mesh_first_unit", tracing::Level::DEBUG) {
++        if let Ok(ordinal) = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
++            if count < 8 {
++                Some(count + 1)
++            } else {
++                None
++            }
++        }) {
++            tracing::debug!(target: "mesh_first_unit", stage, ordinal,
++                connector_ordinal, pump_ordinal, result, bytes, "MESH04_FLOW_BIND");
++        }
++    }
++}
++
+ /// Drain one outbound session flow onto its negotiated native track, and retire
+ /// that track when the flow ends.
+ ///
+@@ -1930,24 +1979,56 @@ fn spawn_outbound_realtime_pump(
+     retired: tokio::sync::oneshot::Sender<()>,
+ ) {
+     let close_owner = Arc::clone(&track.close_owner);
++    let diagnostic_connector = track.incarnation.flow_bind_diagnostic_ordinal;
++    let diagnostic_pump = flow_bind_next_ordinal(&FLOW_BIND_PUMP_ORDINAL);
++    observe_flow_bind(
++        &FLOW_BIND_ATTACH,
++        diagnostic_connector,
++        diagnostic_pump,
++        "pump_attach",
++        "pump-claimed",
++        0,
++    );
+     let task = tokio::spawn(async move {
+         // One exit point, so "retire on every exit" is structural rather than a
+         // rule each `return` has to remember. The inner block produces nothing;
+         // everything after it runs however it ended.
+         let incarnation = Arc::clone(&track.incarnation);
+         let native = Arc::clone(&track.track);
++        let mut diagnostic_end = "waiting";
++        let mut diagnostic_first_step = true;
++        let mut diagnostic_first_unit = true;
+         async {
+             // Keep accepted units and their leases in the existing queue while
+             // negotiation binds the native track. Closing the exact owner or
+             // retiring the connector cancels this wait, then the common tail
+             // below still removes the native sender and completes retirement.
++            observe_flow_bind(
++                &FLOW_BIND_WAIT_ENTER,
++                diagnostic_connector,
++                diagnostic_pump,
++                "bind_wait_enter",
++                diagnostic_end,
++                0,
++            );
+             let bound = tokio::select! {
+                 biased;
+-                () = pump.closed() => false,
++                () = pump.closed() => {
++                    diagnostic_end = "queue-ended";
++                    observe_flow_bind(&FLOW_BIND_WAIT_END, diagnostic_connector, diagnostic_pump,
++                        "bind_wait_end", "queue-ended", 0);
++                    false
++                },
+                 ready = await_until_connector_retirement(
+                     incarnation.subscribe_retirement(),
+                     native.wait_for_first_bind(),
+-                ) => ready.is_some(),
++                ) => {
++                    let bound = ready.is_some();
++                    diagnostic_end = if bound { "bound" } else { "connector-retired" };
++                    observe_flow_bind(&FLOW_BIND_WAIT_END, diagnostic_connector, diagnostic_pump,
++                        "bind_wait_end", diagnostic_end, 0);
++                    bound
++                },
+             };
+             if !bound {
+                 return;
+@@ -1955,11 +2036,34 @@ fn spawn_outbound_realtime_pump(
+             loop {
+                 match pump.next() {
+                     session_flow::RealtimePumpStep::Unit(unit) => {
++                        if diagnostic_first_step {
++                            diagnostic_first_step = false;
++                            observe_flow_bind(
++                                &FLOW_BIND_FIRST_STEP,
++                                diagnostic_connector,
++                                diagnostic_pump,
++                                "first_queue_step",
++                                "unit",
++                                unit.data.len(),
++                            );
++                        }
++                        if diagnostic_first_unit {
++                            diagnostic_first_unit = false;
++                            observe_flow_bind(
++                                &FLOW_BIND_FIRST_UNIT,
++                                diagnostic_connector,
++                                diagnostic_pump,
++                                "first_queue_unit",
++                                "unit",
++                                unit.data.len(),
++                            );
++                        }
+                         // Checked per unit rather than once at attach. A pump
+                         // that proved liveness only when it started would keep
+                         // writing for as long as the application kept feeding
+                         // it.
+                         if !incarnation.is_active() {
++                            diagnostic_end = "connector-retired";
+                             return;
+                         }
+                         if native
+@@ -1973,15 +2077,42 @@ fn spawn_outbound_realtime_pump(
+                         {
+                             // The native track is gone. Ending is the whole
+                             // response; the retirement below still runs.
++                            diagnostic_end = "native-write-error";
+                             return;
+                         }
+                     }
+                     // Nothing queued on a live flow is idle, not closed. Park.
+-                    session_flow::RealtimePumpStep::Empty => pump.ready().await,
++                    session_flow::RealtimePumpStep::Empty => {
++                        if diagnostic_first_step {
++                            diagnostic_first_step = false;
++                            observe_flow_bind(
++                                &FLOW_BIND_FIRST_STEP,
++                                diagnostic_connector,
++                                diagnostic_pump,
++                                "first_queue_step",
++                                "empty",
++                                0,
++                            );
++                        }
++                        pump.ready().await
++                    }
+                     // Terminal. The flow, and so the session, is gone. This is
+                     // the implicit case too: a dropped flow set drops the
+                     // queue, which lands here.
+-                    session_flow::RealtimePumpStep::Closed => return,
++                    session_flow::RealtimePumpStep::Closed => {
++                        if diagnostic_first_step {
++                            observe_flow_bind(
++                                &FLOW_BIND_FIRST_STEP,
++                                diagnostic_connector,
++                                diagnostic_pump,
++                                "first_queue_step",
++                                "closed",
++                                0,
++                            );
++                        }
++                        diagnostic_end = "queue-ended";
++                        return;
++                    }
+                 }
+             }
+         }
+@@ -1989,6 +2120,16 @@ fn spawn_outbound_realtime_pump(
+         // However that ended, the native half goes back. `retire` consumes the
+         // track, so this cannot run twice.
+         track.retire().await;
++        // This marks return from the existing retirement call, not successful
++        // RTP delivery or proof that remove_track itself returned Ok.
++        observe_flow_bind(
++            &FLOW_BIND_PUMP_END,
++            diagnostic_connector,
++            diagnostic_pump,
++            "pump_end",
++            diagnostic_end,
++            0,
++        );
+         // Last, and only after the detach has completed, so a waiting closer
+         // that observes this has observed a finished retirement rather than a
+         // scheduled one. Nobody may be waiting — implicit drop has no closer —
+@@ -2005,6 +2146,8 @@ fn spawn_outbound_realtime_pump(
+ pub(crate) struct WebRtcConnectorIncarnation {
+     active: AtomicBool,
+     retired: watch::Sender<bool>,
++    // One inline usize of diagnostic shape overhead; never authority/custody.
++    flow_bind_diagnostic_ordinal: usize,
+     /// The transport-independent identity for this same incarnation.
+     ///
+     /// Owned here rather than replacing this type, so the WebRTC worker keeps
+@@ -2022,6 +2165,7 @@ impl WebRtcConnectorIncarnation {
+         Self {
+             active: AtomicBool::new(true),
+             retired,
++            flow_bind_diagnostic_ordinal: flow_bind_next_ordinal(&FLOW_BIND_CONNECTOR_ORDINAL),
+             generic: crate::connector::ConnectorIncarnation::new(),
+         }
+     }
+@@ -2029,6 +2173,14 @@ impl WebRtcConnectorIncarnation {
+     fn retire(&self) {
+         self.active.store(false, Ordering::Release);
+         self.retired.send_replace(true);
++        observe_flow_bind(
++            &FLOW_BIND_RETIRE,
++            self.flow_bind_diagnostic_ordinal,
++            0,
++            "connector_retire",
++            "retired",
++            0,
++        );
+     }
+ 
+     /// The transport-independent identity for this exact incarnation.
+@@ -5285,6 +5437,26 @@ impl session_flow::RealtimeSessionBinding for crate::runtime::session_broker::Se
+ }
+ 
+ impl WebRtcConnectorWorker {
++    // Log the exact already-captured ACTIVE worker without lending an identity
++    // accessor or resolving a peer name. An unstamped owner stays unknown.
++    pub(crate) fn observe_flow_bind_active(worker: Option<&Arc<Self>>) {
++        let (connector_ordinal, result) = match worker {
++            Some(worker) => (
++                worker.ownership.incarnation.flow_bind_diagnostic_ordinal,
++                "worker-stamped",
++            ),
++            None => (0, "worker-unstamped"),
++        };
++        observe_flow_bind(
++            &FLOW_BIND_ACTIVE,
++            connector_ordinal,
++            0,
++            "connector_active",
++            result,
++            0,
++        );
++    }
++
+     /// Reserve exact finite work against this connector's attempt owner before
+     /// parsing an endpoint protocol frame.
+     pub(crate) fn reserve_attempt_work(
+diff --git a/crates/myownmesh/src/control/realtime_pipe.rs b/crates/myownmesh/src/control/realtime_pipe.rs
+index 2119e784e1a8c2b7d2ef720610b5bae4a68f2ce3..cc5f998fa29bd3206c01fc7d46623c5743508f8b 100644
+--- a/crates/myownmesh/src/control/realtime_pipe.rs
++++ b/crates/myownmesh/src/control/realtime_pipe.rs
+@@ -27,6 +27,9 @@ use super::{ControlState, FrameAdmission, RealtimePipeDirection, REALTIME_FRAME_
+ 
+ const REALTIME_BUFFER_ALLOCATIONS: u64 = 1;
+ 
++static FLOW_BIND_IPC_OBSERVATIONS: std::sync::atomic::AtomicUsize =
++    std::sync::atomic::AtomicUsize::new(0);
++
+ /// What one realtime pipe is bound to, once its fields have been checked
+ /// against its direction.
+ ///
+@@ -274,6 +277,7 @@ where
+             duration: std::time::Duration::from_micros(u64::from(duration_us)),
+             data: body.slice(payload_range),
+         };
++        let diagnostic_bytes = outbound.data.len();
+         // Lent for exactly this unit and never held: the borrow ends with the
+         // closure, so the daemon's stored handle stays the only one and a close
+         // arriving on another connection is not racing a copy.
+@@ -291,6 +295,26 @@ where
+             }
+             net.send_webrtc_realtime(flow, outbound).map_err(Some)
+         });
++        if tracing::enabled!(target: "mesh_first_unit", tracing::Level::DEBUG) {
++            if let Ok(ordinal) = FLOW_BIND_IPC_OBSERVATIONS.fetch_update(
++                std::sync::atomic::Ordering::Relaxed,
++                std::sync::atomic::Ordering::Relaxed,
++                |count| if count < 8 { Some(count + 1) } else { None },
++            ) {
++                let result = match &sent {
++                    Some(Ok(())) => "accepted",
++                    None => "owner-absent",
++                    Some(Err(None)) => "label-mismatch",
++                    Some(Err(Some(core_realtime::RealtimeRefusal::SessionNotCurrent))) => {
++                        "session-not-current"
++                    }
++                    Some(Err(Some(_))) => "unit-refused",
++                };
++                tracing::debug!(target: "mesh_first_unit", stage = "ipc_admission",
++                    ordinal, bytes = diagnostic_bytes, accepted = matches!(&sent, Some(Ok(()))),
++                    result, "MESH04_FLOW_BIND");
++            }
++        }
+         let Some(sent) = sent else {
+             // The flow was closed while this pipe was running — by this client
+             // on another connection, or by its disconnect drain. There is
