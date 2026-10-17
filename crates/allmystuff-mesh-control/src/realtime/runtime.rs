@@ -734,3 +734,6 @@ impl fmt::Debug for InboundPipe {
             .finish()
     }
 }
+
+#[cfg(test)]
+mod send_regression;
