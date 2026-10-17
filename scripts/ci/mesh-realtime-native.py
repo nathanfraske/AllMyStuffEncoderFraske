@@ -336,6 +336,10 @@ def main():
         commands.run("valid-codec-vectors", [str(node_probe), "--ignored", "--exact", "prepare_realtime_pair_vectors",
                      "--nocapture", "--test-threads=1"], root, vector_env)
         receipt["payload_manifest_sha256"] = digest(vectors / "vectors.json")
+        pair_env = dict(env, ALLMYSTUFF_MESH_REALTIME_FAILURE_DIAGNOSTICS="1")
+        receipt["app_failure_diagnostics"] = {
+            "ALLMYSTUFF_MESH_REALTIME_FAILURE_DIAGNOSTICS": "1",
+        }
         for kind, probe in [("transport", bare_probe), ("consumer", node_probe)]:
             commands.run(kind + "-pair", [sys.executable, str(root / "scripts/ci/mesh-control-paired.py"),
                          "--daemon", str(daemon), "--daemon-sha256", digest(daemon),
@@ -343,7 +347,7 @@ def main():
                          "--probe", str(probe), "--probe-sha256", digest(probe), "--probe-kind", kind,
                          "--app-commit", app_head, "--policy", str(root / "scripts/ci/mesh-control-paired-policy.json"),
                          "--vectors", str(vectors / "vectors.json"), "--private-parent", str(private),
-                         "--output", str(output / (kind + "-pair")), "--signaling-port", "18475", "--mode", "direct"], root, env)
+                         "--output", str(output / (kind + "-pair")), "--signaling-port", "18475", "--mode", "direct"], root, pair_env)
             paired = json.loads((output / (kind + "-pair/receipt.json")).read_text())
             if (paired["result"] != "passed" or paired["cleanup_errors"]
                     or paired["cleanup"] != "owned_root_removed_after_all_children_reaped"):

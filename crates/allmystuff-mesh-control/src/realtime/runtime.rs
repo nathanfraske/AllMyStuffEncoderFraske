@@ -427,6 +427,11 @@ async fn settle_failed_open(shared: &Arc<Shared>, flow: &Arc<FlowState>) -> Resu
     }
 }
 
+fn failure_diagnostics_enabled() -> bool {
+    std::env::var_os("ALLMYSTUFF_MESH_REALTIME_FAILURE_DIAGNOSTICS").as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+}
+
 async fn close_exact(shared: &Arc<Shared>, flow: &Arc<FlowState>) -> Result<()> {
     let capability = {
         let mut record = flow.record.lock();
@@ -453,7 +458,33 @@ async fn close_exact(shared: &Arc<Shared>, flow: &Arc<FlowState>) -> Result<()> 
         // It cannot resolve a successor by peer or label and is never retried.
         let response = wire::exchange(shared, &line, false)
             .await
-            .map_err(|failure| failure.error)?;
+            .map_err(|failure| {
+                if failure_diagnostics_enabled() {
+                    let write_attempted = failure.sent;
+                    let error_family = match &failure.error {
+                        RealtimeError::InvalidPolicy(_) => "invalid_policy",
+                        RealtimeError::InvalidInput(_) => "invalid_input",
+                        RealtimeError::UnsupportedContract => "unsupported_contract",
+                        RealtimeError::StaleSession => "stale_session",
+                        RealtimeError::SessionFenced => "session_fenced",
+                        RealtimeError::LimitExceeded(_) => "limit_exceeded",
+                        RealtimeError::Refused { .. } => "refused",
+                        RealtimeError::InvalidResponse(_) => "invalid_response",
+                        RealtimeError::Transport => "transport",
+                        RealtimeError::Timeout => "timeout",
+                        RealtimeError::PipeEnded(_) => "pipe_ended",
+                        RealtimeError::CleanupUncertain => "cleanup_uncertain",
+                    };
+                    let _ = std::io::Write::write_fmt(
+                        &mut std::io::stderr(),
+                        format_args!(
+                            "MESH_REALTIME_FAILURE_DIAGNOSTIC seam=close_exchange write_attempted={} error_family={}\n",
+                            write_attempted, error_family,
+                        ),
+                    );
+                }
+                failure.error
+            })?;
         if !response.ok || response.error.is_some() {
             return Err(wire::refusal(shared, &response, Some(&capability)));
         }
@@ -501,7 +532,19 @@ fn spawn_monitor(
             result = reader.read(&mut byte) => match result {
                 Ok(0) => PipeEnd::RemoteClosed,
                 Ok(_) => PipeEnd::InvalidData,
-                Err(_) => PipeEnd::IoFailure,
+                Err(error) => {
+                    if failure_diagnostics_enabled() {
+                        let error_kind = error.kind();
+                        let _ = std::io::Write::write_fmt(
+                            &mut std::io::stderr(),
+                            format_args!(
+                                "MESH_REALTIME_FAILURE_DIAGNOSTIC seam=outbound_monitor_read error_kind={:?}\n",
+                                error_kind,
+                            ),
+                        );
+                    }
+                    PipeEnd::IoFailure
+                },
             },
         };
         state.signal(end);

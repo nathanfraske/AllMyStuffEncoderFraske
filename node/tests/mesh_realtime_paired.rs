@@ -327,14 +327,29 @@ async fn send_audio(sender: &mut AudioSender<'_>, units: &[Unit]) {
     }
 }
 
-async fn receive(context: &Context, route: &mut RealtimeAvRoute, prefix: &str) -> Value {
+async fn receive(
+    context: &Context,
+    route: &mut RealtimeAvRoute,
+    prefix: &str,
+    phase: &'static str,
+) -> Value {
     let mut video = Vec::new();
     let mut audio = Vec::new();
     let mut observations = Vec::new();
     let mut video_prior = None;
     let mut audio_prior = None;
     while video.len() < context.video.len() || audio.len() < context.audio.len() {
-        match route.recv().await.unwrap() {
+        match route.recv().await.unwrap_or_else(|error| {
+            let error_family = match &error {
+                AvRouteError::Realtime(RealtimeError::Timeout) => "timeout",
+                _ => "other",
+            };
+            panic!(
+                "consumer receive failed; phase={phase}; video_completed={}; audio_completed={}; error_family={error_family}",
+                video.len(),
+                audio.len(),
+            );
+        }) {
             ReceivedAvUnit::Video(unit) => {
                 assert!(video.len() < context.video.len(), "extra video AU");
                 let expected = &context.video[video.len()];
@@ -400,6 +415,7 @@ async fn transfer(
     source: &mut RealtimeAvRoute,
     sink: &mut RealtimeAvRoute,
     prefix: &str,
+    phase: &'static str,
 ) -> Value {
     let (mut video, mut audio) = source.split_senders().unwrap();
     let sending = async {
@@ -408,7 +424,7 @@ async fn transfer(
             send_audio(&mut audio, &context.audio)
         );
     };
-    let ((), receipt) = tokio::join!(sending, receive(context, sink, prefix));
+    let ((), receipt) = tokio::join!(sending, receive(context, sink, prefix, phase));
     receipt
 }
 
@@ -486,7 +502,7 @@ fn isolated_realtime_consumer_pair() {
             )
             .await
             .unwrap();
-            let initial = transfer(&context, &mut source, &mut sink, "consumer").await;
+            let initial = transfer(&context, &mut source, &mut sink, "consumer", "initial").await;
             let initial_path = paired::selected_paths(&context, &a_id, &b_id).await;
             let mut video_termination = source.video_termination();
             let mut audio_termination = source.audio_termination();
@@ -623,7 +639,14 @@ fn isolated_realtime_consumer_pair() {
             )
             .await
             .unwrap();
-            let after_restart = transfer(&context, &mut source, &mut sink, "consumer").await;
+            let after_restart = transfer(
+                &context,
+                &mut source,
+                &mut sink,
+                "consumer",
+                "after_restart",
+            )
+            .await;
             let after_restart_path = paired::selected_paths(&context, &a_id, &b_id).await;
             source.close().await.unwrap();
             sink.close().await.unwrap();
