@@ -334,9 +334,15 @@ fn isolated_realtime_pair() {
                 .wait(context.realtime_policy().io_timeout)
                 .await
                 .unwrap();
+            let (write_category, write_end): (&'static str, Option<PipeEnd>) = match &write_result {
+                Ok(()) => ("ok", None),
+                Err(RealtimeError::Transport) => ("transport", None),
+                Err(RealtimeError::PipeEnded(reason)) => ("pipe-ended", Some(*reason)),
+                Err(_) => ("other", None),
+            };
             assert!(
                 matches!(end, PipeEnd::RemoteClosed),
-                "require actual remote pipe termination; observed {end:?}"
+                "require actual remote pipe termination; observed {end:?}; write category {write_category}; write end {write_end:?}"
             );
             assert!(
                 a.session.registration().is_active(),
