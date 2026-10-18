@@ -1,0 +1,23 @@
+diff --git a/crates/myownmesh-core/src/engine/mod.rs b/crates/myownmesh-core/src/engine/mod.rs
+index 308e2077ae769df31d82de259aae074d5baf431f..1bb9839417d42edba87839ce2db8dc4eb06ee525 100644
+--- a/crates/myownmesh-core/src/engine/mod.rs
++++ b/crates/myownmesh-core/src/engine/mod.rs
+@@ -3036,8 +3036,16 @@
+         );
+         if already_active {
+             reply.finish(Ok(()));
+-        } else if !state.register_connect_waiter(device_id, reply) {
+-            return;
++        } else {
++            let waiter_registered = state.register_connect_waiter(device_id, reply);
++            debug!(
++                target: "mesh_first_unit",
++                "MESH04_CONNECT_WAITER_REGISTRATION_RESULT waiter_registered={}",
++                waiter_registered,
++            );
++            if !waiter_registered {
++                return;
++            }
+         }
+     }
+     match begin_hub_connection_demand(state, device_id).await {
