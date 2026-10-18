@@ -627,7 +627,21 @@ fn isolated_realtime_consumer_pair() {
                 },
                 match replacement_b_connected.error.as_deref() {
                     None => "absent",
+                    Some("network: engine dropped the connect wait") => "engine_wait_dropped",
+                    Some("network: application connection demand expired") => "introduction_wait_expired",
+                    Some("network: connection demand did not become ready") => "demand_not_ready",
+                    Some("network: connect waiter identity exhausted") => "waiter_identity_exhausted",
+                    Some("network: application connection waiter capacity exhausted") => "waiter_capacity",
+                    Some("network: connect waiter peer identity is not representable") => "waiter_identity_unrepresentable",
+                    Some(error) if error.starts_with("network: connect to ")
+                        && error.contains(" still pending after ") => "native_outer_wait_expired",
+                    Some(error) if error.starts_with("control request parse was not admitted: ") => "request_parse_admission",
+                    Some(error) if error.starts_with("parse: ") => "request_decode",
+                    Some(error) if error.starts_with("identity: ") => "identity_input",
+                    Some(error) if error.starts_with("resource unavailable: ") => "resource_unavailable",
+                    Some(error) if error.starts_with("resource mailbox admission: ") => "mailbox_admission",
                     Some(error) if error.starts_with("unknown network:") => "unknown_network",
+                    Some(error) if error.starts_with("network: ") => "network_other",
                     Some(_) => "other",
                 }
             );
