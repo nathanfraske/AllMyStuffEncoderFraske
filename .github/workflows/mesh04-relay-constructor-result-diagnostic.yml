@@ -1,0 +1,76 @@
+name: MESH04 private relay constructor-result diagnostic
+
+on:
+  push:
+    branches:
+      - agent/1503a621-mesh04-relay-constructor-result-diagnostic
+
+permissions:
+  contents: read
+
+jobs:
+  relay-constructor-result-diagnostic:
+    name: Relay constructor-result diagnostic (${{ matrix.runner }}, ${{ matrix.probe }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            python: python
+            probe: transport
+          - runner: windows-latest
+            python: python
+            probe: consumer
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    env:
+      CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Preserve exact source and selected policy bytes
+        shell: bash
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: nathanfraske/MyOwnMeshSecurityReview
+          ref: db7818e09fedd98899490347b86ac9bc9f97b59b
+          path: target/mesh04-relay-constructor-result-diagnostic-${{ matrix.runner }}-${{ matrix.probe }}-upstream
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88.0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Native Linux build prerequisites from existing project recipes
+        if: runner.os == 'Linux'
+        timeout-minutes: 8
+        shell: bash
+        run: |
+          set -euo pipefail
+          # bootstrap.sh and mesh-control-setup-linux.sh, captureless subset.
+          sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y --no-install-recommends build-essential pkg-config cmake
+      - name: Run one strict private relay constructor-result diagnostic
+        timeout-minutes: 78
+        shell: bash
+        run: |
+          exec ${{ matrix.python }} scripts/ci/mesh-realtime-relay-constructor-result-diagnostic.py \
+            --upstream target/mesh04-relay-constructor-result-diagnostic-${{ matrix.runner }}-${{ matrix.probe }}-upstream \
+            --expected-app '${{ github.sha }}' \
+            --artifacts '${{ runner.temp }}/mesh04-relay-constructor-result-diagnostic-${{ matrix.runner }}-${{ matrix.probe }}-artifacts' \
+            --probe-kind '${{ matrix.probe }}' \
+            --patch-set 'scripts/ci/myownmesh-corrections/relay-constructor-result-diagnostic-provenance.json' \
+            --patch-set-sha256 'bd2e800a1bcd5fce49776a2162eb8baec6a276935550b4d3172c2d0573c77043'
+      - name: Retain complete commands, streams and owned cleanup receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mesh04-relay-constructor-result-diagnostic-${{ matrix.runner }}-${{ matrix.probe }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/mesh04-relay-constructor-result-diagnostic-${{ matrix.runner }}-${{ matrix.probe }}-artifacts
+          if-no-files-found: error
+          retention-days: 14

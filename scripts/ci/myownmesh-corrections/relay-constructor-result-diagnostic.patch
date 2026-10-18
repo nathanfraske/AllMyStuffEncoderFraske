@@ -1,0 +1,20 @@
+diff --git a/crates/myownmesh-core/src/engine/mod.rs b/crates/myownmesh-core/src/engine/mod.rs
+index 1bb9839417d42edba87839ce2db8dc4eb06ee525..c65f5f59cc11377c9832e322f4d73e860782ab68 100644
+--- a/crates/myownmesh-core/src/engine/mod.rs
++++ b/crates/myownmesh-core/src/engine/mod.rs
+@@ -4390,6 +4390,15 @@
+         ),
+     )
+     .await;
++    debug!(
++        target: "mesh_first_unit",
++        "MESH04_CONNECTOR_CONSTRUCTION_RESULT constructor_result={}",
++        match &construction {
++            Ok(Ok(_)) => "constructor_ready",
++            Ok(Err(_)) => "constructor_error",
++            Err(_) => "constructor_wait_elapsed",
++        },
++    );
+     let (session, rx) = match construction {
+         Ok(Ok(peer)) => peer,
+         Ok(Err(e)) => {
