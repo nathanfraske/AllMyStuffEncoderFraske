@@ -1,0 +1,73 @@
+name: MESH04 hosted Linux relay-lab consumer qualification
+
+on:
+  push:
+    branches:
+      - agent/1503a621-mesh04-linux-relay-consumer-qualification
+
+permissions:
+  contents: read
+
+jobs:
+  mesh04-linux-relay-consumer:
+    name: mesh04-linux-relay-consumer (${{ matrix.runner }}, ${{ matrix.probe }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            python: python3
+            probe: consumer
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    env:
+      CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Preserve exact source and selected policy bytes
+        shell: bash
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: nathanfraske/MyOwnMeshSecurityReview
+          ref: db7818e09fedd98899490347b86ac9bc9f97b59b
+          path: target/mesh04-linux-relay-consumer-${{ matrix.runner }}-${{ matrix.probe }}-upstream
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88.0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Native Linux build prerequisites from existing project recipes
+        if: runner.os == 'Linux'
+        timeout-minutes: 8
+        shell: bash
+        run: |
+          set -euo pipefail
+          # bootstrap.sh and mesh-control-setup-linux.sh, captureless subset.
+          sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y --no-install-recommends build-essential pkg-config cmake
+      - name: Run one strict selected relay-lab pair
+        timeout-minutes: 78
+        shell: bash
+        run: |
+          exec ${{ matrix.python }} scripts/ci/mesh-realtime-relay-remaining.py \
+            --upstream target/mesh04-linux-relay-consumer-${{ matrix.runner }}-${{ matrix.probe }}-upstream \
+            --expected-app '${{ github.sha }}' \
+            --artifacts '${{ runner.temp }}/mesh04-linux-relay-consumer-${{ matrix.runner }}-${{ matrix.probe }}-artifacts' \
+            --probe-kind '${{ matrix.probe }}' \
+            --patch-set 'scripts/ci/myownmesh-corrections/inbound-pump-custodian-provenance.json' \
+            --patch-set-sha256 '21cd5d2084f3e6bc0b04fbf3052bafa904e3e451003cb0fe44288f83d87ac50c'
+      - name: Retain complete commands, streams and owned cleanup receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mesh04-linux-relay-consumer-${{ matrix.runner }}-${{ matrix.probe }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/mesh04-linux-relay-consumer-${{ matrix.runner }}-${{ matrix.probe }}-artifacts
+          if-no-files-found: error
+          retention-days: 14
