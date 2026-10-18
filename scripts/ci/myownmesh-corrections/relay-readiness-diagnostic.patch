@@ -1,0 +1,30 @@
+diff --git a/crates/myownmesh-core/src/engine/mod.rs b/crates/myownmesh-core/src/engine/mod.rs
+index 6a9529f7798efd88fde4fc4975d1e5ff5b104854..308e2077ae769df31d82de259aae074d5baf431f 100644
+--- a/crates/myownmesh-core/src/engine/mod.rs
++++ b/crates/myownmesh-core/src/engine/mod.rs
+@@ -3029,6 +3029,11 @@
+             .peers
+             .owner(device_id)
+             .is_some_and(|owner| state.peers.has_usable_authenticated_current(&owner));
++        debug!(
++            target: "mesh_first_unit",
++            "MESH04_CONNECTION_READINESS_RESULT already_active={}",
++            already_active,
++        );
+         if already_active {
+             reply.finish(Ok(()));
+         } else if !state.register_connect_waiter(device_id, reply) {
+@@ -5286,7 +5291,12 @@
+             handle_exact_promoted_message(state, &owner, worker, bytes).await;
+         }
+         TransportEvent::RealtimeUnit(delivery) => {
+-            state.deliver_realtime_unit(&owner, delivery);
++            let session_enqueue_result = state.deliver_realtime_unit(&owner, delivery);
++            debug!(
++                target: "mesh_first_unit",
++                "MESH04_SESSION_ENQUEUE_RESULT session_enqueue_result={}",
++                session_enqueue_result,
++            );
+         }
+         TransportEvent::ApplicationFlowMessage { mode, bytes } => {
+             let exact_owner = owner.for_worker(Arc::clone(worker));
