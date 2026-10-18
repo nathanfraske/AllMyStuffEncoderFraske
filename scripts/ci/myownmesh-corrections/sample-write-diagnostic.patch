@@ -1,0 +1,397 @@
+--- a/crates/myownmesh-core/src/transport/webrtc.rs
++++ b/crates/myownmesh-core/src/transport/webrtc.rs
+@@ -2064,6 +2064,173 @@
+     close_owner.retain_transport_task(task);
+ }
+ 
++/// Only the two owned reservations cross into the observed task. Neither
++/// reservation retains a flow, queue, session, track or worker.
++struct RealtimeSampleWriteDiagnosticFunding {
++    _future: crate::resource::ResourceLease,
++    _task: crate::resource::ResourceLease,
++}
++
++/// The concrete boxed future is freed before either of its funding leases.
++/// Tokio's task header stays an opaque dependency residual; its stored wrapper
++/// and the boxed future are independently measured from their actual types.
++struct RealtimeSampleWriteDiagnosticTask<F> {
++    future: Option<Pin<Box<F>>>,
++    _funding: RealtimeSampleWriteDiagnosticFunding,
++}
++
++impl<F: Future<Output = ()>> Future for RealtimeSampleWriteDiagnosticTask<F> {
++    type Output = ();
++
++    fn poll(
++        self: Pin<&mut Self>,
++        context: &mut std::task::Context<'_>,
++    ) -> std::task::Poll<Self::Output> {
++        self.get_mut()
++            .future
++            .as_mut()
++            .expect("the observed future stays owned until task drop")
++            .as_mut()
++            .poll(context)
++    }
++}
++
++impl<F> Drop for RealtimeSampleWriteDiagnosticTask<F> {
++    fn drop(&mut self) {
++        // Includes cancellation: destroy and deallocate the boxed future first.
++        drop(self.future.take());
++    }
++}
++
++fn reserve_sample_write_diagnostic(
++    port: &realtime::RealtimeFlowPort,
++) -> Option<RealtimeSampleWriteDiagnosticFunding> {
++    fn reserve<C, F>(
++        port: &realtime::RealtimeFlowPort,
++        _constructor: C,
++    ) -> Option<RealtimeSampleWriteDiagnosticFunding>
++    where
++        C: FnOnce(
++            session_flow::RealtimeOutboundPump,
++            RealtimeOutboundTrack,
++            tokio::sync::oneshot::Sender<()>,
++        ) -> F,
++        F: Future<Output = ()> + Send + 'static,
++    {
++        // C is never invoked here. F includes every captured owner, the
++        // observation, and the complete nested vendor write futures. No probe
++        // future is made, polled or dropped with the real pump/track.
++        let future = port.reserve_boxed_checked::<F>().ok()?;
++        let task = port
++            .reserve_boxed_checked::<RealtimeSampleWriteDiagnosticTask<F>>()
++            .ok()?;
++        // Each existing boxed claim charges size_of::<T>() plus one allocation
++        // residual; the existing provider adds its own reservation bookkeeping.
++        Some(RealtimeSampleWriteDiagnosticFunding {
++            _future: future,
++            _task: task,
++        })
++    }
++
++    if !tracing::enabled!(target: "mesh_first_unit", tracing::Level::DEBUG) {
++        return None;
++    }
++    reserve(port, observed_outbound_realtime_pump)
++}
++
++fn spawn_observed_outbound_realtime_pump(
++    pump: session_flow::RealtimeOutboundPump,
++    track: RealtimeOutboundTrack,
++    retired: tokio::sync::oneshot::Sender<()>,
++    funding: RealtimeSampleWriteDiagnosticFunding,
++) {
++    let close_owner = Arc::clone(&track.close_owner);
++    let task = tokio::spawn(RealtimeSampleWriteDiagnosticTask {
++        future: Some(Box::pin(observed_outbound_realtime_pump(
++            pump, track, retired,
++        ))),
++        _funding: funding,
++    });
++    close_owner.retain_transport_task(task);
++}
++
++// Separate coroutine: failed optional admission uses the byte-identical
++// ordinary spawn path above, not an enlarged enum/Option future.
++async fn observed_outbound_realtime_pump(
++    pump: session_flow::RealtimeOutboundPump,
++    track: RealtimeOutboundTrack,
++    retired: tokio::sync::oneshot::Sender<()>,
++) {
++    // One exit point, so "retire on every exit" is structural rather than a
++    // rule each `return` has to remember. The inner block produces nothing;
++    // everything after it runs however it ended.
++    let incarnation = Arc::clone(&track.incarnation);
++    let native = Arc::clone(&track.track);
++    let mut observation =
++        webrtc::track::track_local::track_local_static_sample::SampleWriteObservation::default();
++    async {
++        // Keep accepted units and their leases in the existing queue while
++        // negotiation binds the native track. Closing the exact owner or
++        // retiring the connector cancels this wait, then the common tail
++        // below still removes the native sender and completes retirement.
++        let bound = tokio::select! {
++            biased;
++            () = pump.closed() => false,
++            ready = await_until_connector_retirement(
++                incarnation.subscribe_retirement(),
++                native.wait_for_first_bind(),
++            ) => ready.is_some(),
++        };
++        if !bound {
++            return;
++        }
++        loop {
++            match pump.next() {
++                session_flow::RealtimePumpStep::Unit(unit) => {
++                    // Checked per unit rather than once at attach. A pump
++                    // that proved liveness only when it started would keep
++                    // writing for as long as the application kept feeding
++                    // it.
++                    if !incarnation.is_active() {
++                        return;
++                    }
++                    if native
++                        .write_sample_observed(
++                            &Sample {
++                                data: unit.data,
++                                duration: unit.pace,
++                                ..Default::default()
++                            },
++                            &mut observation,
++                        )
++                        .await
++                        .is_err()
++                    {
++                        // The native track is gone. Ending is the whole
++                        // response; the retirement below still runs.
++                        return;
++                    }
++                }
++                // Nothing queued on a live flow is idle, not closed. Park.
++                session_flow::RealtimePumpStep::Empty => pump.ready().await,
++                // Terminal. The flow, and so the session, is gone. This is
++                // the implicit case too: a dropped flow set drops the
++                // queue, which lands here.
++                session_flow::RealtimePumpStep::Closed => return,
++            }
++        }
++    }
++    .await;
++    // However that ended, the native half goes back. `retire` consumes the
++    // track, so this cannot run twice.
++    track.retire().await;
++    // Last, and only after the detach has completed, so a waiting closer
++    // that observes this has observed a finished retirement rather than a
++    // scheduled one. Nobody may be waiting — implicit drop has no closer —
++    // and that is why the error is discarded.
++    let _ = retired.send(());
++}
++
+ /// Exact process-local identity for one WebRTC connector worker.
+ ///
+ /// This is a stale-callback guard, not authority. Only a
+--- a/crates/myownmesh-core/src/transport/webrtc/session_flow.rs
++++ b/crates/myownmesh-core/src/transport/webrtc/session_flow.rs
+@@ -826,22 +826,27 @@
+     /// retirement. The state allocation is shared by this flow set and any
+     /// delayed native owner; the task lease remains with the actual owner.
+     fn acquire_native_tail(&mut self) -> FlowResult<RealtimeNativeTail> {
+-        let state = if let Some(state) = self.native_tail_state.as_ref() {
++        Self::acquire_native_tail_for(&self.registry, &mut self.native_tail_state)
++    }
++
++    fn acquire_native_tail_for(
++        registry: &RealtimeFlowRegistry,
++        native_tail_state: &mut Option<Arc<RealtimeNativeTailState>>,
++    ) -> FlowResult<RealtimeNativeTail> {
++        let state = if let Some(state) = native_tail_state.as_ref() {
+             Arc::clone(state)
+         } else {
+-            let root = self
+-                .registry
++            let root = registry
+                 .acquire_native_tail_state()
+                 .map_err(realtime_drop_refusal)?;
+             let state = Arc::new(RealtimeNativeTailState {
+                 outstanding: std::sync::atomic::AtomicUsize::new(0),
+                 _root: root,
+             });
+-            self.native_tail_state = Some(Arc::clone(&state));
++            *native_tail_state = Some(Arc::clone(&state));
+             state
+         };
+-        let task = self
+-            .registry
++        let task = registry
+             .acquire_native_tail()
+             .map_err(realtime_drop_refusal)?;
+         state
+@@ -2079,10 +2084,14 @@
+         // Acquire the tail before consuming the queue's one pump claim.  A
+         // refusal must return the native track with both provider and pump
+         // ownership untouched.
+-        let tail = match self.acquire_native_tail() {
++        let tail = match Self::acquire_native_tail_for(&self.registry, &mut self.native_tail_state)
++        {
+             Ok(tail) => tail,
+             Err(_) => return Err((RealtimeFlowError::FlowRefused, track)),
+         };
++        // Optional observation is paid by this ORIGINAL flow port after the
++        // mandatory tail, without retaining the port or adding a product refusal.
++        let observation = reserve_sample_write_diagnostic(&flow.port);
+         // Last, and only once nothing else can refuse: a queue issues exactly
+         // one pump, and a consumed claim cannot be handed back with the track.
+         if !queue.claim_pump() {
+@@ -2101,7 +2110,11 @@
+         // owner that could remove the same track twice or keep a sender alive
+         // past its session.
+         let (retired, remains) = tokio::sync::oneshot::channel();
+-        spawn_outbound_realtime_pump(pump, track, retired);
++        if let Some(funding) = observation {
++            spawn_observed_outbound_realtime_pump(pump, track, retired, funding);
++        } else {
++            spawn_outbound_realtime_pump(pump, track, retired);
++        }
+         // Recorded after the spawn, so the lease on the flow always names a pump
+         // that exists. `attach_outbound` is reached once per flow — the pump
+         // claim above is single-issue — so this cannot overwrite an earlier one.
+--- a/vendor/webrtc-0.13.0/src/track/track_local/track_local_static_sample.rs
++++ b/vendor/webrtc-0.13.0/src/track/track_local/track_local_static_sample.rs
+@@ -13,6 +13,40 @@
+     sequencer: Option<Box<dyn rtp::sequence::Sequencer + Send + Sync>>,
+     clock_rate: f64,
+     did_warn_about_wonky_pause: bool,
++}
++
++/// Nonauthorizing storage for a privately selected sample-write observation.
++///
++/// The caller owns funding for this state and the complete observed future.
++/// This carries no identifiers, payload, authority or resource-provider handle.
++#[doc(hidden)]
++#[derive(Default)]
++pub struct SampleWriteObservation {
++    outcomes: u8,
++}
++
++impl SampleWriteObservation {
++    const ALL_PAUSED: u8 = 1 << 0;
++    const ZERO_PACKETS: u8 = 1 << 1;
++    const WRITE_ZERO: u8 = 1 << 2;
++    const WRITE_POSITIVE: u8 = 1 << 3;
++    const WRITE_ERROR: u8 = 1 << 4;
++    const PACKETIZATION_ERROR: u8 = 1 << 5;
++
++    // Called only after the original write scope, including its guard, ended.
++    // Entry is a completed-call fact; cancellation can leave no record.
++    fn emit(&self) {
++        log::debug!(
++            target: "mesh_first_unit",
++            "MESH04_SAMPLE_WRITE entry=true all_paused_true_no_packetization={} zero_packets={} native_write_zero={} native_write_positive={} native_error={} packetization_error={}",
++            self.outcomes & Self::ALL_PAUSED != 0,
++            self.outcomes & Self::ZERO_PACKETS != 0,
++            self.outcomes & Self::WRITE_ZERO != 0,
++            self.outcomes & Self::WRITE_POSITIVE != 0,
++            self.outcomes & Self::WRITE_ERROR != 0,
++            self.outcomes & Self::PACKETIZATION_ERROR != 0,
++        );
++    }
+ }
+ 
+ /// TrackLocalStaticSample is a TrackLocal that has a pre-set codec and accepts Samples.
+@@ -178,6 +212,112 @@
+         }
+ 
+         flatten_errs(write_errs)
++    }
++
++    /// Private diagnostic carrier entry; ordinary write methods stay unchanged.
++    ///
++    /// The caller must fund this state and its complete async storage. Length
++    /// 119 selects one retained fixture shape, not a flow identity or ordinal.
++    /// Decisions use only the original queries and write results. Cancellation
++    /// before the original scope completes intentionally emits no record.
++    #[doc(hidden)]
++    pub async fn write_sample_observed(
++        &self,
++        sample: &Sample,
++        observation: &mut SampleWriteObservation,
++    ) -> Result<()> {
++        if sample.data.len() != 119 {
++            return self.write_sample(sample).await;
++        }
++        observation.outcomes = 0;
++        let extensions = &[];
++        let result = async {
++            let mut internal = self.bound_internal().await;
++
++            let (any_paused, all_paused) = (
++                self.rtp_track.any_binding_paused().await,
++                self.rtp_track.all_binding_paused().await,
++            );
++
++            if all_paused {
++                observation.outcomes |= SampleWriteObservation::ALL_PAUSED;
++                // Abort already here to not increment sequence numbers.
++                return Ok(());
++            }
++
++            if any_paused {
++                // This is a problem state due to how this impl is structured. The sequencer will allocate
++                // one sequence number per RTP packet regardless of how many TrackBinding that will send
++                // the packet. I.e. we get the same sequence number per multiple SSRC, which is not good
++                // for SRTP, but that's how it works.
++                //
++                // SRTP has a further problem with regards to jumps in sequence number. Consider this:
++                //
++                // 1. Create track local
++                // 2. Bind track local to track 1.
++                // 3. Bind track local to track 2.
++                // 4. Pause track 1.
++                // 5. Keep sending...
++                //
++                // At this point, the track local will keep incrementing the sequence number, because we have
++                // one binding that is still active. However SRTP hmac verifying (tag), can only accept a
++                // relatively small jump in sequence numbers since it uses the ROC (i.e. how many times the
++                // sequence number has rolled over), which means if this pause state of one binding persists
++                // for a longer time, the track can never be resumed since the receiver would have missed
++                // the rollovers.
++                if !internal.did_warn_about_wonky_pause {
++                    internal.did_warn_about_wonky_pause = true;
++                    warn!("Detected multiple track bindings where only one was paused");
++                }
++            }
++
++            // skip packets by the number of previously dropped packets
++            if let Some(sequencer) = &internal.sequencer {
++                for _ in 0..sample.prev_dropped_packets {
++                    sequencer.next_sequence_number();
++                }
++            }
++
++            let clock_rate = internal.clock_rate;
++
++            let packets = if let Some(packetizer) = &mut internal.packetizer {
++                let samples = (sample.duration.as_secs_f64() * clock_rate) as u32;
++                if sample.prev_dropped_packets > 0 {
++                    packetizer.skip_samples(samples * sample.prev_dropped_packets as u32);
++                }
++                packetizer.packetize(&sample.data, samples).map_err(|err| {
++                    observation.outcomes |= SampleWriteObservation::PACKETIZATION_ERROR;
++                    err
++                })?
++            } else {
++                vec![]
++            };
++
++            if packets.is_empty() {
++                observation.outcomes |= SampleWriteObservation::ZERO_PACKETS;
++            }
++
++            let mut write_errs = vec![];
++            for p in packets {
++                let written = self
++                    .rtp_track
++                    .write_rtp_with_extensions(&p, extensions)
++                    .await;
++                match &written {
++                    Ok(0) => observation.outcomes |= SampleWriteObservation::WRITE_ZERO,
++                    Ok(_) => observation.outcomes |= SampleWriteObservation::WRITE_POSITIVE,
++                    Err(_) => observation.outcomes |= SampleWriteObservation::WRITE_ERROR,
++                }
++                if let Err(err) = written {
++                    write_errs.push(err);
++                }
++            }
++
++            flatten_errs(write_errs)
++        }
++        .await;
++        observation.emit();
++        result
+     }
+ 
+     /// Create a builder for writing samples with additional data.
