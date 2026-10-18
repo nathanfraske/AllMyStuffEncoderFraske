@@ -1,4 +1,4 @@
-name: MESH04 isolated sample-write diagnostic
+name: MESH04 isolated receiver-binding diagnostic
 
 on:
   push:
@@ -14,9 +14,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-15-intel
-            python: python3
-            probe: transport
           - runner: windows-latest
             python: python
             probe: consumer
@@ -54,8 +51,8 @@ jobs:
             --expected-app '${{ github.sha }}' \
             --artifacts '${{ runner.temp }}/mesh04-sample-diagnostic-artifacts' \
             --probe-kind '${{ matrix.probe }}' \
-            --patch-set 'scripts/ci/myownmesh-corrections/sample-write-provenance.json' \
-            --patch-set-sha256 '89b106f03265bf0a1eb95f2ee35b414c2e6229b9ed9d93c22c5c16c171321011'
+            --patch-set 'scripts/ci/myownmesh-corrections/receiver-binding-provenance.json' \
+            --patch-set-sha256 '09b58094a6648fa967f73ce29bc7bdd5d6585a585d7d781082b1a671140df159'
       - name: Retain complete commands, streams and owned cleanup receipts
         if: always()
         uses: actions/upload-artifact@v4

@@ -1,0 +1,24 @@
+--- a/crates/myownmesh-core/src/transport/webrtc.rs
++++ b/crates/myownmesh-core/src/transport/webrtc.rs
+@@ -8529,13 +8529,19 @@
+                     return;
+                 };
+                 let capability = &track.codec().capability;
+-                let Some(attachment) = bindings.admit(
++                let attachment = bindings.admit(
+                     &identity,
+                     kind,
+                     &capability.mime_type,
+                     capability.clock_rate,
+                     capability.channels,
+-                ) else {
++                );
++                debug!(
++                    target: "mesh_first_unit",
++                    "MESH04_INBOUND_BIND_RESULT binding_result_some={}",
++                    attachment.is_some(),
++                );
++                let Some(attachment) = attachment else {
+                     // Our transceiver, a shape we did not open the flow for —
+                     // or one whose flow has since closed. Attaching would feed
+                     // a decoder configured for something else.
