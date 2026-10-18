@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Isolated receiver-binding diagnostic: one strict Windows consumer pair.
+"""Isolated callback-fence diagnostic: one strict Windows consumer pair.
 
 Draft bindings deliberately fail closed until B1's actual diagnostic is frozen.
 This runner never changes the ordinary corrected qualification entry point.
@@ -23,9 +23,9 @@ import time
 
 BASE = "db7818e09fedd98899490347b86ac9bc9f97b59b"
 BASE_LOCK = "8f5a30ce863c43b0a8c5225f74d7446aed7656cd7032f47e70030526381930c6"
-PREFIX_PATH = "scripts/ci/myownmesh-corrections/sample-write-provenance.json"
-PREFIX_SHA256 = "89b106f03265bf0a1eb95f2ee35b414c2e6229b9ed9d93c22c5c16c171321011"
-PREFIX_TREE = "c61d0fbf3a07c528ca728a9c2a329e863fe12c67"
+PREFIX_PATH = "scripts/ci/myownmesh-corrections/receiver-binding-provenance.json"
+PREFIX_SHA256 = "09b58094a6648fa967f73ce29bc7bdd5d6585a585d7d781082b1a671140df159"
+PREFIX_TREE = "ec80111e70cab72db58561a1a1aa7b8332bcae42"
 HELPER_PATH = "scripts/ci/myownmesh-corrections/prepare-candidate.py"
 HELPER_SHA256 = "f698d79e564feb88294156b16f131ac0e10a5bb20ccd640c7550af7301ba2a20"
 CONTROLLER_PATH = "scripts/ci/mesh-control-paired.py"
@@ -34,12 +34,12 @@ POLICY_PATH = "scripts/ci/mesh-control-paired-policy.json"
 POLICY_SHA256 = "e6729ca6d0887ec0b4ef2cd91da404ffb477b251e00a5a8c1381254c1a9a9fe6"
 
 # Replace only from the actual independently frozen B1 packet, then review.
-DIAGNOSTIC_MANIFEST = "scripts/ci/myownmesh-corrections/receiver-binding-provenance.json"
-DIAGNOSTIC_MANIFEST_SHA256 = "09b58094a6648fa967f73ce29bc7bdd5d6585a585d7d781082b1a671140df159"
-DIAGNOSTIC_TREE = "ec80111e70cab72db58561a1a1aa7b8332bcae42"
-DIAGNOSTIC_PATCH = "receiver-binding-diagnostic.patch"
-DIAGNOSTIC_PATCH_SHA256 = "40f912a825b5637bca825dd268718546d611015f3dc99a163ff06f21e85837d4"
-DIAGNOSTIC_SCOPE = "private funded sample-write and immediate receiver-binding decision observations only; scheduling may change; no delivery, strict AV, cause, repair or production qualification"
+DIAGNOSTIC_MANIFEST = "scripts/ci/myownmesh-corrections/callback-fence-provenance.json"
+DIAGNOSTIC_MANIFEST_SHA256 = "54e4338578d00493dbd4eaf1e3a306a9524a39453b9ce3cad4a3534901c256f2"
+DIAGNOSTIC_TREE = "ee3cc301b6f5de0a5ba4de71fde5c8d40d3462eb"
+DIAGNOSTIC_PATCH = "callback-fence-diagnostic.patch"
+DIAGNOSTIC_PATCH_SHA256 = "15e3fbebc2e7fce231da4dcc6a6c33d1995f256677bd33efbe7005befc46779e"
+DIAGNOSTIC_SCOPE = "private funded sample-write and immediate receiver-binding and callback-fence decision observations only; scheduling may change; no delivery, strict AV, cause, repair or production qualification"
 
 LOCKS = ["Cargo.lock", "node/Cargo.lock", "gui/src-tauri/Cargo.lock",
          "gui/mobile/Cargo.lock", "scripts/ci/mesh-realtime-minimal/Cargo.lock"]
@@ -159,27 +159,27 @@ def copy_helper(root, output, commands, app_head):
 
 def selected_manifest(root, args, helper):
     prefix_data = (root / PREFIX_PATH).read_bytes()
-    require(hashlib.sha256(prefix_data).hexdigest() == PREFIX_SHA256, "sample diagnostic10 canonical prefix differs")
+    require(hashlib.sha256(prefix_data).hexdigest() == PREFIX_SHA256, "receiver-binding diagnostic11 canonical prefix differs")
     prefix = json.loads(prefix_data)
     path = (root / DIAGNOSTIC_MANIFEST).resolve(strict=True)
     require(path.parent == (root / PREFIX_PATH).parent, "diagnostic manifest must share the canonical patch directory")
     selected = helper.selected_json(path, args.patch_set_sha256)
     helper.validate_set(selected)
-    require(prefix["kind"] == "diagnostic" and len(prefix["patches"]) == 10
-            and prefix["expected_tree"] == PREFIX_TREE, "sample diagnostic10 prefix identity differs")
-    require(selected["kind"] == "diagnostic" and len(selected["patches"]) == 11
+    require(prefix["kind"] == "diagnostic" and len(prefix["patches"]) == 11
+            and prefix["expected_tree"] == PREFIX_TREE, "receiver-binding diagnostic11 prefix identity differs")
+    require(selected["kind"] == "diagnostic" and len(selected["patches"]) == 12
             and selected["expected_tree"] == DIAGNOSTIC_TREE
             and selected.get("qualification_scope") == DIAGNOSTIC_SCOPE,
-            "only the frozen diagnostic11 source may enter this runner")
-    require(selected["patches"][:10] == prefix["patches"]
-            and patch_records(path.read_bytes())[:10] == patch_records(prefix_data),
-            "the first ten canonical patch records must remain byte-exact")
+            "only the frozen diagnostic12 source may enter this runner")
+    require(selected["patches"][:11] == prefix["patches"]
+            and patch_records(path.read_bytes())[:11] == patch_records(prefix_data),
+            "the first eleven canonical patch records must remain byte-exact")
     for key in ("schema", "base_commit", "base_tree", "cargo_lock_sha256"):
         require(selected[key] == prefix[key], "diagnostic prefix base identity differs")
-    last = selected["patches"][10]
+    last = selected["patches"][11]
     require(last["purpose"] == "diagnostic" and last["path"] == DIAGNOSTIC_PATCH
             and last["sha256"] == DIAGNOSTIC_PATCH_SHA256 and last["tree_before"] == PREFIX_TREE
-            and last["tree_after"] == DIAGNOSTIC_TREE, "only the frozen receiver-binding diagnostic patch may extend sample diagnostic10")
+            and last["tree_after"] == DIAGNOSTIC_TREE, "only the frozen callback-fence diagnostic patch may extend receiver-binding diagnostic11")
     protected = [root / PREFIX_PATH, path]
     for item in selected["patches"]:
         patch = path.parent / item["path"]

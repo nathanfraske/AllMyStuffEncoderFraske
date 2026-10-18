@@ -1,4 +1,4 @@
-name: MESH04 isolated receiver-binding diagnostic
+name: MESH04 isolated callback-fence diagnostic
 
 on:
   push:
@@ -51,8 +51,8 @@ jobs:
             --expected-app '${{ github.sha }}' \
             --artifacts '${{ runner.temp }}/mesh04-sample-diagnostic-artifacts' \
             --probe-kind '${{ matrix.probe }}' \
-            --patch-set 'scripts/ci/myownmesh-corrections/receiver-binding-provenance.json' \
-            --patch-set-sha256 '09b58094a6648fa967f73ce29bc7bdd5d6585a585d7d781082b1a671140df159'
+            --patch-set 'scripts/ci/myownmesh-corrections/callback-fence-provenance.json' \
+            --patch-set-sha256 '54e4338578d00493dbd4eaf1e3a306a9524a39453b9ce3cad4a3534901c256f2'
       - name: Retain complete commands, streams and owned cleanup receipts
         if: always()
         uses: actions/upload-artifact@v4

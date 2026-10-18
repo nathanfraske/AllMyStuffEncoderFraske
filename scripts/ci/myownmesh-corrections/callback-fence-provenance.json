@@ -1,0 +1,95 @@
+{
+  "schema": "myownmesh-corrections-patch-set-v1",
+  "kind": "diagnostic",
+  "qualification_scope": "private funded sample-write and immediate receiver-binding and callback-fence decision observations only; scheduling may change; no delivery, strict AV, cause, repair or production qualification",
+  "base_commit": "db7818e09fedd98899490347b86ac9bc9f97b59b",
+  "base_tree": "5492d1845e15dbc067acec3ec592bb9500b9e21d",
+  "expected_tree": "ee3cc301b6f5de0a5ba4de71fde5c8d40d3462eb",
+  "cargo_lock_sha256": "8f5a30ce863c43b0a8c5225f74d7446aed7656cd7032f47e70030526381930c6",
+  "patches": [
+    {
+      "path": "owner-cleanup-fix.patch",
+      "sha256": "6f8c1da2070208c159c663df3d6a67120558aeddb2b20b6b78c17a787e42caaf",
+      "purpose": "production",
+      "tree_before": "5492d1845e15dbc067acec3ec592bb9500b9e21d",
+      "tree_after": "d7f3723d7c2beb361659fef9f06abfe70631be06"
+    },
+    {
+      "path": "owner-cleanup-regression.patch",
+      "sha256": "1a5f193bc89766d47a53d5ebe76e75f72331e0d55bff39ceac42242e1b3068e5",
+      "purpose": "regression",
+      "tree_before": "d7f3723d7c2beb361659fef9f06abfe70631be06",
+      "tree_after": "b6a5aaeecb6aacaec142d986ff30d6bff149cc57"
+    },
+    {
+      "path": "startup-fix.patch",
+      "sha256": "74a666370dec84650bd1975a52e0a21fb87c721479b2ed33671b3f67ef4e4eb4",
+      "purpose": "production",
+      "tree_before": "b6a5aaeecb6aacaec142d986ff30d6bff149cc57",
+      "tree_after": "09ea23d1667036ffb53d234897e3e8835654fb92"
+    },
+    {
+      "path": "startup-regression.patch",
+      "sha256": "da7afd74b297aae0215789206ec429cf2d09c1154addf4be4c514ada2f8c6cf1",
+      "purpose": "regression",
+      "tree_before": "09ea23d1667036ffb53d234897e3e8835654fb92",
+      "tree_after": "bdbf1b96c7809107bd3a151b2ccf9bcad9ace73a"
+    },
+    {
+      "path": "sender-reopen-fix.patch",
+      "sha256": "4e93bbc7e96ae871fd53b40b1eeaf4204e162116c4c0ff9582ab07de4017e012",
+      "purpose": "production",
+      "tree_before": "bdbf1b96c7809107bd3a151b2ccf9bcad9ace73a",
+      "tree_after": "717d7a360f9ce8196b17cb75cfee8f00e54bf50e"
+    },
+    {
+      "path": "sender-reopen-regression.patch",
+      "sha256": "978d54016c38e318043eaf4bb03dc28eb0146dca665ef2a7442ccab301650173",
+      "purpose": "regression",
+      "tree_before": "717d7a360f9ce8196b17cb75cfee8f00e54bf50e",
+      "tree_after": "c87e382172530f898a0f351557c24552926daad1"
+    },
+    {
+      "path": "sendonly-fix.patch",
+      "sha256": "cfe69e048186331d623789eb0a31882b65d01ec511a9fcadf461420229f63797",
+      "purpose": "production",
+      "tree_before": "c87e382172530f898a0f351557c24552926daad1",
+      "tree_after": "f386f0f6f8d1d11e471d836ab4d172c9485592da"
+    },
+    {
+      "path": "worker-retirement-fix.patch",
+      "sha256": "808325ce95d8d5e29d424828ebb7e2b25e5351ddc2c54982348e69e7a1d6e712",
+      "purpose": "production",
+      "tree_before": "f386f0f6f8d1d11e471d836ab4d172c9485592da",
+      "tree_after": "e865a7bc9f446feaeb2e7d244a7b1a211c22d5b9"
+    },
+    {
+      "path": "inbound-pump-custodian-fix.patch",
+      "sha256": "d38ab638c0f6fef1b57a6458ef0ddbe0091f42471e656644e25b8e95208c7088",
+      "purpose": "production",
+      "tree_before": "e865a7bc9f446feaeb2e7d244a7b1a211c22d5b9",
+      "tree_after": "87c0c6485787349c74f17f890c3dcf4b3f4c6e2d"
+    },
+    {
+      "path": "sample-write-diagnostic.patch",
+      "sha256": "95984ae5ee37bb6779a222e550946a642b44175d9ab927de8fef9baed5fb6b8d",
+      "purpose": "diagnostic",
+      "tree_before": "87c0c6485787349c74f17f890c3dcf4b3f4c6e2d",
+      "tree_after": "c61d0fbf3a07c528ca728a9c2a329e863fe12c67"
+    },
+    {
+      "path": "receiver-binding-diagnostic.patch",
+      "sha256": "40f912a825b5637bca825dd268718546d611015f3dc99a163ff06f21e85837d4",
+      "purpose": "diagnostic",
+      "tree_before": "c61d0fbf3a07c528ca728a9c2a329e863fe12c67",
+      "tree_after": "ec80111e70cab72db58561a1a1aa7b8332bcae42"
+    },
+    {
+      "path": "callback-fence-diagnostic.patch",
+      "sha256": "15e3fbebc2e7fce231da4dcc6a6c33d1995f256677bd33efbe7005befc46779e",
+      "purpose": "diagnostic",
+      "tree_before": "ec80111e70cab72db58561a1a1aa7b8332bcae42",
+      "tree_after": "ee3cc301b6f5de0a5ba4de71fde5c8d40d3462eb"
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+--- a/crates/myownmesh-core/src/transport/webrtc.rs
++++ b/crates/myownmesh-core/src/transport/webrtc.rs
+@@ -8491,7 +8491,13 @@
+             let retirement_scope = retirement_scope.clone();
+             Box::pin(async move {
+                 let _callback_work = callback_work;
+-                let Some(_operation) = tx.operation_fence.try_enter() else {
++                let operation = tx.operation_fence.try_enter();
++                debug!(
++                    target: "mesh_first_unit",
++                    "MESH04_ON_TRACK_OPERATION_RESULT operation_result_some={}",
++                    operation.is_some(),
++                );
++                let Some(_operation) = operation else {
+                     return;
+                 };
+                 if !tx.callback_gate.is_active() {
