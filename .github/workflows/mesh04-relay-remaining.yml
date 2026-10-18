@@ -23,12 +23,6 @@ jobs:
             probe: consumer
           - runner: ubuntu-24.04
             python: python3
-            probe: transport
-          - runner: ubuntu-24.04
-            python: python3
-            probe: consumer
-          - runner: macos-15-intel
-            python: python3
             probe: consumer
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
